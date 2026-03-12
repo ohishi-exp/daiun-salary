@@ -6,7 +6,8 @@ use super::kudgivt::KudgivtRow;
 /// イベント分類
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventClass {
-    Work,      // 労働時間に計上 (110=運転, 202=積み, 203=降し)
+    Drive,     // 運転 (110)
+    Cargo,     // 荷役 (202=積み, 203=降し)
     RestSplit, // 勤務区間の区切り (302=休息)
     Break,     // 拘束内だが労働時間外 (301=休憩)
     Ignore,    // 無視 (101=実車, 103=高速道, 412=アイドリング等)
@@ -18,6 +19,8 @@ pub struct WorkSegment {
     pub start: NaiveDateTime,
     pub end: NaiveDateTime,
     pub labor_minutes: i32,
+    pub drive_minutes: i32,
+    pub cargo_minutes: i32,
 }
 
 /// 日別に分割された勤務区間
@@ -29,6 +32,8 @@ pub struct DailyWorkSegment {
     pub work_minutes: i32,
     pub labor_minutes: i32,
     pub late_night_minutes: i32,
+    pub drive_minutes: i32,
+    pub cargo_minutes: i32,
 }
 
 /// day_start〜day_end 間の深夜時間（22:00〜翌5:00）を分単位で返す
@@ -81,17 +86,17 @@ pub fn split_by_rest(
         .collect();
     rest_events.sort_by_key(|e| e.start_at);
 
-    // 勤務(work)イベントを start_at 昇順でソート
-    let mut work_events: Vec<&&KudgivtRow> = events
+    // 労働(drive/cargo)イベントを start_at 昇順でソート
+    let mut labor_events: Vec<&&KudgivtRow> = events
         .iter()
         .filter(|e| {
             classifications
                 .get(&e.event_cd)
-                .map(|c| *c == EventClass::Work)
+                .map(|c| *c == EventClass::Drive || *c == EventClass::Cargo)
                 .unwrap_or(false)
         })
         .collect();
-    work_events.sort_by_key(|e| e.start_at);
+    labor_events.sort_by_key(|e| e.start_at);
 
     let mut segments = Vec::new();
     let mut current_start = departure_at;
@@ -102,11 +107,13 @@ pub fn split_by_rest(
         let rest_end = rest_start + chrono::Duration::minutes(duration as i64);
 
         if rest_start > current_start {
-            let labor = sum_work_events_in_range(&work_events, current_start, rest_start);
+            let (drive, cargo) = sum_events_in_range(&labor_events, classifications, current_start, rest_start);
             segments.push(WorkSegment {
                 start: current_start,
                 end: rest_start,
-                labor_minutes: labor,
+                labor_minutes: drive + cargo,
+                drive_minutes: drive,
+                cargo_minutes: cargo,
             });
         }
 
@@ -115,28 +122,37 @@ pub fn split_by_rest(
 
     // 最後の区間
     if current_start < return_at {
-        let labor = sum_work_events_in_range(&work_events, current_start, return_at);
+        let (drive, cargo) = sum_events_in_range(&labor_events, classifications, current_start, return_at);
         segments.push(WorkSegment {
             start: current_start,
             end: return_at,
-            labor_minutes: labor,
+            labor_minutes: drive + cargo,
+            drive_minutes: drive,
+            cargo_minutes: cargo,
         });
     }
 
     segments
 }
 
-/// 指定範囲内の勤務イベントの duration_minutes を合計
-fn sum_work_events_in_range(
-    work_events: &[&&KudgivtRow],
+/// 指定範囲内のイベントを運転/荷役に分けて duration_minutes を合計
+fn sum_events_in_range(
+    events: &[&&KudgivtRow],
+    classifications: &HashMap<String, EventClass>,
     range_start: NaiveDateTime,
     range_end: NaiveDateTime,
-) -> i32 {
-    work_events
-        .iter()
-        .filter(|e| e.start_at >= range_start && e.start_at < range_end)
-        .map(|e| e.duration_minutes.unwrap_or(0))
-        .sum()
+) -> (i32, i32) {
+    let mut drive = 0i32;
+    let mut cargo = 0i32;
+    for e in events.iter().filter(|e| e.start_at >= range_start && e.start_at < range_end) {
+        let dur = e.duration_minutes.unwrap_or(0);
+        match classifications.get(&e.event_cd) {
+            Some(EventClass::Drive) => drive += dur,
+            Some(EventClass::Cargo) => cargo += dur,
+            _ => {}
+        }
+    }
+    (drive, cargo)
 }
 
 /// 勤務区間を0:00境界で日別に分割する
@@ -170,6 +186,8 @@ pub fn split_segments_by_day(segments: &[WorkSegment]) -> Vec<DailyWorkSegment> 
 
             let ratio = work_mins as f64 / total_work_mins;
             let labor_mins = (seg.labor_minutes as f64 * ratio).round() as i32;
+            let drive_mins = (seg.drive_minutes as f64 * ratio).round() as i32;
+            let cargo_mins = (seg.cargo_minutes as f64 * ratio).round() as i32;
             let late_night = calc_late_night_mins(day_start, day_end);
 
             daily.push(DailyWorkSegment {
@@ -179,6 +197,8 @@ pub fn split_segments_by_day(segments: &[WorkSegment]) -> Vec<DailyWorkSegment> 
                 work_minutes: work_mins,
                 labor_minutes: labor_mins,
                 late_night_minutes: late_night,
+                drive_minutes: drive_mins,
+                cargo_minutes: cargo_mins,
             });
 
             current += chrono::Duration::days(1);
@@ -195,9 +215,9 @@ mod tests {
 
     fn make_classifications() -> HashMap<String, EventClass> {
         let mut m = HashMap::new();
-        m.insert("110".to_string(), EventClass::Work);
-        m.insert("202".to_string(), EventClass::Work);
-        m.insert("203".to_string(), EventClass::Work);
+        m.insert("110".to_string(), EventClass::Drive);
+        m.insert("202".to_string(), EventClass::Cargo);
+        m.insert("203".to_string(), EventClass::Cargo);
         m.insert("302".to_string(), EventClass::RestSplit);
         m.insert("301".to_string(), EventClass::Break);
         m.insert("101".to_string(), EventClass::Ignore);
@@ -317,6 +337,8 @@ mod tests {
             start: dt(2026, 2, 24, 22, 0),
             end: dt(2026, 2, 25, 6, 0),
             labor_minutes: 400,
+            drive_minutes: 300,
+            cargo_minutes: 100,
         }];
 
         let daily = split_segments_by_day(&segments);

@@ -114,6 +114,9 @@ pub struct DailyWorkHours {
     pub total_work_minutes: Option<i32>,
     pub total_drive_minutes: Option<i32>,
     pub total_rest_minutes: Option<i32>,
+    pub late_night_minutes: Option<i32>,
+    pub drive_minutes: i32,
+    pub cargo_minutes: i32,
     pub total_distance: Option<f64>,
     pub operation_count: i32,
     pub unko_nos: Option<Vec<String>>,
@@ -136,6 +139,8 @@ pub struct DailyWorkSegment {
     pub work_minutes: i32,
     pub labor_minutes: i32,
     pub late_night_minutes: i32,
+    pub drive_minutes: i32,
+    pub cargo_minutes: i32,
     pub created_at: DateTime<Utc>,
 }
 
@@ -154,6 +159,47 @@ pub struct EventClassification {
 #[derive(Debug, Deserialize)]
 pub struct UpdateClassificationRequest {
     pub classification: String,
+}
+
+// --- API Token ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ApiToken {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub created_by: Uuid,
+    pub name: String,
+    pub token_hash: String,
+    pub token_prefix: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct ApiTokenListItem {
+    pub id: Uuid,
+    pub name: String,
+    pub token_prefix: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateApiTokenRequest {
+    pub name: String,
+    pub expires_in_days: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateApiTokenResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub token: String,
+    pub token_prefix: String,
 }
 
 // --- API DTOs ---

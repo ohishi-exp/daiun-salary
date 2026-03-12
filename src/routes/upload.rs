@@ -358,6 +358,8 @@ async fn calculate_daily_hours(
         total_work_minutes: i32,
         total_labor_minutes: i32,
         late_night_minutes: i32,
+        drive_minutes: i32,
+        cargo_minutes: i32,
         total_distance: f64,
         operation_count: i32,
         unko_nos: Vec<String>,
@@ -372,6 +374,8 @@ async fn calculate_daily_hours(
         work_minutes: i32,
         labor_minutes: i32,
         late_night_minutes: i32,
+        drive_minutes: i32,
+        cargo_minutes: i32,
     }
 
     let mut day_map: HashMap<(String, chrono::NaiveDate), DayAgg> = HashMap::new();
@@ -421,6 +425,8 @@ async fn calculate_daily_hours(
                             total_work_minutes: 0,
                             total_labor_minutes: 0,
                             late_night_minutes: 0,
+                            drive_minutes: 0,
+                            cargo_minutes: 0,
                             total_distance: 0.0,
                             operation_count: 0,
                             unko_nos: Vec::new(),
@@ -430,6 +436,8 @@ async fn calculate_daily_hours(
                     entry.total_work_minutes += ds.work_minutes;
                     entry.total_labor_minutes += ds.labor_minutes;
                     entry.late_night_minutes += ds.late_night_minutes;
+                    entry.drive_minutes += ds.drive_minutes;
+                    entry.cargo_minutes += ds.cargo_minutes;
                     entry.total_distance += day_distance;
                     if !entry.unko_nos.contains(&row.unko_no) {
                         entry.unko_nos.push(row.unko_no.clone());
@@ -453,6 +461,8 @@ async fn calculate_daily_hours(
                         work_minutes: ds.work_minutes,
                         labor_minutes: ds.labor_minutes,
                         late_night_minutes: ds.late_night_minutes,
+                        drive_minutes: ds.drive_minutes,
+                        cargo_minutes: ds.cargo_minutes,
                     });
                 }
             }
@@ -470,6 +480,8 @@ async fn calculate_daily_hours(
                         total_work_minutes: 0,
                         total_labor_minutes: 0,
                         late_night_minutes: 0,
+                        drive_minutes: 0,
+                        cargo_minutes: 0,
                         total_distance: 0.0,
                         operation_count: 0,
                         unko_nos: Vec::new(),
@@ -510,9 +522,9 @@ async fn calculate_daily_hours(
             r#"INSERT INTO daily_work_hours (
                 tenant_id, driver_id, work_date,
                 total_work_minutes, total_drive_minutes, total_rest_minutes,
-                late_night_minutes,
+                late_night_minutes, drive_minutes, cargo_minutes,
                 total_distance, operation_count, unko_nos
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#,
         )
         .bind(tenant_id)
         .bind(driver_id)
@@ -521,6 +533,8 @@ async fn calculate_daily_hours(
         .bind(agg.total_labor_minutes)
         .bind(rest_minutes)
         .bind(agg.late_night_minutes)
+        .bind(agg.drive_minutes)
+        .bind(agg.cargo_minutes)
         .bind(agg.total_distance)
         .bind(agg.operation_count)
         .bind(&agg.unko_nos)
@@ -541,8 +555,9 @@ async fn calculate_daily_hours(
             sqlx::query(
                 r#"INSERT INTO daily_work_segments (
                     tenant_id, driver_id, work_date, unko_no, segment_index,
-                    start_at, end_at, work_minutes, labor_minutes, late_night_minutes
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+                    start_at, end_at, work_minutes, labor_minutes, late_night_minutes,
+                    drive_minutes, cargo_minutes
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#,
             )
             .bind(tenant_id)
             .bind(driver_id)
@@ -554,6 +569,8 @@ async fn calculate_daily_hours(
             .bind(seg.work_minutes)
             .bind(seg.labor_minutes)
             .bind(seg.late_night_minutes)
+            .bind(seg.drive_minutes)
+            .bind(seg.cargo_minutes)
             .execute(&state.pool)
             .await?;
         }
@@ -581,7 +598,9 @@ async fn load_or_init_classifications(
     let mut map: HashMap<String, EventClass> = HashMap::new();
     for (cd, cls) in &existing {
         let ec = match cls.as_str() {
-            "work" => EventClass::Work,
+            "drive" => EventClass::Drive,
+            "cargo" => EventClass::Cargo,
+            "work" => EventClass::Drive, // legacy fallback
             "rest_split" => EventClass::RestSplit,
             "break" => EventClass::Break,
             _ => EventClass::Ignore,
@@ -618,12 +637,12 @@ async fn load_or_init_classifications(
 
 fn default_classification(event_cd: &str) -> (&'static str, EventClass) {
     match event_cd {
-        "110" => ("work", EventClass::Work),           // IG-Moving(運転)
-        "202" => ("work", EventClass::Work),           // 積み
-        "203" => ("work", EventClass::Work),           // 降し
+        "110" => ("drive", EventClass::Drive),          // IG-Moving(運転)
+        "202" => ("cargo", EventClass::Cargo),          // 積み
+        "203" => ("cargo", EventClass::Cargo),          // 降し
         "302" => ("rest_split", EventClass::RestSplit), // 休息
-        "301" => ("break", EventClass::Break),         // 休憩
-        _ => ("ignore", EventClass::Ignore),           // その他は無視
+        "301" => ("break", EventClass::Break),          // 休憩
+        _ => ("ignore", EventClass::Ignore),            // その他は無視
     }
 }
 

@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::auth::google::GoogleTokenVerifier;
 use crate::auth::jwt::JwtSecret;
+use crate::middleware::auth::GatewaySecret;
 use crate::storage::StorageBackend;
 
 #[derive(Clone)]
@@ -42,9 +43,12 @@ async fn main() -> anyhow::Result<()> {
     let google_client_secret =
         std::env::var("GOOGLE_CLIENT_SECRET").expect("GOOGLE_CLIENT_SECRET must be set");
     let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let gateway_secret =
+        std::env::var("GATEWAY_SECRET").unwrap_or_else(|_| "dev-gateway-secret".into());
 
     let google_verifier = GoogleTokenVerifier::new(google_client_id, google_client_secret);
     let jwt_secret = JwtSecret(jwt_secret);
+    let gateway_secret = GatewaySecret(gateway_secret);
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -77,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api", routes::router())
         .layer(Extension(google_verifier))
         .layer(Extension(jwt_secret))
+        .layer(Extension(gateway_secret))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

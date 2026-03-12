@@ -55,12 +55,13 @@ async fn list_daily_hours(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let items = sqlx::query_as::<_, DailyWorkHours>(
-        r#"SELECT * FROM daily_work_hours
-           WHERE tenant_id = $1
-             AND ($2::UUID IS NULL OR driver_id = $2)
-             AND ($3::DATE IS NULL OR work_date >= $3)
-             AND ($4::DATE IS NULL OR work_date <= $4)
-           ORDER BY work_date DESC, driver_id
+        r#"SELECT h.* FROM daily_work_hours h
+           JOIN drivers d ON d.id = h.driver_id
+           WHERE h.tenant_id = $1
+             AND ($2::UUID IS NULL OR h.driver_id = $2)
+             AND ($3::DATE IS NULL OR h.work_date >= $3)
+             AND ($4::DATE IS NULL OR h.work_date <= $4)
+           ORDER BY h.work_date ASC, d.driver_cd
            LIMIT $5 OFFSET $6"#,
     )
     .bind(tenant_id)

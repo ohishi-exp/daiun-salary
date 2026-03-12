@@ -70,6 +70,15 @@ src/
 - API エンドポイント一覧
 - 計算ロジックの擬似コード
 
+## Related Projects
+
+- **フロントエンド:** `/home/yhonda/js/nuxt-dtako-admin` — Nuxt 4 + Nuxt UI の管理画面。本バックエンドの API を呼び出す
+
+## Deploy
+
+- **バックエンド:** `./deploy.sh` — Docker build → GCP Artifact Registry push → Cloud Run deploy (asia-northeast1)
+- **フロントエンド:** `cd /home/yhonda/js/nuxt-dtako-admin && npx nuxi build && npx wrangler deploy` — Cloudflare Workers
+
 ## plans
 plansフォルダに計画したplanはファイルとして保存
 終了したplanはplans/completedに移動

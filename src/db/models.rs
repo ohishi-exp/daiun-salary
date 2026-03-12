@@ -151,6 +151,11 @@ pub struct EventClassification {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateClassificationRequest {
+    pub classification: String,
+}
+
 // --- API DTOs ---
 
 #[derive(Debug, Serialize, FromRow)]

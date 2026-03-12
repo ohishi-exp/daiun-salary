@@ -2,6 +2,7 @@ pub mod auth;
 pub mod csv_proxy;
 pub mod daily_hours;
 pub mod drivers;
+pub mod event_classifications;
 pub mod operations;
 pub mod upload;
 pub mod vehicles;
@@ -20,6 +21,7 @@ pub fn router() -> Router<AppState> {
         .merge(drivers::router())
         .merge(vehicles::router())
         .merge(daily_hours::router())
+        .merge(event_classifications::router())
         .layer(axum_middleware::from_fn(require_jwt));
 
     let public_routes = Router::new().merge(auth::public_router());

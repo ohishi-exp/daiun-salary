@@ -1,0 +1,435 @@
+use axum::{
+    extract::{Multipart, State},
+    http::StatusCode,
+    routing::post,
+    Extension, Json, Router,
+};
+use serde::Serialize;
+use uuid::Uuid;
+
+use crate::csv_parser;
+use crate::csv_parser::kudguri::{parse_kudguri, KudguriRow};
+use crate::middleware::auth::AuthUser;
+use crate::AppState;
+
+pub fn router() -> Router<AppState> {
+    Router::new().route("/upload", post(upload_zip))
+}
+
+#[derive(Debug, Serialize)]
+pub struct UploadResponse {
+    pub upload_id: Uuid,
+    pub operations_count: i32,
+    pub status: String,
+}
+
+async fn upload_zip(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>, (StatusCode, String)> {
+    let tenant_id = auth_user.tenant_id;
+
+    // Extract ZIP file from multipart
+    let (filename, zip_bytes) = extract_file(&mut multipart).await?;
+
+    // Create upload history record
+    let upload_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO upload_history (id, tenant_id, uploaded_by, filename, status)
+           VALUES ($1, $2, $3, $4, 'processing')"#,
+    )
+    .bind(upload_id)
+    .bind(tenant_id)
+    .bind(auth_user.user_id)
+    .bind(&filename)
+    .execute(&state.pool)
+    .await
+    .map_err(internal_err)?;
+
+    // Process ZIP
+    match process_zip(&state, tenant_id, upload_id, &filename, &zip_bytes).await {
+        Ok(count) => {
+            // Mark success
+            sqlx::query(
+                "UPDATE upload_history SET status = 'completed', operations_count = $1 WHERE id = $2",
+            )
+            .bind(count)
+            .bind(upload_id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal_err)?;
+
+            Ok(Json(UploadResponse {
+                upload_id,
+                operations_count: count,
+                status: "completed".to_string(),
+            }))
+        }
+        Err(e) => {
+            // Mark failure
+            let _ = sqlx::query(
+                "UPDATE upload_history SET status = 'failed', error_message = $1 WHERE id = $2",
+            )
+            .bind(e.to_string())
+            .bind(upload_id)
+            .execute(&state.pool)
+            .await;
+
+            Err((StatusCode::BAD_REQUEST, e.to_string()))
+        }
+    }
+}
+
+async fn extract_file(multipart: &mut Multipart) -> Result<(String, Vec<u8>), (StatusCode, String)> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart error: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            let filename = field
+                .file_name()
+                .unwrap_or("upload.zip")
+                .to_string();
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("read error: {e}")))?;
+            return Ok((filename, bytes.to_vec()));
+        }
+    }
+    Err((StatusCode::BAD_REQUEST, "no 'file' field found".to_string()))
+}
+
+async fn process_zip(
+    state: &AppState,
+    tenant_id: Uuid,
+    upload_id: Uuid,
+    filename: &str,
+    zip_bytes: &[u8],
+) -> Result<i32, anyhow::Error> {
+    // 1. Save original ZIP to R2
+    let zip_key = format!("{}/uploads/{}/{}", tenant_id, upload_id, filename);
+    state
+        .storage
+        .upload(&zip_key, zip_bytes, "application/zip")
+        .await
+        .map_err(|e| anyhow::anyhow!("R2 upload failed: {e}"))?;
+
+    // Update upload_history with R2 key
+    sqlx::query("UPDATE upload_history SET r2_zip_key = $1 WHERE id = $2")
+        .bind(&zip_key)
+        .bind(upload_id)
+        .execute(&state.pool)
+        .await?;
+
+    // 2. Extract ZIP
+    let files = csv_parser::extract_zip(zip_bytes)?;
+
+    // 3. Find and parse KUDGURI.csv
+    let kudguri_file = files
+        .iter()
+        .find(|(name, _)| name.to_uppercase().contains("KUDGURI"))
+        .ok_or_else(|| anyhow::anyhow!("KUDGURI.csv not found in ZIP"))?;
+
+    let csv_text = csv_parser::decode_shift_jis(&kudguri_file.1);
+    let rows = parse_kudguri(&csv_text)?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    // 4. Save all CSV files to R2 (grouped by unko_no)
+    for (name, bytes) in &files {
+        if name.to_lowercase().ends_with(".csv") {
+            let utf8_text = csv_parser::decode_shift_jis(bytes);
+            let header = csv_parser::csv_header(&utf8_text);
+            let grouped = csv_parser::group_csv_by_unko_no(&utf8_text);
+
+            for (unko_no, lines) in &grouped {
+                let csv_name = name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(name)
+                    .to_uppercase()
+                    .replace(".CSV", ".csv");
+                let key = format!("{}/unko/{}/{}", tenant_id, unko_no, csv_name);
+                let mut content = String::new();
+                if let Some(h) = header {
+                    content.push_str(h);
+                    content.push('\n');
+                }
+                for line in lines {
+                    content.push_str(line);
+                    content.push('\n');
+                }
+                let _ = state
+                    .storage
+                    .upload(&key, content.as_bytes(), "text/csv")
+                    .await;
+            }
+        }
+    }
+
+    // 5. Upsert masters and insert operations
+    let mut operations_count = 0i32;
+    for row in &rows {
+        // Upsert office
+        let office_id = upsert_office(state, tenant_id, &row.office_cd, &row.office_name).await?;
+        // Upsert vehicle
+        let vehicle_id =
+            upsert_vehicle(state, tenant_id, &row.vehicle_cd, &row.vehicle_name).await?;
+        // Upsert driver
+        let driver_id =
+            upsert_driver(state, tenant_id, &row.driver_cd, &row.driver_name).await?;
+
+        let r2_key_prefix = format!("{}/unko/{}", tenant_id, row.unko_no);
+
+        // Delete existing operation with same (tenant_id, unko_no, crew_role) for re-upload
+        sqlx::query(
+            "DELETE FROM operations WHERE tenant_id = $1 AND unko_no = $2 AND crew_role = $3",
+        )
+        .bind(tenant_id)
+        .bind(&row.unko_no)
+        .bind(row.crew_role)
+        .execute(&state.pool)
+        .await?;
+
+        // Insert operation
+        sqlx::query(
+            r#"INSERT INTO operations (
+                tenant_id, unko_no, crew_role, reading_date, operation_date,
+                office_id, vehicle_id, driver_id,
+                departure_at, return_at, garage_out_at, garage_in_at,
+                meter_start, meter_end, total_distance,
+                drive_time_general, drive_time_highway, drive_time_bypass,
+                safety_score, economy_score, total_score,
+                raw_data, r2_key_prefix
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8,
+                $9, $10, $11, $12,
+                $13, $14, $15,
+                $16, $17, $18,
+                $19, $20, $21,
+                $22, $23
+            )"#,
+        )
+        .bind(tenant_id)
+        .bind(&row.unko_no)
+        .bind(row.crew_role)
+        .bind(row.reading_date)
+        .bind(row.operation_date)
+        .bind(office_id)
+        .bind(vehicle_id)
+        .bind(driver_id)
+        .bind(row.departure_at)
+        .bind(row.return_at)
+        .bind(row.garage_out_at)
+        .bind(row.garage_in_at)
+        .bind(row.meter_start)
+        .bind(row.meter_end)
+        .bind(row.total_distance)
+        .bind(row.drive_time_general)
+        .bind(row.drive_time_highway)
+        .bind(row.drive_time_bypass)
+        .bind(row.safety_score)
+        .bind(row.economy_score)
+        .bind(row.total_score)
+        .bind(&row.raw_data)
+        .bind(&r2_key_prefix)
+        .execute(&state.pool)
+        .await?;
+
+        operations_count += 1;
+    }
+
+    // 6. Calculate daily_work_hours
+    calculate_daily_hours(state, tenant_id, &rows).await?;
+
+    Ok(operations_count)
+}
+
+async fn upsert_office(
+    state: &AppState,
+    tenant_id: Uuid,
+    office_cd: &str,
+    office_name: &str,
+) -> Result<Option<Uuid>, anyhow::Error> {
+    if office_cd.is_empty() {
+        return Ok(None);
+    }
+    let rec = sqlx::query_as::<_, (Uuid,)>(
+        r#"INSERT INTO offices (tenant_id, office_cd, office_name)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (tenant_id, office_cd) DO UPDATE SET office_name = EXCLUDED.office_name
+           RETURNING id"#,
+    )
+    .bind(tenant_id)
+    .bind(office_cd)
+    .bind(office_name)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Some(rec.0))
+}
+
+async fn upsert_vehicle(
+    state: &AppState,
+    tenant_id: Uuid,
+    vehicle_cd: &str,
+    vehicle_name: &str,
+) -> Result<Option<Uuid>, anyhow::Error> {
+    if vehicle_cd.is_empty() {
+        return Ok(None);
+    }
+    let rec = sqlx::query_as::<_, (Uuid,)>(
+        r#"INSERT INTO vehicles (tenant_id, vehicle_cd, vehicle_name)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (tenant_id, vehicle_cd) DO UPDATE SET vehicle_name = EXCLUDED.vehicle_name
+           RETURNING id"#,
+    )
+    .bind(tenant_id)
+    .bind(vehicle_cd)
+    .bind(vehicle_name)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Some(rec.0))
+}
+
+async fn upsert_driver(
+    state: &AppState,
+    tenant_id: Uuid,
+    driver_cd: &str,
+    driver_name: &str,
+) -> Result<Option<Uuid>, anyhow::Error> {
+    if driver_cd.is_empty() {
+        return Ok(None);
+    }
+    let rec = sqlx::query_as::<_, (Uuid,)>(
+        r#"INSERT INTO drivers (tenant_id, driver_cd, driver_name)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (tenant_id, driver_cd) DO UPDATE SET driver_name = EXCLUDED.driver_name
+           RETURNING id"#,
+    )
+    .bind(tenant_id)
+    .bind(driver_cd)
+    .bind(driver_name)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Some(rec.0))
+}
+
+async fn calculate_daily_hours(
+    state: &AppState,
+    tenant_id: Uuid,
+    rows: &[KudguriRow],
+) -> Result<(), anyhow::Error> {
+    use std::collections::HashMap;
+
+    // Group by (driver_cd, operation_date or reading_date)
+    struct DayAgg {
+        driver_id: Option<Uuid>,
+        total_work_minutes: i32,
+        total_drive_minutes: i32,
+        total_distance: f64,
+        operation_count: i32,
+        unko_nos: Vec<String>,
+    }
+
+    let mut day_map: HashMap<(String, chrono::NaiveDate), DayAgg> = HashMap::new();
+
+    for row in rows {
+        let work_date = row.operation_date.unwrap_or(row.reading_date);
+        let driver_id = if !row.driver_cd.is_empty() {
+            let rec = sqlx::query_as::<_, (Uuid,)>(
+                "SELECT id FROM drivers WHERE tenant_id = $1 AND driver_cd = $2",
+            )
+            .bind(tenant_id)
+            .bind(&row.driver_cd)
+            .fetch_optional(&state.pool)
+            .await?;
+            rec.map(|r| r.0)
+        } else {
+            None
+        };
+
+        let drive_mins = row.drive_time_general.unwrap_or(0)
+            + row.drive_time_highway.unwrap_or(0)
+            + row.drive_time_bypass.unwrap_or(0);
+
+        // Work time = departure to return (if both exist)
+        let work_mins = match (row.departure_at, row.return_at) {
+            (Some(dep), Some(ret)) => (ret - dep).num_minutes() as i32,
+            _ => drive_mins,
+        };
+
+        let entry = day_map
+            .entry((row.driver_cd.clone(), work_date))
+            .or_insert(DayAgg {
+                driver_id,
+                total_work_minutes: 0,
+                total_drive_minutes: 0,
+                total_distance: 0.0,
+                operation_count: 0,
+                unko_nos: Vec::new(),
+            });
+
+        entry.total_work_minutes += work_mins;
+        entry.total_drive_minutes += drive_mins;
+        entry.total_distance += row.total_distance.unwrap_or(0.0);
+        entry.operation_count += 1;
+        entry.unko_nos.push(row.unko_no.clone());
+        if entry.driver_id.is_none() {
+            entry.driver_id = driver_id;
+        }
+    }
+
+    for ((_driver_cd, work_date), agg) in &day_map {
+        let Some(driver_id) = agg.driver_id else {
+            continue;
+        };
+
+        let rest_minutes = (agg.total_work_minutes - agg.total_drive_minutes).max(0);
+
+        // Delete existing for re-upload
+        sqlx::query(
+            "DELETE FROM daily_work_hours WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3",
+        )
+        .bind(tenant_id)
+        .bind(driver_id)
+        .bind(work_date)
+        .execute(&state.pool)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO daily_work_hours (
+                tenant_id, driver_id, work_date,
+                total_work_minutes, total_drive_minutes, total_rest_minutes,
+                total_distance, operation_count, unko_nos
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+        )
+        .bind(tenant_id)
+        .bind(driver_id)
+        .bind(work_date)
+        .bind(agg.total_work_minutes)
+        .bind(agg.total_drive_minutes)
+        .bind(rest_minutes)
+        .bind(agg.total_distance)
+        .bind(agg.operation_count)
+        .bind(&agg.unko_nos)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn internal_err(e: impl std::fmt::Display) -> (StatusCode, String) {
+    tracing::error!("internal error: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".to_string(),
+    )
+}

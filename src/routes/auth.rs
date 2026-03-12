@@ -1,0 +1,204 @@
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Extension, Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::auth::google::GoogleTokenVerifier;
+use crate::auth::jwt::{
+    self, create_access_token, create_refresh_token, hash_refresh_token, refresh_token_expires_at,
+    JwtSecret,
+};
+use crate::db::models::{Tenant, User};
+use crate::middleware::auth::AuthUser;
+use crate::AppState;
+
+pub fn public_router() -> Router<AppState> {
+    Router::new()
+        .route("/auth/google/code", post(google_code_login))
+        .route("/auth/refresh", post(refresh_token))
+}
+
+pub fn protected_router() -> Router<AppState> {
+    Router::new()
+        .route("/auth/me", get(me))
+        .route("/auth/logout", post(logout))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GoogleCodeRequest {
+    pub code: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: i64,
+    pub user: UserResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserResponse {
+    pub id: Uuid,
+    pub email: String,
+    pub name: String,
+    pub tenant_id: Uuid,
+    pub role: String,
+}
+
+async fn google_code_login(
+    State(state): State<AppState>,
+    Extension(verifier): Extension<GoogleTokenVerifier>,
+    Extension(jwt_secret): Extension<JwtSecret>,
+    Json(body): Json<GoogleCodeRequest>,
+) -> Result<Json<AuthResponse>, StatusCode> {
+    let google_claims = verifier
+        .exchange_code(&body.code, &body.redirect_uri)
+        .await
+        .map_err(|e| {
+            tracing::warn!("Google code exchange failed: {e}");
+            StatusCode::UNAUTHORIZED
+        })?;
+
+    // Find or create user
+    let existing_user =
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE google_sub = $1")
+            .bind(&google_claims.sub)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let user = match existing_user {
+        Some(user) => user,
+        None => {
+            let tenant_name = google_claims
+                .email
+                .split('@')
+                .nth(1)
+                .unwrap_or("default")
+                .to_string();
+
+            let tenant = sqlx::query_as::<_, Tenant>(
+                "INSERT INTO tenants (name) VALUES ($1) RETURNING *",
+            )
+            .bind(&tenant_name)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            sqlx::query_as::<_, User>(
+                r#"
+                INSERT INTO users (tenant_id, google_sub, email, name, role)
+                VALUES ($1, $2, $3, $4, 'admin')
+                RETURNING *
+                "#,
+            )
+            .bind(tenant.id)
+            .bind(&google_claims.sub)
+            .bind(&google_claims.email)
+            .bind(&google_claims.name)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        }
+    };
+
+    let access_token = create_access_token(&user, &jwt_secret)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (raw_refresh, refresh_hash) = create_refresh_token();
+    let expires_at = refresh_token_expires_at();
+
+    sqlx::query(
+        "UPDATE users SET refresh_token_hash = $1, refresh_token_expires_at = $2 WHERE id = $3",
+    )
+    .bind(&refresh_hash)
+    .bind(expires_at)
+    .bind(user.id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(AuthResponse {
+        access_token,
+        refresh_token: raw_refresh,
+        expires_in: jwt::ACCESS_TOKEN_EXPIRY_SECS,
+        user: UserResponse {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+            tenant_id: user.tenant_id,
+            role: user.role,
+        },
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefreshResponse {
+    pub access_token: String,
+    pub expires_in: i64,
+}
+
+async fn refresh_token(
+    State(state): State<AppState>,
+    Extension(jwt_secret): Extension<JwtSecret>,
+    Json(body): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, StatusCode> {
+    let token_hash = hash_refresh_token(&body.refresh_token);
+
+    let user = sqlx::query_as::<_, User>(
+        r#"
+        SELECT * FROM users
+        WHERE refresh_token_hash = $1
+          AND refresh_token_expires_at > NOW()
+        "#,
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let access_token = create_access_token(&user, &jwt_secret)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(RefreshResponse {
+        access_token,
+        expires_in: jwt::ACCESS_TOKEN_EXPIRY_SECS,
+    }))
+}
+
+async fn me(Extension(auth_user): Extension<AuthUser>) -> Json<UserResponse> {
+    Json(UserResponse {
+        id: auth_user.user_id,
+        email: auth_user.email,
+        name: auth_user.name,
+        tenant_id: auth_user.tenant_id,
+        role: auth_user.role,
+    })
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<StatusCode, StatusCode> {
+    sqlx::query(
+        "UPDATE users SET refresh_token_hash = NULL, refresh_token_expires_at = NULL WHERE id = $1",
+    )
+    .bind(auth_user.user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}

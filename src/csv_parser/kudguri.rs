@@ -60,18 +60,42 @@ fn find_col(headers: &[&str], name: &str) -> Option<usize> {
     headers.iter().position(|h| h.trim() == name)
 }
 
-fn build_column_index(headers: &[&str]) -> Option<ColumnIndex> {
-    Some(ColumnIndex {
-        unko_no: find_col(headers, "運行NO")?,
-        reading_date: find_col(headers, "読取日")?,
+fn require_col<'a>(headers: &[&str], name: &'a str, missing: &mut Vec<&'a str>) -> Option<usize> {
+    let idx = find_col(headers, name);
+    if idx.is_none() {
+        missing.push(name);
+    }
+    idx
+}
+
+fn build_column_index(headers: &[&str]) -> Result<ColumnIndex, String> {
+    let mut missing = Vec::new();
+
+    let unko_no = require_col(headers, "運行NO", &mut missing);
+    let reading_date = require_col(headers, "読取日", &mut missing);
+    let office_cd = require_col(headers, "事業所CD", &mut missing);
+    let office_name = require_col(headers, "事業所名", &mut missing);
+    let vehicle_cd = require_col(headers, "車輌CD", &mut missing);
+    let vehicle_name = require_col(headers, "車輌名", &mut missing);
+    let driver_cd = require_col(headers, "乗務員CD1", &mut missing);
+    let driver_name = require_col(headers, "乗務員名１", &mut missing);
+    let crew_role = require_col(headers, "対象乗務員区分", &mut missing);
+
+    if !missing.is_empty() {
+        return Err(format!("missing required columns: {}", missing.join(", ")));
+    }
+
+    Ok(ColumnIndex {
+        unko_no: unko_no.unwrap(),
+        reading_date: reading_date.unwrap(),
         operation_date: find_col(headers, "運行日"),
-        office_cd: find_col(headers, "事業所CD")?,
-        office_name: find_col(headers, "事業所名")?,
-        vehicle_cd: find_col(headers, "車輌CD")?,
-        vehicle_name: find_col(headers, "車輌名")?,
-        driver_cd: find_col(headers, "乗務員CD1")?,
-        driver_name: find_col(headers, "乗務員名１")?,
-        crew_role: find_col(headers, "対象乗務員区分")?,
+        office_cd: office_cd.unwrap(),
+        office_name: office_name.unwrap(),
+        vehicle_cd: vehicle_cd.unwrap(),
+        vehicle_name: vehicle_name.unwrap(),
+        driver_cd: driver_cd.unwrap(),
+        driver_name: driver_name.unwrap(),
+        crew_role: crew_role.unwrap(),
         departure_at: find_col(headers, "出社日時"),
         return_at: find_col(headers, "退社日時"),
         garage_out_at: find_col(headers, "出庫日時"),
@@ -124,7 +148,7 @@ pub fn parse_kudguri(csv_text: &str) -> Result<Vec<KudguriRow>, anyhow::Error> {
     let header_line = lines.next().ok_or_else(|| anyhow::anyhow!("empty CSV"))?;
     let headers: Vec<&str> = header_line.split(',').collect();
     let col_idx =
-        build_column_index(&headers).ok_or_else(|| anyhow::anyhow!("missing required columns"))?;
+        build_column_index(&headers).map_err(|e| anyhow::anyhow!(e))?;
 
     let mut rows = Vec::new();
     for line in lines {
@@ -220,5 +244,19 @@ mod tests {
         assert_eq!(row.drive_time_general, Some(108));
         assert_eq!(row.drive_time_highway, Some(1687));
         assert!((row.total_score.unwrap() - 98.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_missing_columns_error_message() {
+        let csv = "運行NO,読取日\ndata1,data2";
+        let err = parse_kudguri(csv).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing required columns"), "got: {msg}");
+        assert!(msg.contains("事業所CD"), "got: {msg}");
+        assert!(msg.contains("乗務員CD1"), "got: {msg}");
+        assert!(msg.contains("対象乗務員区分"), "got: {msg}");
+        // 存在するカラムは含まれない
+        assert!(!msg.contains("運行NO"), "got: {msg}");
+        assert!(!msg.contains("読取日"), "got: {msg}");
     }
 }

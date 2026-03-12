@@ -1,17 +1,24 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
     Extension, Json, Router,
 };
+use chrono::NaiveDate;
 use serde::Serialize;
+use uuid::Uuid;
 
-use crate::db::models::{DailyHoursFilter, DailyWorkHours};
+use crate::db::models::{DailyHoursFilter, DailyWorkHours, DailyWorkSegment};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/daily-hours", get(list_daily_hours))
+    Router::new()
+        .route("/daily-hours", get(list_daily_hours))
+        .route(
+            "/daily-hours/{driver_id}/{date}/segments",
+            get(get_daily_segments),
+        )
 }
 
 #[derive(Debug, Serialize)]
@@ -72,4 +79,31 @@ async fn list_daily_hours(
         page,
         per_page,
     }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SegmentsResponse {
+    pub segments: Vec<DailyWorkSegment>,
+}
+
+async fn get_daily_segments(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path((driver_id, date)): Path<(Uuid, NaiveDate)>,
+) -> Result<Json<SegmentsResponse>, StatusCode> {
+    let tenant_id = auth_user.tenant_id;
+
+    let segments = sqlx::query_as::<_, DailyWorkSegment>(
+        r#"SELECT * FROM daily_work_segments
+           WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3
+           ORDER BY start_at"#,
+    )
+    .bind(tenant_id)
+    .bind(driver_id)
+    .bind(date)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(SegmentsResponse { segments }))
 }

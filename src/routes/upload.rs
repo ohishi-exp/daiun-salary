@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 use crate::csv_parser;
 use crate::csv_parser::kudguri::{parse_kudguri, KudguriRow};
+use crate::csv_parser::kudgivt::{parse_kudgivt, KudgivtRow};
+use crate::csv_parser::work_segments::{self, EventClass};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
@@ -141,6 +143,15 @@ async fn process_zip(
         return Ok(0);
     }
 
+    // 3b. Find and parse KUDGIVT.csv
+    let kudgivt_file = files
+        .iter()
+        .find(|(name, _)| name.to_uppercase().contains("KUDGIVT"))
+        .ok_or_else(|| anyhow::anyhow!("KUDGIVT.csv not found in ZIP"))?;
+
+    let kudgivt_text = csv_parser::decode_shift_jis(&kudgivt_file.1);
+    let kudgivt_rows = parse_kudgivt(&kudgivt_text)?;
+
     // 4. Save all CSV files to R2 (grouped by unko_no)
     for (name, bytes) in &files {
         if name.to_lowercase().ends_with(".csv") {
@@ -246,8 +257,8 @@ async fn process_zip(
         operations_count += 1;
     }
 
-    // 6. Calculate daily_work_hours
-    calculate_daily_hours(state, tenant_id, &rows).await?;
+    // 6. Calculate daily_work_hours using KUDGIVT events
+    calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows).await?;
 
     Ok(operations_count)
 }
@@ -325,42 +336,42 @@ async fn calculate_daily_hours(
     state: &AppState,
     tenant_id: Uuid,
     rows: &[KudguriRow],
+    kudgivt_rows: &[KudgivtRow],
 ) -> Result<(), anyhow::Error> {
     use std::collections::HashMap;
 
+    // 1. Load or initialize event classifications
+    let classifications = load_or_init_classifications(state, tenant_id, kudgivt_rows).await?;
+
+    // 2. Group KUDGIVT rows by unko_no
+    let mut kudgivt_by_unko: HashMap<String, Vec<&KudgivtRow>> = HashMap::new();
+    for row in kudgivt_rows {
+        kudgivt_by_unko
+            .entry(row.unko_no.clone())
+            .or_default()
+            .push(row);
+    }
+
+    // 3. Aggregate per (driver_cd, date)
     struct DayAgg {
         driver_id: Option<Uuid>,
         total_work_minutes: i32,
-        total_drive_minutes: i32,
+        total_labor_minutes: i32,
         late_night_minutes: i32,
         total_distance: f64,
         operation_count: i32,
         unko_nos: Vec<String>,
+        segments: Vec<SegmentRecord>,
     }
 
-    /// day_start〜day_end 間の深夜時間（22:00〜翌5:00）を分単位で返す
-    fn calc_late_night_mins(
-        day_start: chrono::NaiveDateTime,
-        day_end: chrono::NaiveDateTime,
-    ) -> i32 {
-        use chrono::Timelike;
-        let mut total = 0i32;
-        // 深夜帯: 0:00〜5:00 と 22:00〜24:00
-        let start_h = day_start.hour() * 60 + day_start.minute();
-        let end_h = day_end.hour() * 60 + day_end.minute();
-        // 0:00〜5:00 (0〜300分)
-        let early_start = start_h.max(0);
-        let early_end = end_h.min(300);
-        if early_end > early_start {
-            total += (early_end - early_start) as i32;
-        }
-        // 22:00〜24:00 (1320〜1440分)
-        let late_start = start_h.max(1320);
-        let late_end = end_h.min(1440);
-        if late_end > late_start {
-            total += (late_end - late_start) as i32;
-        }
-        total
+    struct SegmentRecord {
+        unko_no: String,
+        segment_index: i32,
+        start_at: chrono::NaiveDateTime,
+        end_at: chrono::NaiveDateTime,
+        work_minutes: i32,
+        labor_minutes: i32,
+        late_night_minutes: i32,
     }
 
     let mut day_map: HashMap<(String, chrono::NaiveDate), DayAgg> = HashMap::new();
@@ -379,60 +390,46 @@ async fn calculate_daily_hours(
             None
         };
 
-        let total_drive_mins = row.drive_time_general.unwrap_or(0)
-            + row.drive_time_highway.unwrap_or(0)
-            + row.drive_time_bypass.unwrap_or(0);
         let total_distance = row.total_distance.unwrap_or(0.0);
 
         match (row.departure_at, row.return_at) {
             (Some(dep), Some(ret)) if ret > dep => {
-                // 出社〜退社を日ごとに分割
-                let total_work_mins = (ret - dep).num_minutes() as i32;
-                let mut current = dep.date();
-                let end_date = ret.date();
+                // KUDGIVTイベントで休息分割
+                let events = kudgivt_by_unko.get(&row.unko_no);
+                let event_slice: Vec<&KudgivtRow> = events
+                    .map(|e| e.iter().copied().collect())
+                    .unwrap_or_default();
 
-                while current <= end_date {
-                    // この日の拘束時間を計算（0:00〜24:00で区切る）
-                    let day_start = if current == dep.date() {
-                        dep
-                    } else {
-                        current.and_hms_opt(0, 0, 0).unwrap()
-                    };
-                    let day_end = if current == end_date {
-                        ret
-                    } else {
-                        (current + chrono::Duration::days(1))
-                            .and_hms_opt(0, 0, 0)
-                            .unwrap()
-                    };
-                    let day_work_mins = (day_end - day_start).num_minutes() as i32;
+                let segments = work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
+                let daily_segments = work_segments::split_segments_by_day(&segments);
 
-                    // 運転時間・走行距離は拘束時間比で按分
+                // 総拘束時間（走行距離按分用）
+                let total_work_mins: i32 = daily_segments.iter().map(|s| s.work_minutes).sum();
+
+                for ds in &daily_segments {
                     let ratio = if total_work_mins > 0 {
-                        day_work_mins as f64 / total_work_mins as f64
+                        ds.work_minutes as f64 / total_work_mins as f64
                     } else {
                         0.0
                     };
-                    let day_drive_mins = (total_drive_mins as f64 * ratio).round() as i32;
                     let day_distance = total_distance * ratio;
 
-                    let late_night_mins = calc_late_night_mins(day_start, day_end);
-
                     let entry = day_map
-                        .entry((row.driver_cd.clone(), current))
+                        .entry((row.driver_cd.clone(), ds.date))
                         .or_insert(DayAgg {
                             driver_id,
                             total_work_minutes: 0,
-                            total_drive_minutes: 0,
+                            total_labor_minutes: 0,
                             late_night_minutes: 0,
                             total_distance: 0.0,
                             operation_count: 0,
                             unko_nos: Vec::new(),
+                            segments: Vec::new(),
                         });
 
-                    entry.total_work_minutes += day_work_mins;
-                    entry.total_drive_minutes += day_drive_mins;
-                    entry.late_night_minutes += late_night_mins;
+                    entry.total_work_minutes += ds.work_minutes;
+                    entry.total_labor_minutes += ds.labor_minutes;
+                    entry.late_night_minutes += ds.late_night_minutes;
                     entry.total_distance += day_distance;
                     if !entry.unko_nos.contains(&row.unko_no) {
                         entry.unko_nos.push(row.unko_no.clone());
@@ -442,26 +439,45 @@ async fn calculate_daily_hours(
                         entry.driver_id = driver_id;
                     }
 
-                    current += chrono::Duration::days(1);
+                    let seg_idx = entry
+                        .segments
+                        .iter()
+                        .filter(|s| s.unko_no == row.unko_no)
+                        .count() as i32;
+
+                    entry.segments.push(SegmentRecord {
+                        unko_no: row.unko_no.clone(),
+                        segment_index: seg_idx,
+                        start_at: ds.start,
+                        end_at: ds.end,
+                        work_minutes: ds.work_minutes,
+                        labor_minutes: ds.labor_minutes,
+                        late_night_minutes: ds.late_night_minutes,
+                    });
                 }
             }
             _ => {
                 // 出社・退社がない場合は運行日（or 読取日）に集約
                 let work_date = row.operation_date.unwrap_or(row.reading_date);
+                let total_drive_mins = row.drive_time_general.unwrap_or(0)
+                    + row.drive_time_highway.unwrap_or(0)
+                    + row.drive_time_bypass.unwrap_or(0);
+
                 let entry = day_map
                     .entry((row.driver_cd.clone(), work_date))
                     .or_insert(DayAgg {
                         driver_id,
                         total_work_minutes: 0,
-                        total_drive_minutes: 0,
+                        total_labor_minutes: 0,
                         late_night_minutes: 0,
                         total_distance: 0.0,
                         operation_count: 0,
                         unko_nos: Vec::new(),
+                        segments: Vec::new(),
                     });
 
                 entry.total_work_minutes += total_drive_mins;
-                entry.total_drive_minutes += total_drive_mins;
+                entry.total_labor_minutes += total_drive_mins;
                 entry.total_distance += total_distance;
                 entry.operation_count += 1;
                 entry.unko_nos.push(row.unko_no.clone());
@@ -472,12 +488,13 @@ async fn calculate_daily_hours(
         }
     }
 
+    // 4. Persist to DB
     for ((_driver_cd, work_date), agg) in &day_map {
         let Some(driver_id) = agg.driver_id else {
             continue;
         };
 
-        let rest_minutes = (agg.total_work_minutes - agg.total_drive_minutes).max(0);
+        let rest_minutes = (agg.total_work_minutes - agg.total_labor_minutes).max(0);
 
         // Delete existing for re-upload
         sqlx::query(
@@ -501,7 +518,7 @@ async fn calculate_daily_hours(
         .bind(driver_id)
         .bind(work_date)
         .bind(agg.total_work_minutes)
-        .bind(agg.total_drive_minutes)
+        .bind(agg.total_labor_minutes)
         .bind(rest_minutes)
         .bind(agg.late_night_minutes)
         .bind(agg.total_distance)
@@ -509,9 +526,105 @@ async fn calculate_daily_hours(
         .bind(&agg.unko_nos)
         .execute(&state.pool)
         .await?;
+
+        // Delete and re-insert segments
+        sqlx::query(
+            "DELETE FROM daily_work_segments WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3",
+        )
+        .bind(tenant_id)
+        .bind(driver_id)
+        .bind(work_date)
+        .execute(&state.pool)
+        .await?;
+
+        for seg in &agg.segments {
+            sqlx::query(
+                r#"INSERT INTO daily_work_segments (
+                    tenant_id, driver_id, work_date, unko_no, segment_index,
+                    start_at, end_at, work_minutes, labor_minutes, late_night_minutes
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+            )
+            .bind(tenant_id)
+            .bind(driver_id)
+            .bind(work_date)
+            .bind(&seg.unko_no)
+            .bind(seg.segment_index)
+            .bind(seg.start_at)
+            .bind(seg.end_at)
+            .bind(seg.work_minutes)
+            .bind(seg.labor_minutes)
+            .bind(seg.late_night_minutes)
+            .execute(&state.pool)
+            .await?;
+        }
     }
 
     Ok(())
+}
+
+/// イベント分類をDBから取得、なければデフォルトで初期化
+async fn load_or_init_classifications(
+    state: &AppState,
+    tenant_id: Uuid,
+    kudgivt_rows: &[KudgivtRow],
+) -> Result<std::collections::HashMap<String, EventClass>, anyhow::Error> {
+    use std::collections::HashMap;
+
+    // DBから既存の分類を取得
+    let existing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_cd, classification FROM event_classifications WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut map: HashMap<String, EventClass> = HashMap::new();
+    for (cd, cls) in &existing {
+        let ec = match cls.as_str() {
+            "work" => EventClass::Work,
+            "rest_split" => EventClass::RestSplit,
+            "break" => EventClass::Break,
+            _ => EventClass::Ignore,
+        };
+        map.insert(cd.clone(), ec);
+    }
+
+    // 未登録のイベントをKUDGIVTから検出してデフォルト分類で登録
+    let mut seen: std::collections::HashSet<String> = map.keys().cloned().collect();
+    for row in kudgivt_rows {
+        if seen.contains(&row.event_cd) {
+            continue;
+        }
+        seen.insert(row.event_cd.clone());
+
+        let (cls_str, ec) = default_classification(&row.event_cd);
+        map.insert(row.event_cd.clone(), ec);
+
+        let _ = sqlx::query(
+            r#"INSERT INTO event_classifications (tenant_id, event_cd, event_name, classification)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (tenant_id, event_cd) DO NOTHING"#,
+        )
+        .bind(tenant_id)
+        .bind(&row.event_cd)
+        .bind(&row.event_name)
+        .bind(cls_str)
+        .execute(&state.pool)
+        .await;
+    }
+
+    Ok(map)
+}
+
+fn default_classification(event_cd: &str) -> (&'static str, EventClass) {
+    match event_cd {
+        "110" => ("work", EventClass::Work),           // IG-Moving(運転)
+        "202" => ("work", EventClass::Work),           // 積み
+        "203" => ("work", EventClass::Work),           // 降し
+        "302" => ("rest_split", EventClass::RestSplit), // 休息
+        "301" => ("break", EventClass::Break),         // 休憩
+        _ => ("ignore", EventClass::Ignore),           // その他は無視
+    }
 }
 
 fn internal_err(e: impl std::fmt::Display) -> (StatusCode, String) {

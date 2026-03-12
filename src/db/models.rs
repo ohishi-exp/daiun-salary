@@ -121,6 +121,36 @@ pub struct DailyWorkHours {
     pub updated_at: DateTime<Utc>,
 }
 
+// --- Daily Work Segments ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct DailyWorkSegment {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub driver_id: Uuid,
+    pub work_date: NaiveDate,
+    pub unko_no: String,
+    pub segment_index: i32,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub work_minutes: i32,
+    pub labor_minutes: i32,
+    pub late_night_minutes: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+// --- Event Classification ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct EventClassification {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub event_cd: String,
+    pub event_name: String,
+    pub classification: String,
+    pub created_at: DateTime<Utc>,
+}
+
 // --- API DTOs ---
 
 #[derive(Debug, Serialize, FromRow)]

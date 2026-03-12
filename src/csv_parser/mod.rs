@@ -1,4 +1,6 @@
 pub mod kudguri;
+pub mod kudgivt;
+pub mod work_segments;
 
 use std::io::Read;
 

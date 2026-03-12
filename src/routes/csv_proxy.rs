@@ -29,10 +29,10 @@ async fn get_csv_as_json(
 ) -> Result<Json<CsvJsonResponse>, StatusCode> {
     let filename = match csv_type.to_lowercase().as_str() {
         "kudguri" => "KUDGURI.csv",
-        "events" | "event" => "EVENT.csv",
-        "tolls" | "toll" => "TOLL.csv",
-        "ferries" | "ferry" => "FERRY.csv",
-        "speed" => "SPEED.csv",
+        "kudgivt" => "KUDGIVT.csv",
+        "kudgfry" | "ferry" => "KUDGFRY.csv",
+        "kudgsir" => "KUDGSIR.csv",
+        "speed" | "sokudo" => "SOKUDODATA.csv",
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 

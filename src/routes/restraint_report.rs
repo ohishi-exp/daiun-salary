@@ -4,7 +4,7 @@ use axum::{
     routing::get,
     Extension, Json, Router,
 };
-use chrono::{Datelike, NaiveDate};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -87,8 +87,8 @@ pub struct MonthlyTotal {
 struct SegmentRow {
     pub work_date: NaiveDate,
     pub unko_no: String,
-    pub start_at: chrono::NaiveDateTime,
-    pub end_at: chrono::NaiveDateTime,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
     pub work_minutes: i32,
     pub drive_minutes: i32,
     pub cargo_minutes: i32,
@@ -186,9 +186,7 @@ async fn get_restraint_report(
     // Build day rows
     let mut days = Vec::new();
     let mut cumulative = 0i32;
-    let mut total_drive_so_far = 0i32;
-    let mut working_days = 0i32;
-    let mut prev_end_at: Option<chrono::NaiveDateTime> = None;
+    let mut prev_day_drive: Option<i32> = None; // 前日の運転時間（2日平均用）
 
     // Weekly tracking
     let mut weekly_subtotals = Vec::new();
@@ -222,8 +220,8 @@ async fn get_restraint_report(
             // Group by unko_no
             let mut op_map: std::collections::BTreeMap<&str, (i32, i32, i32, i32)> =
                 std::collections::BTreeMap::new();
-            let mut day_start: Option<chrono::NaiveDateTime> = None;
-            let mut day_end: Option<chrono::NaiveDateTime> = None;
+            let mut day_start: Option<DateTime<Utc>> = None;
+            let mut day_end: Option<DateTime<Utc>> = None;
 
             for seg in segs {
                 let entry = op_map.entry(&seg.unko_no).or_insert((0, 0, 0, 0));
@@ -260,21 +258,18 @@ async fn get_restraint_report(
             let day_break = (day_restraint - day_drive - day_cargo).max(0);
 
             cumulative += day_restraint;
-            total_drive_so_far += day_drive;
-            working_days += 1;
-            let drive_avg = total_drive_so_far as f64 / working_days as f64;
-
-            // Rest period: gap from previous work end to current work start
-            let rest_period = match (prev_end_at, day_start) {
-                (Some(pe), Some(ds)) if ds > pe => {
-                    Some((ds - pe).num_minutes() as i32)
-                }
-                _ => None,
+            // 2日平均運転時間（前日と当日の平均）
+            let drive_avg = match prev_day_drive {
+                Some(prev) => (prev + day_drive) as f64 / 2.0,
+                None => day_drive as f64,
             };
 
-            if let Some(de) = day_end {
-                prev_end_at = Some(de);
-            }
+            // 休息: 運行内の休息時間（work_minutes - drive - cargo）の合計
+            let rest_period = if day_break > 0 {
+                Some(day_break)
+            } else {
+                None
+            };
 
             week_drive += day_drive;
             week_cargo += day_cargo;
@@ -296,6 +291,7 @@ async fn get_restraint_report(
                 rest_period_minutes: rest_period,
                 remarks: String::new(),
             });
+            prev_day_drive = Some(day_drive);
         } else {
             // No work on this day (holiday/off)
             days.push(RestraintDayRow {
@@ -309,11 +305,7 @@ async fn get_restraint_report(
                 break_minutes: 0,
                 restraint_total_minutes: 0,
                 restraint_cumulative_minutes: cumulative,
-                drive_average_minutes: if working_days > 0 {
-                    ((total_drive_so_far as f64 / working_days as f64) * 100.0).round() / 100.0
-                } else {
-                    0.0
-                },
+                drive_average_minutes: 0.0,
                 rest_period_minutes: None,
                 remarks: "休".to_string(),
             });
@@ -334,7 +326,7 @@ async fn get_restraint_report(
     }
 
     let monthly_total = MonthlyTotal {
-        drive_minutes: total_drive_so_far,
+        drive_minutes: days.iter().map(|d| d.drive_minutes).sum(),
         cargo_minutes: days.iter().map(|d| d.cargo_minutes).sum(),
         break_minutes: days.iter().map(|d| d.break_minutes).sum(),
         restraint_minutes: cumulative,

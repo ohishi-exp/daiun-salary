@@ -79,6 +79,10 @@ src/
 - **バックエンド:** `./deploy.sh` — Docker build → GCP Artifact Registry push → Cloud Run deploy (asia-northeast1)
 - **フロントエンド:** `cd /home/yhonda/js/nuxt-dtako-admin && npx nuxi build && npx wrangler deploy` — Cloudflare Workers
 
+## Workflow
+
+- 変更完了後は、AskUserQuestion ツールを使ってデプロイするか確認してから実行すること（勝手にデプロイしない）
+
 ## plans
 plansフォルダに計画したplanはファイルとして保存
 終了したplanはplans/completedに移動

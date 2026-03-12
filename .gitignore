@@ -1,8 +1,10 @@
 # Build
 target/
+node_modules/
 
-# Environment
+# Environment / Secrets
 .env
+client_secret_*.json
 
 # Data files
 docs/給与管理_Rust実装計画.md

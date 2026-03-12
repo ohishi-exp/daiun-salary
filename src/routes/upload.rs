@@ -328,20 +328,44 @@ async fn calculate_daily_hours(
 ) -> Result<(), anyhow::Error> {
     use std::collections::HashMap;
 
-    // Group by (driver_cd, operation_date or reading_date)
     struct DayAgg {
         driver_id: Option<Uuid>,
         total_work_minutes: i32,
         total_drive_minutes: i32,
+        late_night_minutes: i32,
         total_distance: f64,
         operation_count: i32,
         unko_nos: Vec<String>,
     }
 
+    /// day_start〜day_end 間の深夜時間（22:00〜翌5:00）を分単位で返す
+    fn calc_late_night_mins(
+        day_start: chrono::NaiveDateTime,
+        day_end: chrono::NaiveDateTime,
+    ) -> i32 {
+        use chrono::Timelike;
+        let mut total = 0i32;
+        // 深夜帯: 0:00〜5:00 と 22:00〜24:00
+        let start_h = day_start.hour() * 60 + day_start.minute();
+        let end_h = day_end.hour() * 60 + day_end.minute();
+        // 0:00〜5:00 (0〜300分)
+        let early_start = start_h.max(0);
+        let early_end = end_h.min(300);
+        if early_end > early_start {
+            total += (early_end - early_start) as i32;
+        }
+        // 22:00〜24:00 (1320〜1440分)
+        let late_start = start_h.max(1320);
+        let late_end = end_h.min(1440);
+        if late_end > late_start {
+            total += (late_end - late_start) as i32;
+        }
+        total
+    }
+
     let mut day_map: HashMap<(String, chrono::NaiveDate), DayAgg> = HashMap::new();
 
     for row in rows {
-        let work_date = row.operation_date.unwrap_or(row.reading_date);
         let driver_id = if !row.driver_cd.is_empty() {
             let rec = sqlx::query_as::<_, (Uuid,)>(
                 "SELECT id FROM drivers WHERE tenant_id = $1 AND driver_cd = $2",
@@ -355,34 +379,96 @@ async fn calculate_daily_hours(
             None
         };
 
-        let drive_mins = row.drive_time_general.unwrap_or(0)
+        let total_drive_mins = row.drive_time_general.unwrap_or(0)
             + row.drive_time_highway.unwrap_or(0)
             + row.drive_time_bypass.unwrap_or(0);
+        let total_distance = row.total_distance.unwrap_or(0.0);
 
-        // Work time = departure to return (if both exist)
-        let work_mins = match (row.departure_at, row.return_at) {
-            (Some(dep), Some(ret)) => (ret - dep).num_minutes() as i32,
-            _ => drive_mins,
-        };
+        match (row.departure_at, row.return_at) {
+            (Some(dep), Some(ret)) if ret > dep => {
+                // 出社〜退社を日ごとに分割
+                let total_work_mins = (ret - dep).num_minutes() as i32;
+                let mut current = dep.date();
+                let end_date = ret.date();
 
-        let entry = day_map
-            .entry((row.driver_cd.clone(), work_date))
-            .or_insert(DayAgg {
-                driver_id,
-                total_work_minutes: 0,
-                total_drive_minutes: 0,
-                total_distance: 0.0,
-                operation_count: 0,
-                unko_nos: Vec::new(),
-            });
+                while current <= end_date {
+                    // この日の拘束時間を計算（0:00〜24:00で区切る）
+                    let day_start = if current == dep.date() {
+                        dep
+                    } else {
+                        current.and_hms_opt(0, 0, 0).unwrap()
+                    };
+                    let day_end = if current == end_date {
+                        ret
+                    } else {
+                        (current + chrono::Duration::days(1))
+                            .and_hms_opt(0, 0, 0)
+                            .unwrap()
+                    };
+                    let day_work_mins = (day_end - day_start).num_minutes() as i32;
 
-        entry.total_work_minutes += work_mins;
-        entry.total_drive_minutes += drive_mins;
-        entry.total_distance += row.total_distance.unwrap_or(0.0);
-        entry.operation_count += 1;
-        entry.unko_nos.push(row.unko_no.clone());
-        if entry.driver_id.is_none() {
-            entry.driver_id = driver_id;
+                    // 運転時間・走行距離は拘束時間比で按分
+                    let ratio = if total_work_mins > 0 {
+                        day_work_mins as f64 / total_work_mins as f64
+                    } else {
+                        0.0
+                    };
+                    let day_drive_mins = (total_drive_mins as f64 * ratio).round() as i32;
+                    let day_distance = total_distance * ratio;
+
+                    let late_night_mins = calc_late_night_mins(day_start, day_end);
+
+                    let entry = day_map
+                        .entry((row.driver_cd.clone(), current))
+                        .or_insert(DayAgg {
+                            driver_id,
+                            total_work_minutes: 0,
+                            total_drive_minutes: 0,
+                            late_night_minutes: 0,
+                            total_distance: 0.0,
+                            operation_count: 0,
+                            unko_nos: Vec::new(),
+                        });
+
+                    entry.total_work_minutes += day_work_mins;
+                    entry.total_drive_minutes += day_drive_mins;
+                    entry.late_night_minutes += late_night_mins;
+                    entry.total_distance += day_distance;
+                    if !entry.unko_nos.contains(&row.unko_no) {
+                        entry.unko_nos.push(row.unko_no.clone());
+                        entry.operation_count += 1;
+                    }
+                    if entry.driver_id.is_none() {
+                        entry.driver_id = driver_id;
+                    }
+
+                    current += chrono::Duration::days(1);
+                }
+            }
+            _ => {
+                // 出社・退社がない場合は運行日（or 読取日）に集約
+                let work_date = row.operation_date.unwrap_or(row.reading_date);
+                let entry = day_map
+                    .entry((row.driver_cd.clone(), work_date))
+                    .or_insert(DayAgg {
+                        driver_id,
+                        total_work_minutes: 0,
+                        total_drive_minutes: 0,
+                        late_night_minutes: 0,
+                        total_distance: 0.0,
+                        operation_count: 0,
+                        unko_nos: Vec::new(),
+                    });
+
+                entry.total_work_minutes += total_drive_mins;
+                entry.total_drive_minutes += total_drive_mins;
+                entry.total_distance += total_distance;
+                entry.operation_count += 1;
+                entry.unko_nos.push(row.unko_no.clone());
+                if entry.driver_id.is_none() {
+                    entry.driver_id = driver_id;
+                }
+            }
         }
     }
 
@@ -407,8 +493,9 @@ async fn calculate_daily_hours(
             r#"INSERT INTO daily_work_hours (
                 tenant_id, driver_id, work_date,
                 total_work_minutes, total_drive_minutes, total_rest_minutes,
+                late_night_minutes,
                 total_distance, operation_count, unko_nos
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
         )
         .bind(tenant_id)
         .bind(driver_id)
@@ -416,6 +503,7 @@ async fn calculate_daily_hours(
         .bind(agg.total_work_minutes)
         .bind(agg.total_drive_minutes)
         .bind(rest_minutes)
+        .bind(agg.late_night_minutes)
         .bind(agg.total_distance)
         .bind(agg.operation_count)
         .bind(&agg.unko_nos)

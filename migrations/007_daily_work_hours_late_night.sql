@@ -1,0 +1,1 @@
+ALTER TABLE daily_work_hours ADD COLUMN IF NOT EXISTS late_night_minutes INTEGER NOT NULL DEFAULT 0;

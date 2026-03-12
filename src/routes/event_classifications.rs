@@ -13,7 +13,7 @@ use crate::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/event-classifications", get(list_event_classifications))
-        .route("/event-classifications/:id", put(update_classification))
+        .route("/event-classifications/{id}", put(update_classification))
 }
 
 async fn list_event_classifications(

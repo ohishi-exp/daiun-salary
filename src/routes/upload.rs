@@ -18,6 +18,10 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/upload", post(upload_zip))
 }
 
+pub fn internal_router() -> Router<AppState> {
+    Router::new().route("/internal/upload", post(internal_upload_zip))
+}
+
 #[derive(Debug, Serialize)]
 pub struct UploadResponse {
     pub upload_id: Uuid,
@@ -643,6 +647,95 @@ fn default_classification(event_cd: &str) -> (&'static str, EventClass) {
         "302" => ("rest_split", EventClass::RestSplit), // 休息
         "301" => ("break", EventClass::Break),          // 休憩
         _ => ("ignore", EventClass::Ignore),            // その他は無視
+    }
+}
+
+/// 内部用アップロード（認証なし、tenant_id はフォームで指定）
+async fn internal_upload_zip(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>, (StatusCode, String)> {
+    let mut tenant_id_str = None;
+    let mut file_data = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart error: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "tenant_id" => {
+                tenant_id_str = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("read tenant_id: {e}")))?,
+                );
+            }
+            "file" => {
+                let filename = field
+                    .file_name()
+                    .unwrap_or("upload.zip")
+                    .to_string();
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("read file: {e}")))?;
+                file_data = Some((filename, bytes.to_vec()));
+            }
+            _ => {}
+        }
+    }
+
+    let tenant_id_str = tenant_id_str
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing tenant_id field".into()))?;
+    let tenant_id = Uuid::parse_str(&tenant_id_str)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid tenant_id: {e}")))?;
+    let (filename, zip_bytes) =
+        file_data.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing file field".into()))?;
+
+    let upload_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO upload_history (id, tenant_id, uploaded_by, filename, status)
+           VALUES ($1, $2, $3, $4, 'processing')"#,
+    )
+    .bind(upload_id)
+    .bind(tenant_id)
+    .bind(Uuid::nil()) // internal: no user
+    .bind(&filename)
+    .execute(&state.pool)
+    .await
+    .map_err(internal_err)?;
+
+    match process_zip(&state, tenant_id, upload_id, &filename, &zip_bytes).await {
+        Ok(count) => {
+            sqlx::query(
+                "UPDATE upload_history SET status = 'completed', operations_count = $1 WHERE id = $2",
+            )
+            .bind(count)
+            .bind(upload_id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal_err)?;
+
+            Ok(Json(UploadResponse {
+                upload_id,
+                operations_count: count,
+                status: "completed".to_string(),
+            }))
+        }
+        Err(e) => {
+            let _ = sqlx::query(
+                "UPDATE upload_history SET status = 'failed', error_message = $1 WHERE id = $2",
+            )
+            .bind(e.to_string())
+            .bind(upload_id)
+            .execute(&state.pool)
+            .await;
+
+            Err((StatusCode::BAD_REQUEST, e.to_string()))
+        }
     }
 }
 

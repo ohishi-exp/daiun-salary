@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .nest("/api", routes::router())
+        .merge(routes::upload::internal_router())
         .layer(Extension(google_verifier))
         .layer(Extension(jwt_secret))
         .layer(Extension(gateway_secret))

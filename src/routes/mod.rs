@@ -38,6 +38,7 @@ pub fn router() -> Router<AppState> {
         .merge(event_classifications::router())
         .merge(work_times::router())
         .merge(restraint_report::router())
+        .merge(scraper::history_router())
         .layer(axum_middleware::from_fn(require_jwt_or_gateway));
 
     // Public routes (no auth)

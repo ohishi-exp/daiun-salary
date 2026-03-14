@@ -161,6 +161,19 @@ pub struct UpdateClassificationRequest {
     pub classification: String,
 }
 
+// --- Multi-Tenant ---
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct UserTenantInfo {
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SwitchTenantRequest {
+    pub tenant_id: Uuid,
+}
+
 // --- API Token ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

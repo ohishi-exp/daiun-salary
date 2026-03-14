@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use crate::auth::google::GoogleTokenVerifier;
 use crate::auth::jwt::{
-    self, create_access_token, create_refresh_token, hash_refresh_token, refresh_token_expires_at,
-    JwtSecret,
+    self, create_access_token, create_access_token_for_tenant, create_refresh_token,
+    hash_refresh_token, refresh_token_expires_at, JwtSecret,
 };
-use crate::db::models::{Tenant, User};
+use crate::db::models::{SwitchTenantRequest, Tenant, User, UserTenantInfo};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
@@ -26,6 +26,8 @@ pub fn protected_router() -> Router<AppState> {
     Router::new()
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
+        .route("/auth/tenants", get(list_tenants))
+        .route("/auth/switch-tenant", post(switch_tenant))
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +51,16 @@ pub struct UserResponse {
     pub name: String,
     pub tenant_id: Uuid,
     pub role: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeResponse {
+    pub id: Uuid,
+    pub email: String,
+    pub name: String,
+    pub tenant_id: Uuid,
+    pub role: String,
+    pub tenants: Vec<UserTenantInfo>,
 }
 
 async fn google_code_login(
@@ -88,6 +100,16 @@ async fn google_code_login(
             )
             .bind(&tenant_name)
             .fetch_one(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            // tenant_members にメンバー登録
+            sqlx::query(
+                "INSERT INTO tenant_members (tenant_id, email, role) VALUES ($1, $2, 'admin') ON CONFLICT DO NOTHING",
+            )
+            .bind(tenant.id)
+            .bind(&google_claims.email)
+            .execute(&state.pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -169,6 +191,7 @@ async fn refresh_token(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::UNAUTHORIZED)?;
 
+    // user.tenant_id は最後に切り替えたテナント
     let access_token = create_access_token(&user, &jwt_secret)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -178,14 +201,92 @@ async fn refresh_token(
     }))
 }
 
-async fn me(Extension(auth_user): Extension<AuthUser>) -> Json<UserResponse> {
-    Json(UserResponse {
+async fn me(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<Json<MeResponse>, StatusCode> {
+    let tenants = sqlx::query_as::<_, UserTenantInfo>(
+        "SELECT t.id AS tenant_id, t.name AS tenant_name FROM tenants t JOIN tenant_members tm ON tm.tenant_id = t.id WHERE tm.email = $1",
+    )
+    .bind(&auth_user.email)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(MeResponse {
         id: auth_user.user_id,
         email: auth_user.email,
         name: auth_user.name,
         tenant_id: auth_user.tenant_id,
         role: auth_user.role,
-    })
+        tenants,
+    }))
+}
+
+async fn list_tenants(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<Json<Vec<UserTenantInfo>>, StatusCode> {
+    let tenants = sqlx::query_as::<_, UserTenantInfo>(
+        "SELECT t.id AS tenant_id, t.name AS tenant_name FROM tenants t JOIN tenant_members tm ON tm.tenant_id = t.id WHERE tm.email = $1",
+    )
+    .bind(&auth_user.email)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(tenants))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SwitchTenantResponse {
+    pub access_token: String,
+    pub expires_in: i64,
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+}
+
+async fn switch_tenant(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Extension(jwt_secret): Extension<JwtSecret>,
+    Json(body): Json<SwitchTenantRequest>,
+) -> Result<Json<SwitchTenantResponse>, StatusCode> {
+    // tenant_members で所属確認
+    let tenant = sqlx::query_as::<_, Tenant>(
+        "SELECT t.* FROM tenants t JOIN tenant_members tm ON tm.tenant_id = t.id WHERE t.id = $1 AND tm.email = $2",
+    )
+    .bind(body.tenant_id)
+    .bind(&auth_user.email)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::FORBIDDEN)?;
+
+    // users.tenant_id を更新（次回 refresh 時に使用）
+    sqlx::query("UPDATE users SET tenant_id = $1 WHERE id = $2")
+        .bind(body.tenant_id)
+        .bind(auth_user.user_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // ユーザーレコード取得（更新後）
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+        .bind(auth_user.user_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let access_token = create_access_token_for_tenant(&user, body.tenant_id, &user.role, &jwt_secret)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(SwitchTenantResponse {
+        access_token,
+        expires_in: jwt::ACCESS_TOKEN_EXPIRY_SECS,
+        tenant_id: tenant.id,
+        tenant_name: tenant.name,
+    }))
 }
 
 async fn logout(

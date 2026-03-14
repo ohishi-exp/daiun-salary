@@ -45,6 +45,30 @@ pub fn create_access_token(
     )
 }
 
+pub fn create_access_token_for_tenant(
+    user: &User,
+    tenant_id: Uuid,
+    role: &str,
+    secret: &JwtSecret,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let now = Utc::now();
+    let claims = AppClaims {
+        sub: user.id,
+        email: user.email.clone(),
+        name: user.name.clone(),
+        tenant_id,
+        role: role.to_string(),
+        iat: now.timestamp(),
+        exp: (now + Duration::seconds(ACCESS_TOKEN_EXPIRY_SECS)).timestamp(),
+    };
+
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.0.as_bytes()),
+    )
+}
+
 pub fn verify_access_token(
     token: &str,
     secret: &JwtSecret,

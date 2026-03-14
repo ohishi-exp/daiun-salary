@@ -702,7 +702,7 @@ async fn internal_upload_zip(
     )
     .bind(upload_id)
     .bind(tenant_id)
-    .bind(Uuid::nil()) // internal: no user
+    .bind(None::<Uuid>) // internal: no user
     .bind(&filename)
     .execute(&state.pool)
     .await

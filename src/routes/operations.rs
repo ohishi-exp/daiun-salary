@@ -4,6 +4,8 @@ use axum::{
     routing::{delete, get},
     Extension, Json, Router,
 };
+use serde::Deserialize;
+
 use crate::db::models::{Operation, OperationFilter, OperationListItem, OperationsResponse};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
@@ -11,8 +13,73 @@ use crate::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/operations", get(list_operations))
+        .route("/operations/calendar", get(calendar_dates))
         .route("/operations/{unko_no}", get(get_operation))
         .route("/operations/{unko_no}", delete(delete_operation))
+}
+
+#[derive(Deserialize)]
+struct CalendarQuery {
+    year: i32,
+    month: i32,
+}
+
+#[derive(serde::Serialize)]
+struct CalendarResponse {
+    year: i32,
+    month: u32,
+    dates: Vec<CalendarDateEntry>,
+}
+
+#[derive(serde::Serialize)]
+struct CalendarDateEntry {
+    date: chrono::NaiveDate,
+    count: i64,
+}
+
+async fn calendar_dates(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(q): Query<CalendarQuery>,
+) -> Result<Json<CalendarResponse>, StatusCode> {
+    let month = q.month as u32;
+    let date_from = chrono::NaiveDate::from_ymd_opt(q.year, month, 1)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let date_to = if month == 12 {
+        chrono::NaiveDate::from_ymd_opt(q.year + 1, 1, 1)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(q.year, month + 1, 1)
+    }
+    .ok_or(StatusCode::BAD_REQUEST)?
+    .pred_opt()
+    .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let rows = sqlx::query_as::<_, (chrono::NaiveDate, i64)>(
+        r#"SELECT reading_date, COUNT(*)::BIGINT
+           FROM operations
+           WHERE tenant_id = $1
+             AND reading_date >= $2
+             AND reading_date <= $3
+           GROUP BY reading_date
+           ORDER BY reading_date"#,
+    )
+    .bind(auth_user.tenant_id)
+    .bind(date_from)
+    .bind(date_to)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let dates = rows
+        .into_iter()
+        .map(|(date, count)| CalendarDateEntry { date, count })
+        .collect();
+
+    Ok(Json(CalendarResponse {
+        year: q.year,
+        month: month,
+        dates,
+    }))
 }
 
 async fn list_operations(

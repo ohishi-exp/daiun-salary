@@ -30,7 +30,8 @@ gcloud run deploy daiun-salary \
   --set-env-vars "R2_ACCOUNT_ID=${R2_ACCOUNT_ID}" \
   --set-env-vars "R2_ACCESS_KEY=${R2_ACCESS_KEY}" \
   --set-env-vars "R2_SECRET_KEY=${R2_SECRET_KEY}" \
-  --set-env-vars "GATEWAY_SECRET=${GATEWAY_SECRET}"
+  --set-env-vars "GATEWAY_SECRET=${GATEWAY_SECRET}" \
+  --set-env-vars "SCRAPER_URL=${SCRAPER_URL}"
 
 echo "==> Done!"
 gcloud run services describe daiun-salary --region=asia-northeast1 --format="value(status.url)"

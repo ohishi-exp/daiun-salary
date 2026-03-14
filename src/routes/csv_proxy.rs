@@ -29,20 +29,24 @@ async fn get_csv_as_json(
 ) -> Result<Json<CsvJsonResponse>, StatusCode> {
     let filename = match csv_type.to_lowercase().as_str() {
         "kudguri" => "KUDGURI.csv",
-        "kudgivt" => "KUDGIVT.csv",
-        "kudgfry" | "ferry" => "KUDGFRY.csv",
-        "kudgsir" => "KUDGSIR.csv",
+        "kudgivt" | "events" => "KUDGIVT.csv",
+        "kudgfry" | "ferry" | "ferries" => "KUDGFRY.csv",
+        "kudgsir" | "tolls" => "KUDGSIR.csv",
         "speed" | "sokudo" => "SOKUDODATA.csv",
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
     let key = format!("{}/unko/{}/{}", auth_user.tenant_id, unko_no, filename);
+    tracing::info!("CSV download: key={}", key);
 
     let bytes = state
         .storage
         .download(&key)
         .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(|e| {
+            tracing::error!("CSV download failed: key={}, error={}", key, e);
+            StatusCode::NOT_FOUND
+        })?;
 
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = text.lines();

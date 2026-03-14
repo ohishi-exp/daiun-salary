@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 use crate::auth::google::GoogleTokenVerifier;
 use crate::auth::jwt::JwtSecret;
 use crate::middleware::auth::GatewaySecret;
+use crate::routes::scraper::ScraperUrl;
 use crate::storage::StorageBackend;
 
 #[derive(Clone)]
@@ -45,6 +46,8 @@ async fn main() -> anyhow::Result<()> {
     let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     let gateway_secret =
         std::env::var("GATEWAY_SECRET").unwrap_or_else(|_| "dev-gateway-secret".into());
+    let scraper_url = std::env::var("SCRAPER_URL")
+        .unwrap_or_else(|_| "http://localhost:8081".into());
 
     let google_verifier = GoogleTokenVerifier::new(google_client_id, google_client_secret);
     let jwt_secret = JwtSecret(jwt_secret);
@@ -82,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::upload::internal_router())
         .layer(Extension(google_verifier))
         .layer(Extension(jwt_secret))
+        .layer(Extension(ScraperUrl(scraper_url)))
         .layer(Extension(gateway_secret))
         .layer(cors)
         .layer(TraceLayer::new_for_http())

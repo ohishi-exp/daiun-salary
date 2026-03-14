@@ -17,7 +17,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 anyhow = "1"
 tower = "0.5"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 jsonwebtoken = "9"
 sha2 = "0.10"
 thiserror = "2"
@@ -26,3 +26,5 @@ rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustl
 csv = "1"
 zip = "2"
 encoding_rs = "0.8"
+futures = "0.3"
+tokio-stream = "0.1"

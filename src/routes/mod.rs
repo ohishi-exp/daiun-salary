@@ -7,6 +7,7 @@ pub mod event_classifications;
 pub mod gateway;
 pub mod operations;
 pub mod restraint_report;
+pub mod scraper;
 pub mod upload;
 pub mod vehicles;
 pub mod work_times;
@@ -22,6 +23,7 @@ pub fn router() -> Router<AppState> {
         .merge(auth::protected_router())
         .merge(upload::router())
         .merge(api_tokens::router())
+        .merge(scraper::router())
         .layer(axum_middleware::from_fn(require_jwt));
 
     // Read endpoints: JWT or gateway secret (external API clients)

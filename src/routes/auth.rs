@@ -88,42 +88,60 @@ async fn google_code_login(
     let user = match existing_user {
         Some(user) => user,
         None => {
-            let tenant_name = google_claims
-                .email
-                .split('@')
-                .nth(1)
-                .unwrap_or("default")
-                .to_string();
-
-            let tenant = sqlx::query_as::<_, Tenant>(
-                "INSERT INTO tenants (name) VALUES ($1) RETURNING *",
+            // 招待済みメンバーかチェック（tenant_members に事前登録されているか）
+            let invited = sqlx::query_as::<_, (uuid::Uuid, String)>(
+                "SELECT tenant_id, role FROM tenant_members WHERE email = $1 LIMIT 1",
             )
-            .bind(&tenant_name)
-            .fetch_one(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-            // tenant_members にメンバー登録
-            sqlx::query(
-                "INSERT INTO tenant_members (tenant_id, email, role) VALUES ($1, $2, 'admin') ON CONFLICT DO NOTHING",
-            )
-            .bind(tenant.id)
             .bind(&google_claims.email)
-            .execute(&state.pool)
+            .fetch_optional(&state.pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            let (tenant_id, role) = if let Some((tid, role)) = invited {
+                // 招待済み: 既存テナントに参加
+                (tid, role)
+            } else {
+                // 未招待: 新テナント作成
+                let tenant_name = google_claims
+                    .email
+                    .split('@')
+                    .nth(1)
+                    .unwrap_or("default")
+                    .to_string();
+
+                let tenant = sqlx::query_as::<_, Tenant>(
+                    "INSERT INTO tenants (name) VALUES ($1) RETURNING *",
+                )
+                .bind(&tenant_name)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                // tenant_members にメンバー登録
+                sqlx::query(
+                    "INSERT INTO tenant_members (tenant_id, email, role) VALUES ($1, $2, 'admin') ON CONFLICT DO NOTHING",
+                )
+                .bind(tenant.id)
+                .bind(&google_claims.email)
+                .execute(&state.pool)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                (tenant.id, "admin".to_string())
+            };
 
             sqlx::query_as::<_, User>(
                 r#"
                 INSERT INTO users (tenant_id, google_sub, email, name, role)
-                VALUES ($1, $2, $3, $4, 'admin')
+                VALUES ($1, $2, $3, $4, $5)
                 RETURNING *
                 "#,
             )
-            .bind(tenant.id)
+            .bind(tenant_id)
             .bind(&google_claims.sub)
             .bind(&google_claims.email)
             .bind(&google_claims.name)
+            .bind(&role)
             .fetch_one(&state.pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -252,9 +270,14 @@ async fn switch_tenant(
     Extension(jwt_secret): Extension<JwtSecret>,
     Json(body): Json<SwitchTenantRequest>,
 ) -> Result<Json<SwitchTenantResponse>, StatusCode> {
-    // tenant_members で所属確認
-    let tenant = sqlx::query_as::<_, Tenant>(
-        "SELECT t.* FROM tenants t JOIN tenant_members tm ON tm.tenant_id = t.id WHERE t.id = $1 AND tm.email = $2",
+    // tenant_members で所属確認 + role 取得
+    #[derive(sqlx::FromRow)]
+    struct TenantWithRole {
+        name: String,
+        member_role: String,
+    }
+    let tenant = sqlx::query_as::<_, TenantWithRole>(
+        "SELECT t.name, tm.role AS member_role FROM tenants t JOIN tenant_members tm ON tm.tenant_id = t.id WHERE t.id = $1 AND tm.email = $2",
     )
     .bind(body.tenant_id)
     .bind(&auth_user.email)
@@ -263,9 +286,10 @@ async fn switch_tenant(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::FORBIDDEN)?;
 
-    // users.tenant_id を更新（次回 refresh 時に使用）
-    sqlx::query("UPDATE users SET tenant_id = $1 WHERE id = $2")
+    // users.tenant_id と role を更新
+    sqlx::query("UPDATE users SET tenant_id = $1, role = $2 WHERE id = $3")
         .bind(body.tenant_id)
+        .bind(&tenant.member_role)
         .bind(auth_user.user_id)
         .execute(&state.pool)
         .await
@@ -278,13 +302,13 @@ async fn switch_tenant(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let access_token = create_access_token_for_tenant(&user, body.tenant_id, &user.role, &jwt_secret)
+    let access_token = create_access_token_for_tenant(&user, body.tenant_id, &tenant.member_role, &jwt_secret)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(SwitchTenantResponse {
         access_token,
         expires_in: jwt::ACCESS_TOKEN_EXPIRY_SECS,
-        tenant_id: tenant.id,
+        tenant_id: body.tenant_id,
         tenant_name: tenant.name,
     }))
 }

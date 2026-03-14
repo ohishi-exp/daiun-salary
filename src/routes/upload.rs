@@ -1,7 +1,7 @@
 use axum::{
-    extract::{Multipart, State},
+    extract::{Multipart, Path, State},
     http::StatusCode,
-    routing::post,
+    routing::{post, get},
     Extension, Json, Router,
 };
 use serde::Serialize;
@@ -19,7 +19,11 @@ pub fn router() -> Router<AppState> {
 }
 
 pub fn internal_router() -> Router<AppState> {
-    Router::new().route("/internal/upload", post(internal_upload_zip))
+    Router::new()
+        .route("/internal/upload", post(internal_upload_zip))
+        .route("/internal/store", post(internal_store_zip))
+        .route("/internal/rerun/{upload_id}", post(internal_rerun))
+        .route("/internal/pending", get(list_pending_uploads))
 }
 
 #[derive(Debug, Serialize)]
@@ -142,6 +146,7 @@ async fn process_zip(
 
     let csv_text = csv_parser::decode_shift_jis(&kudguri_file.1);
     let rows = parse_kudguri(&csv_text)?;
+    tracing::info!("KUDGURI parsed: {} rows (tenant={})", rows.len(), tenant_id);
 
     if rows.is_empty() {
         return Ok(0);
@@ -155,6 +160,7 @@ async fn process_zip(
 
     let kudgivt_text = csv_parser::decode_shift_jis(&kudgivt_file.1);
     let kudgivt_rows = parse_kudgivt(&kudgivt_text)?;
+    tracing::info!("KUDGIVT parsed: {} rows (tenant={})", kudgivt_rows.len(), tenant_id);
 
     // 4. Save all CSV files to R2 (grouped by unko_no)
     for (name, bytes) in &files {
@@ -187,6 +193,8 @@ async fn process_zip(
             }
         }
     }
+
+    tracing::info!("R2 CSV upload done (tenant={})", tenant_id);
 
     // 5. Upsert masters and insert operations
     let mut operations_count = 0i32;
@@ -261,8 +269,11 @@ async fn process_zip(
         operations_count += 1;
     }
 
+    tracing::info!("DB upsert done: {} operations (tenant={})", operations_count, tenant_id);
+
     // 6. Calculate daily_work_hours using KUDGIVT events
     calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows).await?;
+    tracing::info!("calculate_daily_hours done (tenant={})", tenant_id);
 
     Ok(operations_count)
 }
@@ -745,4 +756,170 @@ fn internal_err(e: impl std::fmt::Display) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal server error".to_string(),
     )
+}
+
+/// ZIP を R2 に保存のみ（処理なし）。アップロード失敗時の退避用。
+async fn internal_store_zip(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>, (StatusCode, String)> {
+    let mut tenant_id_str = None;
+    let mut file_data = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart error: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "tenant_id" => {
+                tenant_id_str = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("read tenant_id: {e}")))?,
+                );
+            }
+            "file" => {
+                let filename = field
+                    .file_name()
+                    .unwrap_or("upload.zip")
+                    .to_string();
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("read file: {e}")))?;
+                file_data = Some((filename, bytes.to_vec()));
+            }
+            _ => {}
+        }
+    }
+
+    let tenant_id_str = tenant_id_str
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing tenant_id field".into()))?;
+    let tenant_id = Uuid::parse_str(&tenant_id_str)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid tenant_id: {e}")))?;
+    let (filename, zip_bytes) =
+        file_data.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing file field".into()))?;
+
+    let upload_id = Uuid::new_v4();
+
+    // R2 に ZIP を保存 (pending/ プレフィックス → ライフサイクルルールで7日後に自動削除)
+    let zip_key = format!("{}/pending/{}/{}", tenant_id, upload_id, filename);
+    state
+        .storage
+        .upload(&zip_key, &zip_bytes, "application/zip")
+        .await
+        .map_err(internal_err)?;
+
+    // upload_history に pending_retry で記録
+    sqlx::query(
+        r#"INSERT INTO upload_history (id, tenant_id, uploaded_by, filename, status, r2_zip_key)
+           VALUES ($1, $2, $3, $4, 'pending_retry', $5)"#,
+    )
+    .bind(upload_id)
+    .bind(tenant_id)
+    .bind(None::<Uuid>)
+    .bind(&filename)
+    .bind(&zip_key)
+    .execute(&state.pool)
+    .await
+    .map_err(internal_err)?;
+
+    tracing::info!("ZIP stored for retry: upload_id={}, key={}", upload_id, zip_key);
+
+    Ok(Json(UploadResponse {
+        upload_id,
+        operations_count: 0,
+        status: "pending_retry".to_string(),
+    }))
+}
+
+/// R2 に保存済みの ZIP を再処理
+async fn internal_rerun(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+) -> Result<Json<UploadResponse>, (StatusCode, String)> {
+    // upload_history から r2_zip_key を取得
+    let record = sqlx::query_as::<_, (Uuid, String, String)>(
+        "SELECT tenant_id, r2_zip_key, filename FROM upload_history WHERE id = $1",
+    )
+    .bind(upload_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal_err)?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("upload {} not found", upload_id)))?;
+
+    let (tenant_id, r2_zip_key, filename) = record;
+
+    // R2 から ZIP をダウンロード
+    let zip_bytes = state
+        .storage
+        .download(&r2_zip_key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("R2 download failed: {e}")))?;
+
+    tracing::info!("Rerun: upload_id={}, tenant={}, file={}", upload_id, tenant_id, filename);
+
+    match process_zip(&state, tenant_id, upload_id, &filename, &zip_bytes).await {
+        Ok(count) => {
+            sqlx::query(
+                "UPDATE upload_history SET status = 'completed', operations_count = $1 WHERE id = $2",
+            )
+            .bind(count)
+            .bind(upload_id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal_err)?;
+
+            Ok(Json(UploadResponse {
+                upload_id,
+                operations_count: count,
+                status: "completed".to_string(),
+            }))
+        }
+        Err(e) => {
+            let _ = sqlx::query(
+                "UPDATE upload_history SET status = 'failed', error_message = $1 WHERE id = $2",
+            )
+            .bind(e.to_string())
+            .bind(upload_id)
+            .execute(&state.pool)
+            .await;
+
+            Err((StatusCode::BAD_REQUEST, e.to_string()))
+        }
+    }
+}
+
+/// pending_retry / failed のアップロード一覧
+async fn list_pending_uploads(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<String>)>(
+        r#"SELECT id, tenant_id, filename, status, error_message
+           FROM upload_history
+           WHERE status IN ('pending_retry', 'failed')
+           ORDER BY created_at DESC
+           LIMIT 50"#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal_err)?;
+
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, tenant_id, filename, status, error)| {
+            serde_json::json!({
+                "upload_id": id,
+                "tenant_id": tenant_id,
+                "filename": filename,
+                "status": status,
+                "error_message": error,
+            })
+        })
+        .collect();
+
+    Ok(Json(items))
 }

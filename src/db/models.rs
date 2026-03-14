@@ -174,6 +174,34 @@ pub struct SwitchTenantRequest {
     pub tenant_id: Uuid,
 }
 
+// --- Tenant Member ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TenantMember {
+    pub tenant_id: Uuid,
+    pub email: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct TenantMemberListItem {
+    pub email: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InviteMemberRequest {
+    pub email: String,
+    pub role: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMemberRoleRequest {
+    pub role: String,
+}
+
 // --- API Token ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

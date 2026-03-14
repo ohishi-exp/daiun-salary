@@ -5,6 +5,7 @@ pub mod daily_hours;
 pub mod drivers;
 pub mod event_classifications;
 pub mod gateway;
+pub mod members;
 pub mod operations;
 pub mod restraint_report;
 pub mod scraper;
@@ -23,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .merge(auth::protected_router())
         .merge(upload::router())
         .merge(api_tokens::router())
+        .merge(members::router())
         .merge(scraper::router())
         .layer(axum_middleware::from_fn(require_jwt));
 

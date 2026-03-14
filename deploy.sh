@@ -21,7 +21,7 @@ gcloud run deploy daiun-salary \
   --platform managed \
   --allow-unauthenticated \
   --port 8080 \
-  --memory 512Mi \
+  --memory 1Gi \
   --set-env-vars "DATABASE_URL=${DATABASE_URL}" \
   --set-env-vars "JWT_SECRET=${JWT_SECRET}" \
   --set-env-vars "GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}" \

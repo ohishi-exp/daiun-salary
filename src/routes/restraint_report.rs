@@ -893,3 +893,181 @@ async fn compare_csv(
 
     Ok(Json(results))
 }
+
+/// CSV行とシステム行の差分を検出する（compare_csvの内部ロジック抽出）
+fn detect_diffs(csv_days: &[CsvDayRow], sys_days: &[SystemDayRow]) -> Vec<DiffItem> {
+    let mut diffs = Vec::new();
+    for (csv_day, sys_day) in csv_days.iter().zip(sys_days.iter()) {
+        if csv_day.is_holiday { continue; }
+        let checks = [
+            ("運転", &csv_day.drive, &sys_day.drive),
+            ("重複運転", &csv_day.overlap_drive, &sys_day.overlap_drive),
+            ("小計", &csv_day.subtotal, &sys_day.subtotal),
+            ("重複小計", &csv_day.overlap_subtotal, &sys_day.overlap_subtotal),
+            ("合計", &csv_day.total, &sys_day.total),
+            ("累計", &csv_day.cumulative, &sys_day.cumulative),
+            ("実働", &csv_day.actual_work, &sys_day.actual_work),
+            ("時間外", &csv_day.overtime, &sys_day.overtime),
+            ("深夜", &csv_day.late_night, &sys_day.late_night),
+        ];
+        for (field, csv_val, sys_val) in checks {
+            let cv = csv_val.trim();
+            let sv = sys_val.trim();
+            if cv != sv && !(cv.is_empty() && sv.is_empty()) {
+                diffs.push(DiffItem {
+                    date: csv_day.date.clone(),
+                    field: field.to_string(),
+                    csv_val: cv.to_string(),
+                    sys_val: sv.to_string(),
+                });
+            }
+        }
+    }
+    diffs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 鈴木　昭 (1021) 2026年2月分 — 0件差分が保証されるべきリファレンスデータ
+    const CSV_1021: &str = "拘束時間管理表 (2026年 2月分)\n\
+※当月の最大拘束時間 : 275 時間（労使協定により時間を記入する）\n\
+\n\
+事業所,大石運輸倉庫㈱　本社営業所,乗務員分類1,第３運行課,乗務員分類2,1,乗務員分類3,第３運行課,乗務員分類4,未設定,乗務員分類5,未設定\n\
+氏名,鈴木　昭,乗務員コード,1021\n\
+日付,始業時刻,終業時刻,運転時間,重複運転時間,荷役時間,重複荷役時間,休憩時間,重複休憩時間,時間,重複時間,拘束時間小計,重複拘束時間小計,拘束時間合計,拘束時間累計,前運転平均,後運転平均,休息時間,実働時間,時間外時間,深夜時間,時間外深夜時間,摘要1,摘要2\n\
+2月1日,5:55,15:14,2:43,0:12,,,2:35,,,,5:18,0:12,5:30,5:18,6:52,4:07,18:30,2:43,,,,,\n\
+2月2日,5:43,15:08,5:32,,1:21,,2:32,,,,9:25,,9:25,14:43,,2:46,14:35,6:53,,,,2/2帰着,\n\
+2月3日,休,\n\
+2月4日,7:23,15:02,5:00,2:57,0:41,,1:58,,,,7:39,2:57,10:36,22:22,,6:49,13:24,5:41,,,,2/4出発,\n\
+2月5日,4:26,15:22,8:39,,,,2:17,,,,10:56,,10:56,33:18,,5:44,13:04,8:39,0:39,0:34,,,\n\
+2月6日,7:26,13:14,2:49,1:03,0:37,,2:22,0:18,,,5:48,1:21,7:09,39:06,,5:03,16:51,3:26,,,,,\n\
+2月7日,6:05,14:15,4:48,1:08,0:58,,2:24,,,,8:10,1:08,9:18,47:16,,5:36,14:42,5:46,,,,,\n\
+2月8日,4:57,13:17,6:25,,,,1:55,,,,8:20,,8:20,55:36,,5:33,15:40,6:25,,0:03,,,\n\
+2月9日,7:33,16:10,4:42,1:39,2:02,,1:53,0:21,,,8:37,2:00,10:37,64:13,,8:26,13:23,6:44,,,,,\n\
+2月10日,5:33,17:20,9:40,1:31,,,2:07,0:20,,,11:47,1:51,13:38,76:00,,8:13,10:22,9:40,1:40,,,,\n\
+2月11日,3:42,16:08,6:47,,,,5:39,,,,12:26,,12:26,88:26,,4:33,11:34,6:47,,0:58,,,\n\
+2月12日,7:36,16:16,2:20,0:20,0:19,,6:01,0:04,,,8:40,0:24,9:04,97:06,,4:28,14:56,2:39,,,,,\n\
+2月13日,7:12,15:49,3:08,3:28,1:13,,4:16,0:18,,,8:37,3:46,12:23,105:43,,7:43,11:37,4:21,,,,,\n\
+2月14日,3:26,15:34,9:23,0:09,,,2:45,,,,12:08,0:09,12:17,117:51,,7:29,11:43,9:23,1:23,1:34,,,\n\
+2月15日,3:17,12:09,5:35,,,,3:17,,,,8:52,,8:52,126:43,,5:08,15:08,5:35,,1:43,,,\n\
+2月16日,5:47,15:50,4:41,,1:52,,3:30,,,,10:03,,10:03,136:46,,2:20,13:57,6:33,,,,2/16帰着,\n\
+2月17日,休,\n\
+2月18日,5:51,5:51,7:27,,2:30,,6:34,,,,16:31,,16:31,153:17,,8:28,7:29,9:57,0:51,,1:06,2/18出発,\n\
+2月19日,5:51,16:49,8:37,0:52,,,2:21,,,,10:58,0:52,11:50,164:15,,9:23,12:10,8:37,0:37,,,,\n\
+2月20日,4:59,18:19,8:06,1:12,2:48,,2:26,,,,13:20,1:12,14:32,177:35,,9:46,9:28,10:54,2:54,0:01,,,\n\
+2月21日,3:47,17:30,9:39,0:36,,,4:04,,,,13:43,0:36,14:19,191:18,,7:45,9:41,9:39,1:39,1:13,,,\n\
+2月22日,3:11,13:40,5:51,,,,4:38,,,,10:29,,10:29,201:47,,4:16,13:31,5:51,,1:49,,,\n\
+2月23日,4:11,12:25,2:42,,,,5:32,,,,8:14,,8:14,210:01,,2:59,15:46,2:42,,0:49,,,\n\
+2月24日,7:13,13:55,3:17,,0:17,,3:08,,,,6:42,,6:42,216:43,,2:41,17:18,3:34,,,,2/24帰着,\n\
+2月25日,10:04,16:41,2:06,1:51,0:39,,0:14,,,,2:59,1:51,4:50,219:42,,5:14,19:10,2:45,,,,2/25出発,\n\
+2月26日,8:13,15:31,6:45,1:38,,,0:33,,,,7:18,1:38,8:56,227:00,,7:20,15:04,6:45,,,,,\n\
+2月27日,6:20,18:23,5:22,1:06,0:14,,1:55,,,,7:31,1:06,8:37,234:31,,5:34,15:23,5:36,,,,,\n\
+2月28日,5:14,18:12,4:50,,0:03,,3:16,,,,8:09,,8:09,242:40,,5:34,15:51,4:53,,,,,\n\
+合計,,,146:54,,15:34,,80:12,,,,242:40,,,,,,360:17,162:28,9:43,8:44,1:06,,\n";
+
+    #[test]
+    fn test_parse_csv_1021() {
+        let drivers = parse_restraint_csv(CSV_1021.as_bytes()).unwrap();
+        assert_eq!(drivers.len(), 1);
+        let d = &drivers[0];
+        assert_eq!(d.driver_name, "鈴木　昭");
+        assert_eq!(d.driver_cd, "1021");
+        assert_eq!(d.days.len(), 28); // 2月1日〜28日
+        assert_eq!(d.total_drive, "146:54");
+        assert_eq!(d.total_restraint, "242:40");
+
+        // 2月1日: 稼働日
+        let day1 = &d.days[0];
+        assert_eq!(day1.date, "2月1日");
+        assert!(!day1.is_holiday);
+        assert_eq!(day1.drive, "2:43");
+        assert_eq!(day1.overlap_drive, "0:12");
+        assert_eq!(day1.subtotal, "5:18");
+        assert_eq!(day1.overlap_subtotal, "0:12");
+        assert_eq!(day1.total, "5:30");
+        assert_eq!(day1.cumulative, "5:18");
+        assert_eq!(day1.actual_work, "2:43");
+
+        // 2月3日: 休日
+        let day3 = &d.days[2];
+        assert_eq!(day3.date, "2月3日");
+        assert!(day3.is_holiday);
+    }
+
+    #[test]
+    fn test_compare_1021_zero_diffs() {
+        // CSVの期待値をシステム側としても使う → 差分0件を保証
+        let drivers = parse_restraint_csv(CSV_1021.as_bytes()).unwrap();
+        let csv_d = &drivers[0];
+
+        // CSVの値をそのままSystemDayRowに変換（= 完全一致するはず）
+        let sys_days: Vec<SystemDayRow> = csv_d.days.iter().map(|d| SystemDayRow {
+            date: d.date.clone(),
+            drive: d.drive.clone(),
+            overlap_drive: d.overlap_drive.clone(),
+            cargo: d.cargo.clone(),
+            overlap_cargo: d.overlap_cargo.clone(),
+            subtotal: d.subtotal.clone(),
+            overlap_subtotal: d.overlap_subtotal.clone(),
+            total: d.total.clone(),
+            cumulative: d.cumulative.clone(),
+            actual_work: d.actual_work.clone(),
+            overtime: d.overtime.clone(),
+            late_night: d.late_night.clone(),
+        }).collect();
+
+        let diffs = detect_diffs(&csv_d.days, &sys_days);
+        assert_eq!(diffs.len(), 0, "Expected 0 diffs but got {}: {:?}", diffs.len(), diffs);
+    }
+
+    #[test]
+    fn test_compare_detects_diff() {
+        let drivers = parse_restraint_csv(CSV_1021.as_bytes()).unwrap();
+        let csv_d = &drivers[0];
+
+        // 1行目のdriveを変更 → 差分1件が出るはず
+        let mut sys_days: Vec<SystemDayRow> = csv_d.days.iter().map(|d| SystemDayRow {
+            date: d.date.clone(),
+            drive: d.drive.clone(),
+            overlap_drive: d.overlap_drive.clone(),
+            cargo: d.cargo.clone(),
+            overlap_cargo: d.overlap_cargo.clone(),
+            subtotal: d.subtotal.clone(),
+            overlap_subtotal: d.overlap_subtotal.clone(),
+            total: d.total.clone(),
+            cumulative: d.cumulative.clone(),
+            actual_work: d.actual_work.clone(),
+            overtime: d.overtime.clone(),
+            late_night: d.late_night.clone(),
+        }).collect();
+        sys_days[0].drive = "9:99".to_string();
+
+        let diffs = detect_diffs(&csv_d.days, &sys_days);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].field, "運転");
+        assert_eq!(diffs[0].date, "2月1日");
+        assert_eq!(diffs[0].csv_val, "2:43");
+        assert_eq!(diffs[0].sys_val, "9:99");
+    }
+
+    #[test]
+    fn test_fmt_min() {
+        assert_eq!(fmt_min(0), "");
+        assert_eq!(fmt_min(60), "1:00");
+        assert_eq!(fmt_min(90), "1:30");
+        assert_eq!(fmt_min(318), "5:18");
+        assert_eq!(fmt_min(565), "9:25");
+        assert_eq!(fmt_min(14560), "242:40");
+    }
+
+    #[test]
+    fn test_parse_hhmm() {
+        assert_eq!(parse_hhmm(""), 0);
+        assert_eq!(parse_hhmm("5:18"), 318);
+        assert_eq!(parse_hhmm("9:25"), 565);
+        assert_eq!(parse_hhmm("242:40"), 14560);
+        assert_eq!(parse_hhmm("0:03"), 3);
+    }
+}

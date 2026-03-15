@@ -8,6 +8,7 @@ pub mod gateway;
 pub mod members;
 pub mod operations;
 pub mod restraint_report;
+pub mod restraint_report_pdf;
 pub mod scraper;
 pub mod upload;
 pub mod vehicles;
@@ -23,6 +24,7 @@ pub fn router() -> Router<AppState> {
     let jwt_only = Router::new()
         .merge(auth::protected_router())
         .merge(upload::router())
+        .merge(upload::recalculate_router())
         .merge(api_tokens::router())
         .merge(members::router())
         .merge(scraper::router())
@@ -38,6 +40,7 @@ pub fn router() -> Router<AppState> {
         .merge(event_classifications::router())
         .merge(work_times::router())
         .merge(restraint_report::router())
+        .merge(restraint_report_pdf::router())
         .merge(scraper::history_router())
         .layer(axum_middleware::from_fn(require_jwt_or_gateway));
 

@@ -1,14 +1,15 @@
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::Response,
     routing::{post, get},
     Extension, Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use tokio_stream::StreamExt;
 use crate::csv_parser;
 use crate::csv_parser::kudguri::{parse_kudguri, KudguriRow};
 use crate::csv_parser::kudgivt::{parse_kudgivt, KudgivtRow};
@@ -28,6 +29,11 @@ pub fn internal_router() -> Router<AppState> {
         .route("/internal/split-csv/{upload_id}", post(internal_split_csv))
         .route("/internal/download/{upload_id}", get(internal_download))
         .route("/internal/pending", get(list_pending_uploads))
+}
+
+pub fn recalculate_router() -> Router<AppState> {
+    Router::new()
+        .route("/recalculate", post(internal_recalculate_all))
 }
 
 #[derive(Debug, Serialize)]
@@ -242,7 +248,7 @@ async fn process_zip(
     tracing::info!("DB upsert done: {} operations (tenant={})", operations_count, tenant_id);
 
     // 5. Calculate daily_work_hours using KUDGIVT events
-    calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows).await?;
+    calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows, None).await?;
     tracing::info!("calculate_daily_hours done (tenant={})", tenant_id);
 
     // 6. Enqueue CSV split task (async, non-blocking)
@@ -327,6 +333,7 @@ async fn calculate_daily_hours(
     tenant_id: Uuid,
     rows: &[KudguriRow],
     kudgivt_rows: &[KudgivtRow],
+    progress_tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<(), anyhow::Error> {
     use std::collections::HashMap;
 
@@ -342,6 +349,34 @@ async fn calculate_daily_hours(
             .push(row);
     }
 
+    // 2.5. 302休息イベントを日別に集計
+    let mut rest_event_map: HashMap<(String, chrono::NaiveDate), i32> = HashMap::new();
+    for row in kudgivt_rows {
+        if classifications.get(&row.event_cd) == Some(&EventClass::RestSplit) {
+            let dur = row.duration_minutes.unwrap_or(0);
+            if dur <= 0 { continue; }
+            let start = row.start_at;
+            let end = start + chrono::Duration::minutes(dur as i64);
+            // 日跨ぎ分割
+            let mut current = start;
+            while current < end {
+                let day = current.date();
+                let day_end = chrono::NaiveDate::succ_opt(&day)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap();
+                let segment_end = end.min(day_end);
+                let mins = (segment_end - current).num_minutes() as i32;
+                if mins > 0 {
+                    *rest_event_map
+                        .entry((row.driver_cd.clone(), day))
+                        .or_insert(0) += mins;
+                }
+                current = segment_end;
+            }
+        }
+    }
+
     // 3. Aggregate per (driver_cd, date)
     struct DayAgg {
         driver_id: Option<Uuid>,
@@ -354,6 +389,7 @@ async fn calculate_daily_hours(
         operation_count: i32,
         unko_nos: Vec<String>,
         segments: Vec<SegmentRecord>,
+        rest_event_minutes: i32,
     }
 
     struct SegmentRecord {
@@ -421,6 +457,7 @@ async fn calculate_daily_hours(
                             operation_count: 0,
                             unko_nos: Vec::new(),
                             segments: Vec::new(),
+                            rest_event_minutes: 0,
                         });
 
                     entry.total_work_minutes += ds.work_minutes;
@@ -476,6 +513,7 @@ async fn calculate_daily_hours(
                         operation_count: 0,
                         unko_nos: Vec::new(),
                         segments: Vec::new(),
+                        rest_event_minutes: 0,
                     });
 
                 entry.total_work_minutes += total_drive_mins;
@@ -490,13 +528,22 @@ async fn calculate_daily_hours(
         }
     }
 
+    // 3.5. rest_event_mapをday_mapに反映
+    for ((driver_cd, date), rest_mins) in &rest_event_map {
+        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
+            agg.rest_event_minutes = *rest_mins;
+        }
+    }
+
     // 4. Persist to DB
-    for ((_driver_cd, work_date), agg) in &day_map {
+    let day_entries: Vec<_> = day_map.iter().collect();
+    let save_total = day_entries.len();
+    for (i, ((_driver_cd, work_date), agg)) in day_entries.into_iter().enumerate() {
         let Some(driver_id) = agg.driver_id else {
             continue;
         };
 
-        let rest_minutes = (agg.total_work_minutes - agg.total_labor_minutes).max(0);
+        let rest_minutes = agg.rest_event_minutes;
 
         // Delete existing for re-upload
         sqlx::query(
@@ -563,6 +610,18 @@ async fn calculate_daily_hours(
             .bind(seg.cargo_minutes)
             .execute(&state.pool)
             .await?;
+        }
+
+        if let Some(ref ptx) = progress_tx {
+            if (i + 1) % 20 == 0 || i + 1 == save_total {
+                let msg = serde_json::json!({
+                    "event": "progress",
+                    "current": i + 1,
+                    "total": save_total,
+                    "step": "save"
+                });
+                let _ = ptx.send(format!("data: {}\n\n", msg)).await;
+            }
         }
     }
 
@@ -1039,6 +1098,191 @@ async fn internal_rerun(
             Err((StatusCode::BAD_REQUEST, e.to_string()))
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RecalcFilter {
+    year: i32,
+    month: u32,
+}
+
+/// 月指定で再計算（R2の個別CSVから。SSEで進捗通知）
+async fn internal_recalculate_all(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(params): Query<RecalcFilter>,
+) -> Response<Body> {
+    let tenant_id = auth_user.tenant_id;
+    let year = params.year;
+    let month = params.month;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+
+    tokio::spawn(async move {
+        let send = |json: serde_json::Value| {
+            let tx = tx.clone();
+            async move {
+                let s = serde_json::to_string(&json).unwrap_or_default();
+                let _ = tx.send(format!("data: {s}\n\n")).await;
+            }
+        };
+
+        let month_start = match chrono::NaiveDate::from_ymd_opt(year, month, 1) {
+            Some(d) => d,
+            None => {
+                send(serde_json::json!({"event":"error","message":"invalid year/month"})).await;
+                return;
+            }
+        };
+        let month_end = if month == 12 {
+            chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)
+        } else {
+            chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)
+        }
+        .unwrap()
+            - chrono::Duration::days(1);
+
+        // 1. 指定月のoperationsを取得（KUDGURI情報）
+        #[derive(sqlx::FromRow)]
+        struct OpRow {
+            unko_no: String,
+            reading_date: chrono::NaiveDate,
+            operation_date: Option<chrono::NaiveDate>,
+            departure_at: Option<chrono::DateTime<chrono::Utc>>,
+            return_at: Option<chrono::DateTime<chrono::Utc>>,
+            driver_cd: Option<String>,
+            total_distance: Option<f64>,
+            drive_time_general: Option<i32>,
+            drive_time_highway: Option<i32>,
+            drive_time_bypass: Option<i32>,
+        }
+
+        let op_rows = match sqlx::query_as::<_, OpRow>(
+            r#"SELECT o.unko_no, o.reading_date, o.operation_date,
+                      o.departure_at, o.return_at,
+                      d.driver_cd,
+                      o.total_distance,
+                      o.drive_time_general, o.drive_time_highway, o.drive_time_bypass
+               FROM operations o
+               LEFT JOIN drivers d ON d.id = o.driver_id AND d.tenant_id = o.tenant_id
+               WHERE o.tenant_id = $1
+                 AND o.reading_date >= $2 AND o.reading_date <= $3
+               ORDER BY o.reading_date, o.unko_no"#,
+        )
+        .bind(tenant_id)
+        .bind(month_start)
+        .bind(month_end)
+        .fetch_all(&state.pool)
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                send(serde_json::json!({"event":"error","message":format!("DB error: {e}")})).await;
+                return;
+            }
+        };
+
+        // OpRow → KudguriRow に変換
+        let ops: Vec<KudguriRow> = op_rows.iter().map(|r| KudguriRow {
+            unko_no: r.unko_no.clone(),
+            reading_date: r.reading_date,
+            operation_date: r.operation_date,
+            office_cd: String::new(),
+            office_name: String::new(),
+            vehicle_cd: String::new(),
+            vehicle_name: String::new(),
+            driver_cd: r.driver_cd.clone().unwrap_or_default(),
+            driver_name: String::new(),
+            crew_role: 0,
+            departure_at: r.departure_at.map(|dt| dt.naive_utc()),
+            return_at: r.return_at.map(|dt| dt.naive_utc()),
+            garage_out_at: None,
+            garage_in_at: None,
+            meter_start: None,
+            meter_end: None,
+            total_distance: r.total_distance,
+            drive_time_general: r.drive_time_general,
+            drive_time_highway: r.drive_time_highway,
+            drive_time_bypass: r.drive_time_bypass,
+            safety_score: None,
+            economy_score: None,
+            total_score: None,
+            raw_data: serde_json::Value::Null,
+        }).collect();
+
+        let total = ops.len();
+        send(serde_json::json!({"event":"progress","current":0,"total":total,"step":"start"})).await;
+
+        // 2. 各operationのKUDGIVT.csvをR2からバッチ並列取得
+        let mut all_kudgivt: Vec<KudgivtRow> = Vec::new();
+        let batch_size = 20;
+        for batch_start in (0..total).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(total);
+            send(serde_json::json!({
+                "event": "progress",
+                "current": batch_end,
+                "total": total,
+                "step": "download"
+            })).await;
+
+            let futures: Vec<_> = ops[batch_start..batch_end]
+                .iter()
+                .map(|op| {
+                    let r2_key = format!("{}/unko/{}/KUDGIVT.csv", tenant_id, op.unko_no);
+                    let storage = state.storage.clone();
+                    async move { (op.unko_no.clone(), storage.download(&r2_key).await) }
+                })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+            for (unko_no, result) in results {
+                match result {
+                    Ok(bytes) => {
+                        // R2のCSVは既にUTF-8で保存済み
+                        let csv_text = String::from_utf8_lossy(&bytes);
+                        match parse_kudgivt(&csv_text) {
+                            Ok(rows) => all_kudgivt.extend(rows),
+                            Err(e) => tracing::warn!("KUDGIVT parse error {}: {e}", unko_no),
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        send(serde_json::json!({
+            "event": "progress",
+            "current": total,
+            "total": total,
+            "step": "calculate"
+        })).await;
+
+        // 3. 再計算
+        match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, Some(tx.clone())).await {
+            Ok(()) => {
+                send(serde_json::json!({
+                    "event": "done",
+                    "total": total,
+                    "success": total,
+                    "failed": 0
+                })).await;
+            }
+            Err(e) => {
+                send(serde_json::json!({"event":"error","message":format!("計算エラー: {e}")})).await;
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|msg| Ok::<_, std::convert::Infallible>(msg));
+
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
 
 /// pending_retry / failed のアップロード一覧

@@ -51,6 +51,18 @@ pub struct RestraintDayRow {
     pub drive_average_minutes: f64,
     pub rest_period_minutes: Option<i32>,
     pub remarks: String,
+    // CSV互換フィールド
+    pub overlap_drive_minutes: i32,
+    pub overlap_cargo_minutes: i32,
+    pub overlap_break_minutes: i32,
+    pub overlap_restraint_minutes: i32,
+    pub restraint_main_minutes: i32,
+    pub drive_avg_before: Option<i32>,
+    pub drive_avg_after: Option<i32>,
+    pub actual_work_minutes: i32,
+    pub overtime_minutes: i32,
+    pub late_night_minutes: i32,
+    pub overtime_late_night_minutes: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +91,15 @@ pub struct MonthlyTotal {
     pub restraint_minutes: i32,
     pub fiscal_year_cumulative_minutes: i32,
     pub fiscal_year_total_minutes: i32,
+    // CSV互換フィールド
+    pub overlap_drive_minutes: i32,
+    pub overlap_cargo_minutes: i32,
+    pub overlap_break_minutes: i32,
+    pub overlap_restraint_minutes: i32,
+    pub actual_work_minutes: i32,
+    pub overtime_minutes: i32,
+    pub late_night_minutes: i32,
+    pub overtime_late_night_minutes: i32,
 }
 
 // --- DB row types ---
@@ -99,16 +120,58 @@ struct FiscalCumRow {
     pub total: Option<i64>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct DailyWorkHoursRow {
+    pub work_date: NaiveDate,
+    pub total_rest_minutes: Option<i32>,
+    pub late_night_minutes: i32,
+}
+
 async fn get_restraint_report(
     State(state): State<AppState>,
     Extension(auth_user): Extension<AuthUser>,
     Query(filter): Query<RestraintReportFilter>,
 ) -> Result<Json<RestraintReportResponse>, (StatusCode, String)> {
-    let tenant_id = auth_user.tenant_id;
-    let driver_id = filter.driver_id;
-    let year = filter.year;
-    let month = filter.month;
+    let report = build_report(
+        &state.pool,
+        auth_user.tenant_id,
+        filter.driver_id,
+        filter.year,
+        filter.month,
+    )
+    .await?;
+    Ok(Json(report))
+}
 
+pub async fn build_report(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    driver_id: Uuid,
+    year: i32,
+    month: u32,
+) -> Result<RestraintReportResponse, (StatusCode, String)> {
+    // Get driver name
+    let driver_name: String = sqlx::query_scalar(
+        "SELECT driver_name FROM drivers WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(driver_id)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_err)?
+    .unwrap_or_default();
+
+    build_report_with_name(pool, tenant_id, driver_id, &driver_name, year, month).await
+}
+
+pub async fn build_report_with_name(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    driver_id: Uuid,
+    driver_name: &str,
+    year: i32,
+    month: u32,
+) -> Result<RestraintReportResponse, (StatusCode, String)> {
     // Validate month
     let Some(month_start) = NaiveDate::from_ymd_opt(year, month, 1) else {
         return Err((StatusCode::BAD_REQUEST, "invalid year/month".to_string()));
@@ -120,17 +183,6 @@ async fn get_restraint_report(
     }
     .unwrap()
         - chrono::Duration::days(1);
-
-    // Get driver name
-    let driver_name: String = sqlx::query_scalar(
-        "SELECT driver_name FROM drivers WHERE id = $1 AND tenant_id = $2",
-    )
-    .bind(driver_id)
-    .bind(tenant_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(internal_err)?
-    .unwrap_or_default();
 
     // Fetch segments for the month
     let segments = sqlx::query_as::<_, SegmentRow>(
@@ -144,7 +196,39 @@ async fn get_restraint_report(
     .bind(driver_id)
     .bind(month_start)
     .bind(month_end)
-    .fetch_all(&state.pool)
+    .fetch_all(pool)
+    .await
+    .map_err(internal_err)?;
+
+    // Fetch daily_work_hours for the month (batch query instead of per-day)
+    let dwh_rows = sqlx::query_as::<_, DailyWorkHoursRow>(
+        r#"SELECT work_date, total_rest_minutes, late_night_minutes
+           FROM daily_work_hours
+           WHERE tenant_id = $1 AND driver_id = $2
+             AND work_date >= $3 AND work_date <= $4"#,
+    )
+    .bind(tenant_id)
+    .bind(driver_id)
+    .bind(month_start)
+    .bind(month_end)
+    .fetch_all(pool)
+    .await
+    .map_err(internal_err)?;
+
+    let dwh_map: std::collections::HashMap<NaiveDate, &DailyWorkHoursRow> =
+        dwh_rows.iter().map(|r| (r.work_date, r)).collect();
+
+    // Fetch previous day's drive minutes (for 前運転平均 on day 1)
+    let prev_day = month_start - chrono::Duration::days(1);
+    let prev_day_main_drive: Option<i32> = sqlx::query_scalar(
+        r#"SELECT drive_minutes FROM daily_work_segments
+           WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3
+           ORDER BY start_at LIMIT 1"#,
+    )
+    .bind(tenant_id)
+    .bind(driver_id)
+    .bind(prev_day)
+    .fetch_optional(pool)
     .await
     .map_err(internal_err)?;
 
@@ -167,7 +251,7 @@ async fn get_restraint_report(
         .bind(driver_id)
         .bind(fiscal_year_start)
         .bind(prev_month_end)
-        .fetch_one(&state.pool)
+        .fetch_one(pool)
         .await
         .map_err(internal_err)?
         .total
@@ -183,10 +267,10 @@ async fn get_restraint_report(
         day_groups.entry(seg.work_date).or_default().push(seg);
     }
 
-    // Build day rows
+    // Build day rows (pass 1)
     let mut days = Vec::new();
     let mut cumulative = 0i32;
-    let mut prev_day_drive: Option<i32> = None; // 前日の運転時間（2日平均用）
+    let mut prev_main_drive: Option<i32> = prev_day_main_drive;
 
     // Weekly tracking
     let mut weekly_subtotals = Vec::new();
@@ -252,29 +336,51 @@ async fn get_restraint_report(
                 })
                 .collect();
 
-            let day_drive: i32 = operations.iter().map(|o| o.drive_minutes).sum();
-            let day_cargo: i32 = operations.iter().map(|o| o.cargo_minutes).sum();
-            let day_restraint: i32 = operations.iter().map(|o| o.restraint_minutes).sum();
+            // 主運行 = 最初の運行, 重複 = 2番目以降
+            let main_op = &operations[0];
+            let main_drive = main_op.drive_minutes;
+            let main_cargo = main_op.cargo_minutes;
+            let main_break = main_op.break_minutes;
+            let main_restraint = main_op.restraint_minutes;
+
+            let overlap_drive: i32 = operations.iter().skip(1).map(|o| o.drive_minutes).sum();
+            let overlap_cargo: i32 = operations.iter().skip(1).map(|o| o.cargo_minutes).sum();
+            let overlap_break: i32 = operations.iter().skip(1).map(|o| o.break_minutes).sum();
+            let overlap_restraint: i32 = operations.iter().skip(1).map(|o| o.restraint_minutes).sum();
+
+            let day_drive = main_drive + overlap_drive;
+            let day_cargo = main_cargo + overlap_cargo;
+            let day_restraint = main_restraint + overlap_restraint;
             let day_break = (day_restraint - day_drive - day_cargo).max(0);
 
-            cumulative += day_restraint;
-            // 2日平均運転時間（前日と当日の平均）
-            let drive_avg = match prev_day_drive {
-                Some(prev) => (prev + day_drive) as f64 / 2.0,
-                None => day_drive as f64,
+            // 拘束累計は主運行の小計のみで積み上げ（CSV準拠）
+            cumulative += main_restraint;
+
+            // 前運転平均: (前日の主運転 + 当日の主運転) / 2
+            let drive_avg_before = prev_main_drive
+                .map(|prev| (prev + main_drive) / 2);
+            // drive_average_minutes は互換性のため残す
+            let drive_avg = match prev_main_drive {
+                Some(prev) => (prev + main_drive) as f64 / 2.0,
+                None => main_drive as f64,
             };
 
-            // 休息: 運行内の休息時間（work_minutes - drive - cargo）の合計
-            let rest_period = if day_break > 0 {
-                Some(day_break)
-            } else {
-                None
-            };
+            // 実働時間 = drive + cargo（全運行合算）
+            let actual_work = day_drive + day_cargo;
+            // 時間外 = max(0, 実働 - 8h)
+            let overtime = (actual_work - 480).max(0);
+
+            // daily_work_hours から休息・深夜を取得
+            let dwh = dwh_map.get(&current_date);
+            let rest_period = dwh
+                .and_then(|r| r.total_rest_minutes)
+                .filter(|&v| v > 0);
+            let late_night = dwh.map(|r| r.late_night_minutes).unwrap_or(0);
 
             week_drive += day_drive;
             week_cargo += day_cargo;
             week_break += day_break;
-            week_restraint += day_restraint;
+            week_restraint += main_restraint;
 
             days.push(RestraintDayRow {
                 date: current_date,
@@ -282,16 +388,27 @@ async fn get_restraint_report(
                 start_time: day_start.map(|t| t.format("%H:%M").to_string()),
                 end_time: day_end.map(|t| t.format("%H:%M").to_string()),
                 operations,
-                drive_minutes: day_drive,
-                cargo_minutes: day_cargo,
-                break_minutes: day_break,
+                drive_minutes: main_drive,
+                cargo_minutes: main_cargo,
+                break_minutes: main_break,
                 restraint_total_minutes: day_restraint,
                 restraint_cumulative_minutes: cumulative,
                 drive_average_minutes: (drive_avg * 100.0).round() / 100.0,
                 rest_period_minutes: rest_period,
                 remarks: String::new(),
+                overlap_drive_minutes: overlap_drive,
+                overlap_cargo_minutes: overlap_cargo,
+                overlap_break_minutes: overlap_break,
+                overlap_restraint_minutes: overlap_restraint,
+                restraint_main_minutes: main_restraint,
+                drive_avg_before: drive_avg_before,
+                drive_avg_after: None, // pass 2 で埋める
+                actual_work_minutes: actual_work,
+                overtime_minutes: overtime,
+                late_night_minutes: late_night,
+                overtime_late_night_minutes: 0,
             });
-            prev_day_drive = Some(day_drive);
+            prev_main_drive = Some(main_drive);
         } else {
             // No work on this day (holiday/off)
             days.push(RestraintDayRow {
@@ -308,10 +425,37 @@ async fn get_restraint_report(
                 drive_average_minutes: 0.0,
                 rest_period_minutes: None,
                 remarks: "休".to_string(),
+                overlap_drive_minutes: 0,
+                overlap_cargo_minutes: 0,
+                overlap_break_minutes: 0,
+                overlap_restraint_minutes: 0,
+                restraint_main_minutes: 0,
+                drive_avg_before: None,
+                drive_avg_after: None,
+                actual_work_minutes: 0,
+                overtime_minutes: 0,
+                late_night_minutes: 0,
+                overtime_late_night_minutes: 0,
             });
+            // 休日の場合、prev_main_drive は 0 として扱う（CSV準拠）
+            prev_main_drive = Some(0);
         }
 
         current_date += chrono::Duration::days(1);
+    }
+
+    // Pass 2: 後運転平均を埋める（当日の主運転 + 翌日の主運転）/ 2
+    for i in 0..days.len() {
+        if days[i].is_holiday {
+            continue;
+        }
+        let current_main_drive = days[i].drive_minutes;
+        let next_main_drive = if i + 1 < days.len() {
+            days[i + 1].drive_minutes // 休日なら0
+        } else {
+            0
+        };
+        days[i].drive_avg_after = Some((current_main_drive + next_main_drive) / 2);
     }
 
     // Final weekly subtotal
@@ -332,21 +476,29 @@ async fn get_restraint_report(
         restraint_minutes: cumulative,
         fiscal_year_cumulative_minutes: fiscal_cum,
         fiscal_year_total_minutes: fiscal_cum + cumulative,
+        overlap_drive_minutes: days.iter().map(|d| d.overlap_drive_minutes).sum(),
+        overlap_cargo_minutes: days.iter().map(|d| d.overlap_cargo_minutes).sum(),
+        overlap_break_minutes: days.iter().map(|d| d.overlap_break_minutes).sum(),
+        overlap_restraint_minutes: days.iter().map(|d| d.overlap_restraint_minutes).sum(),
+        actual_work_minutes: days.iter().map(|d| d.actual_work_minutes).sum(),
+        overtime_minutes: days.iter().map(|d| d.overtime_minutes).sum(),
+        late_night_minutes: days.iter().map(|d| d.late_night_minutes).sum(),
+        overtime_late_night_minutes: 0,
     };
 
     // 最大拘束時間: デフォルト275時間（分換算16500）
     let max_restraint_minutes = 275 * 60;
 
-    Ok(Json(RestraintReportResponse {
+    Ok(RestraintReportResponse {
         driver_id,
-        driver_name,
+        driver_name: driver_name.to_string(),
         year,
         month,
         max_restraint_minutes,
         days,
         weekly_subtotals,
         monthly_total,
-    }))
+    })
 }
 
 fn internal_err(e: impl std::fmt::Display) -> (StatusCode, String) {

@@ -817,6 +817,184 @@ async fn calculate_daily_hours(
         }
     }
 
+    // 3.7. 運行単位の集計値を計算（CSV比較用: 運行出発日ベース）
+    {
+        struct OpAgg {
+            drive_minutes: i32,
+            cargo_minutes: i32,
+            late_night_minutes: i32,
+            restraint_minutes: i32,
+            break_minutes: i32,
+            overlap_drive_minutes: i32,
+            overlap_cargo_minutes: i32,
+            overlap_break_minutes: i32,
+            overlap_restraint_minutes: i32,
+            ot_late_night_minutes: i32,
+        }
+
+        let mut op_agg_map: HashMap<String, OpAgg> = HashMap::new();
+
+        // 3.7.1. KUDGIVTイベントから運行単位のdrive/cargo/late_nightを集計
+        for row in rows {
+            let unko_no = &row.unko_no;
+            if let Some(events) = kudgivt_by_unko.get(unko_no) {
+                let mut op_drive = 0i32;
+                let mut op_cargo = 0i32;
+                let mut op_late_night = 0i32;
+
+                for evt in events {
+                    let dur = evt.duration_minutes.unwrap_or(0);
+                    if dur <= 0 { continue; }
+                    let cls = classifications.get(&evt.event_cd);
+
+                    match cls {
+                        Some(EventClass::Drive) => op_drive += dur,
+                        Some(EventClass::Cargo) => op_cargo += dur,
+                        _ => {}
+                    }
+
+                    match cls {
+                        Some(EventClass::Drive) | Some(EventClass::Cargo) => {
+                            let evt_end = evt.start_at + chrono::Duration::minutes(dur as i64);
+                            let night = crate::csv_parser::work_segments::calc_late_night_mins(evt.start_at, evt_end);
+                            op_late_night += night;
+                        }
+                        _ => {}
+                    }
+                }
+
+                op_agg_map.insert(unko_no.clone(), OpAgg {
+                    drive_minutes: op_drive,
+                    cargo_minutes: op_cargo,
+                    late_night_minutes: op_late_night,
+                    restraint_minutes: 0,
+                    break_minutes: 0,
+                    overlap_drive_minutes: 0,
+                    overlap_cargo_minutes: 0,
+                    overlap_break_minutes: 0,
+                    overlap_restraint_minutes: 0,
+                    ot_late_night_minutes: 0,
+                });
+            }
+        }
+
+        // 3.7.2. セグメントから運行単位のrestraint_minutesを計算（HH:MM arithmetic）
+        for ((_dc, _dt), agg) in &day_map {
+            for seg in &agg.segments {
+                if let Some(op) = op_agg_map.get_mut(&seg.unko_no) {
+                    let s_min = (seg.start_at.hour() * 60 + seg.start_at.minute()) as i32;
+                    let e_min = (seg.end_at.hour() * 60 + seg.end_at.minute()) as i32;
+                    let dur = if seg.end_at.date() > seg.start_at.date() {
+                        let days = (seg.end_at.date() - seg.start_at.date()).num_days() as i32;
+                        e_min + days * 1440 - s_min
+                    } else {
+                        e_min - s_min
+                    };
+                    op.restraint_minutes += dur;
+                }
+            }
+        }
+        for op in op_agg_map.values_mut() {
+            op.break_minutes = (op.restraint_minutes - op.drive_minutes - op.cargo_minutes).max(0);
+        }
+
+        // 3.7.3. 運行間の重複(overlap)計算
+        // 各運行の24h窓（departure_at + 24h）内に次の運行の開始が入るかチェック
+        {
+            let mut driver_ops: HashMap<String, Vec<(String, chrono::NaiveDateTime, chrono::NaiveDateTime)>> = HashMap::new();
+            for row in rows {
+                if let (Some(dep), Some(ret)) = (row.departure_at, row.return_at) {
+                    driver_ops.entry(row.driver_cd.clone()).or_default()
+                        .push((row.unko_no.clone(), dep, ret));
+                }
+            }
+
+            for (_dc, ops) in &mut driver_ops {
+                ops.sort_by_key(|(_, dep, _)| *dep);
+
+                for i in 0..ops.len().saturating_sub(1) {
+                    let (ref unko_no, dep, _ret) = ops[i];
+                    let (ref next_unko, next_dep, next_ret) = ops[i + 1];
+
+                    let window_end = dep + chrono::Duration::hours(24);
+                    if next_dep >= window_end { continue; }
+
+                    // 次の運行のイベントで窓内のものを集計
+                    let mut ol_drive = 0i32;
+                    let mut ol_cargo = 0i32;
+
+                    if let Some(events) = kudgivt_by_unko.get(next_unko) {
+                        for evt in events {
+                            let dur = evt.duration_minutes.unwrap_or(0);
+                            if dur <= 0 { continue; }
+                            let cls = classifications.get(&evt.event_cd);
+
+                            let evt_start = evt.start_at;
+                            let evt_end = evt_start + chrono::Duration::minutes(dur as i64);
+
+                            if evt_start >= window_end { continue; }
+                            if evt_end <= next_dep { continue; }
+
+                            let overlap_start = evt_start.max(next_dep);
+                            let effective_end = evt_end.min(window_end);
+                            if effective_end <= overlap_start { continue; }
+                            let mins = (effective_end - overlap_start).num_minutes() as i32;
+                            let actual_dur = mins.min(dur);
+
+                            match cls {
+                                Some(EventClass::Drive) => ol_drive += actual_dur,
+                                Some(EventClass::Cargo) => ol_cargo += actual_dur,
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    let ol_restraint = (window_end.min(next_ret) - next_dep).num_minutes() as i32;
+                    let ol_break = (ol_restraint - ol_drive - ol_cargo).max(0);
+
+                    if let Some(op) = op_agg_map.get_mut(unko_no) {
+                        op.overlap_drive_minutes = ol_drive;
+                        op.overlap_cargo_minutes = ol_cargo;
+                        op.overlap_break_minutes = ol_break;
+                        op.overlap_restraint_minutes = ol_restraint;
+                    }
+                }
+            }
+        }
+
+        // 3.7.4. operationsテーブルに保存
+        for (unko_no, op) in &op_agg_map {
+            sqlx::query(
+                r#"UPDATE operations SET
+                    op_drive_minutes = $1,
+                    op_cargo_minutes = $2,
+                    op_break_minutes = $3,
+                    op_restraint_minutes = $4,
+                    op_late_night_minutes = $5,
+                    op_overlap_drive_minutes = $6,
+                    op_overlap_cargo_minutes = $7,
+                    op_overlap_break_minutes = $8,
+                    op_overlap_restraint_minutes = $9,
+                    op_ot_late_night_minutes = $10
+                WHERE tenant_id = $11 AND unko_no = $12"#,
+            )
+            .bind(op.drive_minutes)
+            .bind(op.cargo_minutes)
+            .bind(op.break_minutes)
+            .bind(op.restraint_minutes)
+            .bind(op.late_night_minutes)
+            .bind(op.overlap_drive_minutes)
+            .bind(op.overlap_cargo_minutes)
+            .bind(op.overlap_break_minutes)
+            .bind(op.overlap_restraint_minutes)
+            .bind(op.ot_late_night_minutes)
+            .bind(tenant_id)
+            .bind(unko_no)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
+
     // 4. Persist to DB
     let day_entries: Vec<_> = day_map.iter().collect();
     let save_total = day_entries.len();

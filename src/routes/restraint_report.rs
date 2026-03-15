@@ -726,6 +726,134 @@ fn parse_restraint_csv(bytes: &[u8]) -> Result<Vec<CsvDriverData>, String> {
     Ok(drivers)
 }
 
+/// operationsテーブルから運行単位のデータを取得してCSV比較用の行を生成
+#[derive(Debug, sqlx::FromRow)]
+struct OpRow {
+    unko_no: String,
+    departure_at: Option<DateTime<Utc>>,
+    return_at: Option<DateTime<Utc>>,
+    op_drive_minutes: Option<i32>,
+    op_cargo_minutes: Option<i32>,
+    op_restraint_minutes: Option<i32>,
+    op_late_night_minutes: Option<i32>,
+    op_overlap_drive_minutes: i32,
+    op_overlap_cargo_minutes: i32,
+    op_overlap_restraint_minutes: i32,
+    op_ot_late_night_minutes: i32,
+}
+
+async fn build_operation_comparison(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    driver_id: Uuid,
+    year: i32,
+    month: u32,
+) -> Result<Vec<SystemDayRow>, (StatusCode, String)> {
+    let month_start = NaiveDate::from_ymd_opt(year, month, 1)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid year/month".to_string()))?;
+    let month_end = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .unwrap()
+        - chrono::Duration::days(1);
+
+    // 当月の運行を出発日時順に取得
+    let ops = sqlx::query_as::<_, OpRow>(
+        r#"SELECT unko_no, departure_at, return_at,
+                  op_drive_minutes, op_cargo_minutes,
+                  op_restraint_minutes, op_late_night_minutes,
+                  op_overlap_drive_minutes, op_overlap_cargo_minutes,
+                  op_overlap_restraint_minutes, op_ot_late_night_minutes
+           FROM operations
+           WHERE tenant_id = $1 AND driver_id = $2
+             AND departure_at IS NOT NULL
+             AND departure_at >= $3::date::timestamptz
+             AND departure_at < ($4::date + interval '1 day')::timestamptz
+           ORDER BY departure_at"#,
+    )
+    .bind(tenant_id)
+    .bind(driver_id)
+    .bind(month_start)
+    .bind(month_end)
+    .fetch_all(pool)
+    .await
+    .map_err(internal_err)?;
+
+    // 運行を出発日でグループ化
+    let mut op_by_date: std::collections::BTreeMap<NaiveDate, Vec<&OpRow>> =
+        std::collections::BTreeMap::new();
+    for op in &ops {
+        if let Some(dep) = op.departure_at {
+            let dep_date = dep.naive_utc().date();
+            op_by_date.entry(dep_date).or_default().push(op);
+        }
+    }
+
+    // 全日付を走査して行を生成（休日含む）
+    let mut rows = Vec::new();
+    let mut cumulative = 0i32;
+    let mut current_date = month_start;
+
+    while current_date <= month_end {
+        if let Some(day_ops) = op_by_date.get(&current_date) {
+            // この日に1つ以上の運行あり → 運行ごとに1行
+            for op in day_ops {
+                let drive = op.op_drive_minutes.unwrap_or(0);
+                let cargo = op.op_cargo_minutes.unwrap_or(0);
+                let restraint = op.op_restraint_minutes.unwrap_or(0);
+                let late_night = op.op_late_night_minutes.unwrap_or(0);
+                let ol_drive = op.op_overlap_drive_minutes;
+                let ol_cargo = op.op_overlap_cargo_minutes;
+                let ol_restraint = op.op_overlap_restraint_minutes;
+                let ot_late_night = op.op_ot_late_night_minutes;
+
+                let actual_work = drive + cargo;
+                let total_overtime = (actual_work - 480).max(0);
+                let overtime = (total_overtime - ot_late_night).max(0);
+                let total = restraint + ol_restraint;
+                cumulative += restraint;
+
+                rows.push(SystemDayRow {
+                    date: format!("{}月{}日", current_date.month(), current_date.day()),
+                    drive: fmt_min(drive),
+                    overlap_drive: fmt_min(ol_drive),
+                    cargo: fmt_min(cargo),
+                    overlap_cargo: fmt_min(ol_cargo),
+                    subtotal: fmt_min(restraint),
+                    overlap_subtotal: fmt_min(ol_restraint),
+                    total: fmt_min(total),
+                    cumulative: fmt_min(cumulative),
+                    actual_work: fmt_min(actual_work),
+                    overtime: fmt_min(overtime),
+                    late_night: fmt_min(late_night),
+                });
+            }
+        } else {
+            // 休日
+            rows.push(SystemDayRow {
+                date: format!("{}月{}日", current_date.month(), current_date.day()),
+                drive: String::new(),
+                overlap_drive: String::new(),
+                cargo: String::new(),
+                overlap_cargo: String::new(),
+                subtotal: String::new(),
+                overlap_subtotal: String::new(),
+                total: String::new(),
+                cumulative: String::new(),
+                actual_work: String::new(),
+                overtime: String::new(),
+                late_night: String::new(),
+            });
+        }
+
+        current_date += chrono::Duration::days(1);
+    }
+
+    Ok(rows)
+}
+
 async fn compare_csv(
     State(state): State<AppState>,
     Extension(auth_user): Extension<AuthUser>,
@@ -755,16 +883,12 @@ async fn compare_csv(
     let (year, month) = csv_drivers.first()
         .and_then(|d| d.days.first())
         .and_then(|day| {
-            // "2月1日" → month=2
             let s = &day.date;
             let m_pos = s.find('月')?;
             let m: u32 = s[..m_pos].parse().ok()?;
             Some(m)
         })
-        .map(|m| {
-            // 年はCSVヘッダーから取れないので現在年を使う（要改善）
-            (2026i32, m)
-        })
+        .map(|m| (2026i32, m))
         .unwrap_or((2026, 1));
 
     // 全ドライバー取得
@@ -779,65 +903,98 @@ async fn compare_csv(
     let mut results = Vec::new();
 
     for csv_d in &csv_drivers {
-        // driver_cd でマッチ
         let db_match = db_drivers.iter().find(|(_, cd, _)| cd == &csv_d.driver_cd);
 
-        let (driver_id, system_data, diffs) = if let Some((did, _, dname)) = db_match {
-            // システムのレポートを取得
-            match build_report_with_name(&state.pool, tenant_id, *did, dname, year, month).await {
-                Ok(report) => {
-                    let sys_days: Vec<SystemDayRow> = report.days.iter().map(|d| SystemDayRow {
-                        date: format!("{}月{}日", d.date.month(), d.date.day()),
-                        drive: fmt_min(d.drive_minutes),
-                        overlap_drive: fmt_min(d.overlap_drive_minutes),
-                        cargo: fmt_min(d.cargo_minutes),
-                        overlap_cargo: fmt_min(d.overlap_cargo_minutes),
-                        subtotal: fmt_min(d.restraint_main_minutes),
-                        overlap_subtotal: fmt_min(d.overlap_restraint_minutes),
-                        total: fmt_min(d.restraint_total_minutes),
-                        cumulative: fmt_min(d.restraint_cumulative_minutes),
-                        actual_work: fmt_min(d.actual_work_minutes),
-                        overtime: fmt_min(d.overtime_minutes),
-                        late_night: fmt_min(d.late_night_minutes),
-                    }).collect();
-
-                    // 差分検出
+        let (driver_id, system_data, diffs) = if let Some((did, _, _dname)) = db_match {
+            match build_operation_comparison(&state.pool, tenant_id, *did, year, month).await {
+                Ok(sys_days) => {
+                    // 日付+順序ベースのマッチングで差分検出
                     let mut diffs = Vec::new();
-                    for (csv_day, sys_day) in csv_d.days.iter().zip(sys_days.iter()) {
-                        if csv_day.is_holiday { continue; }
-                        let checks = [
-                            ("運転", &csv_day.drive, &sys_day.drive),
-                            ("重複運転", &csv_day.overlap_drive, &sys_day.overlap_drive),
-                            ("小計", &csv_day.subtotal, &sys_day.subtotal),
-                            ("重複小計", &csv_day.overlap_subtotal, &sys_day.overlap_subtotal),
-                            ("合計", &csv_day.total, &sys_day.total),
-                            ("累計", &csv_day.cumulative, &sys_day.cumulative),
-                            ("実働", &csv_day.actual_work, &sys_day.actual_work),
-                            ("時間外", &csv_day.overtime, &sys_day.overtime),
-                            ("深夜", &csv_day.late_night, &sys_day.late_night),
-                        ];
-                        for (field, csv_val, sys_val) in checks {
-                            let cv = csv_val.trim();
-                            let sv = sys_val.trim();
-                            if cv != sv && !(cv.is_empty() && sv.is_empty()) {
-                                diffs.push(DiffItem {
-                                    date: csv_day.date.clone(),
-                                    field: field.to_string(),
-                                    csv_val: cv.to_string(),
-                                    sys_val: sv.to_string(),
-                                });
+
+                    // CSV行とシステム行をそれぞれ (日付, 順序) でインデックス
+                    let mut csv_by_date: std::collections::BTreeMap<String, Vec<usize>> =
+                        std::collections::BTreeMap::new();
+                    for (i, day) in csv_d.days.iter().enumerate() {
+                        csv_by_date.entry(day.date.clone()).or_default().push(i);
+                    }
+                    let mut sys_by_date: std::collections::BTreeMap<String, Vec<usize>> =
+                        std::collections::BTreeMap::new();
+                    for (i, day) in sys_days.iter().enumerate() {
+                        sys_by_date.entry(day.date.clone()).or_default().push(i);
+                    }
+
+                    // 日付ごとにマッチ
+                    for (date_str, csv_indices) in &csv_by_date {
+                        let sys_indices = sys_by_date.get(date_str);
+                        for (order, &ci) in csv_indices.iter().enumerate() {
+                            let csv_day = &csv_d.days[ci];
+                            if csv_day.is_holiday { continue; }
+
+                            let sys_day = sys_indices
+                                .and_then(|si| si.get(order))
+                                .map(|&si| &sys_days[si]);
+
+                            let empty_row = SystemDayRow {
+                                date: date_str.clone(),
+                                drive: String::new(), overlap_drive: String::new(),
+                                cargo: String::new(), overlap_cargo: String::new(),
+                                subtotal: String::new(), overlap_subtotal: String::new(),
+                                total: String::new(), cumulative: String::new(),
+                                actual_work: String::new(), overtime: String::new(),
+                                late_night: String::new(),
+                            };
+                            let sd = sys_day.unwrap_or(&empty_row);
+
+                            let checks = [
+                                ("運転", &csv_day.drive, &sd.drive),
+                                ("重複運転", &csv_day.overlap_drive, &sd.overlap_drive),
+                                ("小計", &csv_day.subtotal, &sd.subtotal),
+                                ("重複小計", &csv_day.overlap_subtotal, &sd.overlap_subtotal),
+                                ("合計", &csv_day.total, &sd.total),
+                                ("累計", &csv_day.cumulative, &sd.cumulative),
+                                ("実働", &csv_day.actual_work, &sd.actual_work),
+                                ("時間外", &csv_day.overtime, &sd.overtime),
+                                ("深夜", &csv_day.late_night, &sd.late_night),
+                            ];
+                            for (field, csv_val, sys_val) in checks {
+                                let cv = csv_val.trim();
+                                let sv = sys_val.trim();
+                                if cv != sv && !(cv.is_empty() && sv.is_empty()) {
+                                    diffs.push(DiffItem {
+                                        date: csv_day.date.clone(),
+                                        field: field.to_string(),
+                                        csv_val: cv.to_string(),
+                                        sys_val: sv.to_string(),
+                                    });
+                                }
                             }
                         }
                     }
 
+                    // SystemDriverData の集計
+                    let mut tot_drive = 0i32;
+                    let mut tot_ol_drive = 0i32;
+                    let mut tot_restraint = 0i32;
+                    let mut tot_actual = 0i32;
+                    let mut tot_overtime = 0i32;
+                    let mut tot_late = 0i32;
+                    for sd in &sys_days {
+                        tot_drive += parse_hhmm(&sd.drive);
+                        tot_ol_drive += parse_hhmm(&sd.overlap_drive);
+                        tot_restraint += parse_hhmm(&sd.subtotal);
+                        tot_actual += parse_hhmm(&sd.actual_work);
+                        tot_overtime += parse_hhmm(&sd.overtime);
+                        tot_late += parse_hhmm(&sd.late_night);
+                    }
+
                     let sys_data = SystemDriverData {
                         days: sys_days,
-                        total_drive: fmt_min(report.monthly_total.drive_minutes),
-                        total_overlap_drive: fmt_min(report.monthly_total.overlap_drive_minutes),
-                        total_restraint: fmt_min(report.monthly_total.restraint_minutes),
-                        total_actual_work: fmt_min(report.monthly_total.actual_work_minutes),
-                        total_overtime: fmt_min(report.monthly_total.overtime_minutes),
-                        total_late_night: fmt_min(report.monthly_total.late_night_minutes),
+                        total_drive: fmt_min(tot_drive),
+                        total_overlap_drive: fmt_min(tot_ol_drive),
+                        total_restraint: fmt_min(tot_restraint),
+                        total_actual_work: fmt_min(tot_actual),
+                        total_overtime: fmt_min(tot_overtime),
+                        total_late_night: fmt_min(tot_late),
                     };
 
                     (Some(did.to_string()), Some(sys_data), diffs)

@@ -570,18 +570,31 @@ async fn calculate_daily_hours(
         for (driver_cd, unko_nos) in &driver_unko_map {
             let mut day_drive: HashMap<chrono::NaiveDate, i32> = HashMap::new();
             let mut day_cargo: HashMap<chrono::NaiveDate, i32> = HashMap::new();
+            let mut day_late_night: HashMap<chrono::NaiveDate, i32> = HashMap::new();
 
             for unko_no in unko_nos {
                 if let Some(events) = kudgivt_by_unko.get(unko_no) {
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
-                        match classifications.get(&evt.event_cd) {
+                        let cls = classifications.get(&evt.event_cd);
+                        match cls {
                             Some(EventClass::Drive) => {
                                 *day_drive.entry(evt.start_at.date()).or_insert(0) += dur;
                             }
                             Some(EventClass::Cargo) => {
                                 *day_cargo.entry(evt.start_at.date()).or_insert(0) += dur;
+                            }
+                            _ => {}
+                        }
+                        // 深夜時間: Drive/Cargo イベントの実時間のみから計算
+                        match cls {
+                            Some(EventClass::Drive) | Some(EventClass::Cargo) => {
+                                let evt_end = evt.start_at + chrono::Duration::minutes(dur as i64);
+                                let night = crate::csv_parser::work_segments::calc_late_night_mins(evt.start_at, evt_end);
+                                if night > 0 {
+                                    *day_late_night.entry(evt.start_at.date()).or_insert(0) += night;
+                                }
                             }
                             _ => {}
                         }
@@ -597,6 +610,18 @@ async fn calculate_daily_hours(
             for (date, cargo) in &day_cargo {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
                     agg.cargo_minutes = *cargo;
+                }
+            }
+            // 深夜時間をイベントベースで上書き（セグメント時間ベースから変更）
+            for (date, night) in &day_late_night {
+                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
+                    agg.late_night_minutes = *night;
+                }
+            }
+            // 深夜イベントがない日は0にリセット
+            for ((dc, _date), agg) in day_map.iter_mut() {
+                if dc == driver_cd && !day_late_night.contains_key(&_date) {
+                    agg.late_night_minutes = 0;
                 }
             }
         }

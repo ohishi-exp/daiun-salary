@@ -161,7 +161,8 @@ async fn list_operations(
     let operations = sqlx::query_as::<_, OperationListItem>(
         r#"SELECT o.id, o.unko_no, o.crew_role, o.reading_date, o.operation_date,
                   d.driver_name, v.vehicle_name,
-                  o.total_distance, o.safety_score, o.economy_score, o.total_score
+                  o.total_distance, o.safety_score, o.economy_score, o.total_score,
+                  o.has_kudgivt
            FROM operations o
            LEFT JOIN drivers d ON o.driver_id = d.id
            LEFT JOIN vehicles v ON o.vehicle_id = v.id

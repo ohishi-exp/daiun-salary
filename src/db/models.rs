@@ -258,6 +258,7 @@ pub struct OperationListItem {
     pub safety_score: Option<f64>,
     pub economy_score: Option<f64>,
     pub total_score: Option<f64>,
+    pub has_kudgivt: bool,
 }
 
 #[derive(Debug, Deserialize)]

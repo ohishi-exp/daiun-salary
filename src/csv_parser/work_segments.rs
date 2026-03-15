@@ -98,6 +98,21 @@ pub fn split_by_rest(
         .collect();
     labor_events.sort_by_key(|e| e.start_at);
 
+    // 実際の終了時刻 = イベントの最終終了時刻（なければreturn_at）
+    let actual_end = events
+        .iter()
+        .filter_map(|e| {
+            let dur = e.duration_minutes.unwrap_or(0);
+            if dur > 0 {
+                Some(e.start_at + chrono::Duration::minutes(dur as i64))
+            } else {
+                // duration=0 のイベント（運行開始/終了等）は start_at を使う
+                Some(e.start_at)
+            }
+        })
+        .max()
+        .unwrap_or(return_at);
+
     let mut segments = Vec::new();
     let mut current_start = departure_at;
 
@@ -117,15 +132,15 @@ pub fn split_by_rest(
             });
         }
 
-        current_start = rest_end.min(return_at);
+        current_start = rest_end.min(actual_end);
     }
 
     // 最後の区間
-    if current_start < return_at {
-        let (drive, cargo) = sum_events_in_range(&labor_events, classifications, current_start, return_at);
+    if current_start < actual_end {
+        let (drive, cargo) = sum_events_in_range(&labor_events, classifications, current_start, actual_end);
         segments.push(WorkSegment {
             start: current_start,
-            end: return_at,
+            end: actual_end,
             labor_minutes: drive + cargo,
             drive_minutes: drive,
             cargo_minutes: cargo,

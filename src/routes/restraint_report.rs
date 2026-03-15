@@ -1,7 +1,7 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Multipart, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
     Extension, Json, Router,
 };
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
@@ -12,7 +12,9 @@ use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/restraint-report", get(get_restraint_report))
+    Router::new()
+        .route("/restraint-report", get(get_restraint_report))
+        .route("/restraint-report/compare-csv", post(compare_csv))
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,8 +125,15 @@ struct FiscalCumRow {
 #[derive(Debug, sqlx::FromRow)]
 struct DailyWorkHoursRow {
     pub work_date: NaiveDate,
+    pub total_work_minutes: i32,
     pub total_rest_minutes: Option<i32>,
     pub late_night_minutes: i32,
+    pub drive_minutes: i32,
+    pub cargo_minutes: i32,
+    pub overlap_drive_minutes: i32,
+    pub overlap_cargo_minutes: i32,
+    pub overlap_break_minutes: i32,
+    pub overlap_restraint_minutes: i32,
 }
 
 async fn get_restraint_report(
@@ -202,7 +211,10 @@ pub async fn build_report_with_name(
 
     // Fetch daily_work_hours for the month (batch query instead of per-day)
     let dwh_rows = sqlx::query_as::<_, DailyWorkHoursRow>(
-        r#"SELECT work_date, total_rest_minutes, late_night_minutes
+        r#"SELECT work_date, total_work_minutes, total_rest_minutes, late_night_minutes,
+                  drive_minutes, cargo_minutes,
+                  overlap_drive_minutes, overlap_cargo_minutes,
+                  overlap_break_minutes, overlap_restraint_minutes
            FROM daily_work_hours
            WHERE tenant_id = $1 AND driver_id = $2
              AND work_date >= $3 AND work_date <= $4"#,
@@ -336,42 +348,35 @@ pub async fn build_report_with_name(
                 })
                 .collect();
 
-            // 主運行 = 最初の運行, 重複 = 2番目以降
-            let main_op = &operations[0];
-            let main_drive = main_op.drive_minutes;
-            let main_cargo = main_op.cargo_minutes;
-            let main_break = main_op.break_minutes;
-            let main_restraint = main_op.restraint_minutes;
-
-            let overlap_drive: i32 = operations.iter().skip(1).map(|o| o.drive_minutes).sum();
-            let overlap_cargo: i32 = operations.iter().skip(1).map(|o| o.cargo_minutes).sum();
-            let overlap_break: i32 = operations.iter().skip(1).map(|o| o.break_minutes).sum();
-            let overlap_restraint: i32 = operations.iter().skip(1).map(|o| o.restraint_minutes).sum();
-
-            let day_drive = main_drive + overlap_drive;
-            let day_cargo = main_cargo + overlap_cargo;
-            let day_restraint = main_restraint + overlap_restraint;
+            // daily_work_hours から取得（KUDGIVTイベント直接集計値）
+            let dwh = dwh_map.get(&current_date);
+            let seg_restraint: i32 = operations.iter().map(|o| o.restraint_minutes).sum();
+            let day_drive = dwh.map(|r| r.drive_minutes).unwrap_or_else(|| operations.iter().map(|o| o.drive_minutes).sum());
+            let day_cargo = dwh.map(|r| r.cargo_minutes).unwrap_or_else(|| operations.iter().map(|o| o.cargo_minutes).sum());
+            let day_restraint = dwh.map(|r| r.total_work_minutes).unwrap_or(seg_restraint);
             let day_break = (day_restraint - day_drive - day_cargo).max(0);
+            let overlap_drive = dwh.map(|r| r.overlap_drive_minutes).unwrap_or(0);
+            let overlap_cargo = dwh.map(|r| r.overlap_cargo_minutes).unwrap_or(0);
+            let overlap_break = dwh.map(|r| r.overlap_break_minutes).unwrap_or(0);
+            let overlap_restraint = dwh.map(|r| r.overlap_restraint_minutes).unwrap_or(0);
 
-            // 拘束累計は主運行の小計のみで積み上げ（CSV準拠）
-            cumulative += main_restraint;
+            // 拘束累計は当日の小計のみで積み上げ（CSV準拠）
+            cumulative += day_restraint;
 
-            // 前運転平均: (前日の主運転 + 当日の主運転) / 2
+            // 前運転平均: (前日の運転 + 当日の運転) / 2
             let drive_avg_before = prev_main_drive
-                .map(|prev| (prev + main_drive) / 2);
-            // drive_average_minutes は互換性のため残す
+                .map(|prev| (prev + day_drive) / 2);
             let drive_avg = match prev_main_drive {
-                Some(prev) => (prev + main_drive) as f64 / 2.0,
-                None => main_drive as f64,
+                Some(prev) => (prev + day_drive) as f64 / 2.0,
+                None => day_drive as f64,
             };
 
-            // 実働時間 = drive + cargo（全運行合算）
+            // 実働時間 = drive + cargo
             let actual_work = day_drive + day_cargo;
             // 時間外 = max(0, 実働 - 8h)
             let overtime = (actual_work - 480).max(0);
 
-            // daily_work_hours から休息・深夜を取得
-            let dwh = dwh_map.get(&current_date);
+            // 休息・深夜（dwh は既に上で取得済み）
             let rest_period = dwh
                 .and_then(|r| r.total_rest_minutes)
                 .filter(|&v| v > 0);
@@ -380,7 +385,7 @@ pub async fn build_report_with_name(
             week_drive += day_drive;
             week_cargo += day_cargo;
             week_break += day_break;
-            week_restraint += main_restraint;
+            week_restraint += day_restraint;
 
             days.push(RestraintDayRow {
                 date: current_date,
@@ -388,10 +393,10 @@ pub async fn build_report_with_name(
                 start_time: day_start.map(|t| t.format("%H:%M").to_string()),
                 end_time: day_end.map(|t| t.format("%H:%M").to_string()),
                 operations,
-                drive_minutes: main_drive,
-                cargo_minutes: main_cargo,
-                break_minutes: main_break,
-                restraint_total_minutes: day_restraint,
+                drive_minutes: day_drive,
+                cargo_minutes: day_cargo,
+                break_minutes: day_break,
+                restraint_total_minutes: day_restraint + overlap_restraint,
                 restraint_cumulative_minutes: cumulative,
                 drive_average_minutes: (drive_avg * 100.0).round() / 100.0,
                 rest_period_minutes: rest_period,
@@ -400,15 +405,15 @@ pub async fn build_report_with_name(
                 overlap_cargo_minutes: overlap_cargo,
                 overlap_break_minutes: overlap_break,
                 overlap_restraint_minutes: overlap_restraint,
-                restraint_main_minutes: main_restraint,
-                drive_avg_before: drive_avg_before,
+                restraint_main_minutes: day_restraint,
+                drive_avg_before,
                 drive_avg_after: None, // pass 2 で埋める
                 actual_work_minutes: actual_work,
                 overtime_minutes: overtime,
                 late_night_minutes: late_night,
                 overtime_late_night_minutes: 0,
             });
-            prev_main_drive = Some(main_drive);
+            prev_main_drive = Some(day_drive);
         } else {
             // No work on this day (holiday/off)
             days.push(RestraintDayRow {
@@ -507,4 +512,379 @@ fn internal_err(e: impl std::fmt::Display) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal server error".to_string(),
     )
+}
+
+// === CSV比較 ===
+
+/// CSV1ドライバー分のパース結果
+#[derive(Debug, Serialize)]
+pub struct CsvDriverData {
+    pub driver_name: String,
+    pub driver_cd: String,
+    pub days: Vec<CsvDayRow>,
+    pub total_drive: String,
+    pub total_cargo: String,
+    pub total_break: String,
+    pub total_restraint: String,
+    pub total_actual_work: String,
+    pub total_overtime: String,
+    pub total_late_night: String,
+    pub total_ot_late_night: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CsvDayRow {
+    pub date: String,
+    pub is_holiday: bool,
+    pub start_time: String,
+    pub end_time: String,
+    pub drive: String,
+    pub overlap_drive: String,
+    pub cargo: String,
+    pub overlap_cargo: String,
+    pub break_time: String,
+    pub overlap_break: String,
+    pub subtotal: String,
+    pub overlap_subtotal: String,
+    pub total: String,
+    pub cumulative: String,
+    pub rest: String,
+    pub actual_work: String,
+    pub overtime: String,
+    pub late_night: String,
+    pub ot_late_night: String,
+    pub remarks: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompareResult {
+    pub driver_name: String,
+    pub driver_cd: String,
+    pub driver_id: Option<String>,
+    pub csv: CsvDriverData,
+    pub system: Option<SystemDriverData>,
+    pub diffs: Vec<DiffItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SystemDriverData {
+    pub days: Vec<SystemDayRow>,
+    pub total_drive: String,
+    pub total_overlap_drive: String,
+    pub total_restraint: String,
+    pub total_actual_work: String,
+    pub total_overtime: String,
+    pub total_late_night: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SystemDayRow {
+    pub date: String,
+    pub drive: String,
+    pub overlap_drive: String,
+    pub cargo: String,
+    pub overlap_cargo: String,
+    pub subtotal: String,
+    pub overlap_subtotal: String,
+    pub total: String,
+    pub cumulative: String,
+    pub actual_work: String,
+    pub overtime: String,
+    pub late_night: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffItem {
+    pub date: String,
+    pub field: String,
+    pub csv_val: String,
+    pub sys_val: String,
+}
+
+fn fmt_min(val: i32) -> String {
+    if val == 0 { return String::new(); }
+    format!("{}:{:02}", val / 60, val % 60)
+}
+
+fn parse_hhmm(s: &str) -> i32 {
+    let s = s.trim();
+    if s.is_empty() { return 0; }
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 { return 0; }
+    let h: i32 = parts[0].parse().unwrap_or(0);
+    let m: i32 = parts[1].parse().unwrap_or(0);
+    h * 60 + m
+}
+
+/// Shift-JIS/CP932 のCSVをパースして全ドライバーのデータを返す
+fn parse_restraint_csv(bytes: &[u8]) -> Result<Vec<CsvDriverData>, String> {
+    // CP932 → UTF-8
+    let text = if let Ok(s) = String::from_utf8(bytes.to_vec()) {
+        s
+    } else {
+        encoding_rs::SHIFT_JIS.decode(bytes).0.into_owned()
+    };
+
+    let mut drivers = Vec::new();
+    let mut current: Option<CsvDriverData> = None;
+    let mut in_data = false;
+
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() { continue; }
+
+        // ドライバーヘッダー検出
+        if line.starts_with("氏名,") {
+            // 前のドライバーを保存
+            if let Some(d) = current.take() {
+                drivers.push(d);
+            }
+            let cols: Vec<&str> = line.split(',').collect();
+            let name = cols.get(1).unwrap_or(&"").to_string();
+            let cd = cols.get(3).unwrap_or(&"").to_string();
+            current = Some(CsvDriverData {
+                driver_name: name,
+                driver_cd: cd,
+                days: Vec::new(),
+                total_drive: String::new(),
+                total_cargo: String::new(),
+                total_break: String::new(),
+                total_restraint: String::new(),
+                total_actual_work: String::new(),
+                total_overtime: String::new(),
+                total_late_night: String::new(),
+                total_ot_late_night: String::new(),
+            });
+            in_data = false;
+            continue;
+        }
+
+        // ヘッダー行をスキップ
+        if line.starts_with("日付,") {
+            in_data = true;
+            continue;
+        }
+
+        let Some(ref mut driver) = current else { continue; };
+        if !in_data { continue; }
+
+        let cols: Vec<&str> = line.split(',').collect();
+
+        // 合計行
+        if cols.first().map(|s| s.contains("合計")).unwrap_or(false) {
+            driver.total_drive = cols.get(3).unwrap_or(&"").to_string();
+            driver.total_cargo = cols.get(5).unwrap_or(&"").to_string();
+            driver.total_break = cols.get(7).unwrap_or(&"").to_string();
+            driver.total_restraint = cols.get(11).unwrap_or(&"").to_string();
+            driver.total_actual_work = cols.get(17).unwrap_or(&"").to_string();
+            driver.total_overtime = cols.get(18).unwrap_or(&"").to_string();
+            driver.total_late_night = cols.get(19).unwrap_or(&"").to_string();
+            driver.total_ot_late_night = cols.get(20).unwrap_or(&"").to_string();
+            in_data = false;
+            continue;
+        }
+
+        // 日付行チェック（N月N日）
+        let date_str = cols.first().unwrap_or(&"").to_string();
+        if !date_str.contains('月') { continue; }
+
+        let is_holiday = cols.get(1).map(|s| s.trim() == "休").unwrap_or(false);
+
+        driver.days.push(CsvDayRow {
+            date: date_str,
+            is_holiday,
+            start_time: cols.get(1).unwrap_or(&"").to_string(),
+            end_time: cols.get(2).unwrap_or(&"").to_string(),
+            drive: cols.get(3).unwrap_or(&"").to_string(),
+            overlap_drive: cols.get(4).unwrap_or(&"").to_string(),
+            cargo: cols.get(5).unwrap_or(&"").to_string(),
+            overlap_cargo: cols.get(6).unwrap_or(&"").to_string(),
+            break_time: cols.get(7).unwrap_or(&"").to_string(),
+            overlap_break: cols.get(8).unwrap_or(&"").to_string(),
+            subtotal: cols.get(11).unwrap_or(&"").to_string(),
+            overlap_subtotal: cols.get(12).unwrap_or(&"").to_string(),
+            total: cols.get(13).unwrap_or(&"").to_string(),
+            cumulative: cols.get(14).unwrap_or(&"").to_string(),
+            rest: cols.get(17).unwrap_or(&"").to_string(),
+            actual_work: cols.get(18).unwrap_or(&"").to_string(),
+            overtime: cols.get(19).unwrap_or(&"").to_string(),
+            late_night: cols.get(20).unwrap_or(&"").to_string(),
+            ot_late_night: cols.get(21).unwrap_or(&"").to_string(),
+            remarks: cols.get(22).unwrap_or(&"").to_string(),
+        });
+    }
+
+    if let Some(d) = current {
+        drivers.push(d);
+    }
+
+    Ok(drivers)
+}
+
+async fn compare_csv(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    mut multipart: Multipart,
+) -> Result<Json<Vec<CompareResult>>, (StatusCode, String)> {
+    let tenant_id = auth_user.tenant_id;
+
+    // CSVファイルを受け取る
+    let mut csv_bytes = Vec::new();
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (StatusCode::BAD_REQUEST, format!("multipart error: {e}"))
+    })? {
+        if let Some(data) = field.bytes().await.ok() {
+            csv_bytes = data.to_vec();
+            break;
+        }
+    }
+
+    if csv_bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "CSVファイルが空です".to_string()));
+    }
+
+    let csv_drivers = parse_restraint_csv(&csv_bytes)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    // 年月をCSVの日付行から推測
+    let (year, month) = csv_drivers.first()
+        .and_then(|d| d.days.first())
+        .and_then(|day| {
+            // "2月1日" → month=2
+            let s = &day.date;
+            let m_pos = s.find('月')?;
+            let m: u32 = s[..m_pos].parse().ok()?;
+            Some(m)
+        })
+        .map(|m| {
+            // 年はCSVヘッダーから取れないので現在年を使う（要改善）
+            (2026i32, m)
+        })
+        .unwrap_or((2026, 1));
+
+    // 全ドライバー取得
+    let db_drivers: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT id, driver_cd, driver_name FROM drivers WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal_err)?;
+
+    let mut results = Vec::new();
+
+    for csv_d in &csv_drivers {
+        // driver_cd でマッチ
+        let db_match = db_drivers.iter().find(|(_, cd, _)| cd == &csv_d.driver_cd);
+
+        let (driver_id, system_data, diffs) = if let Some((did, _, dname)) = db_match {
+            // システムのレポートを取得
+            match build_report_with_name(&state.pool, tenant_id, *did, dname, year, month).await {
+                Ok(report) => {
+                    let sys_days: Vec<SystemDayRow> = report.days.iter().map(|d| SystemDayRow {
+                        date: format!("{}月{}日", d.date.month(), d.date.day()),
+                        drive: fmt_min(d.drive_minutes),
+                        overlap_drive: fmt_min(d.overlap_drive_minutes),
+                        cargo: fmt_min(d.cargo_minutes),
+                        overlap_cargo: fmt_min(d.overlap_cargo_minutes),
+                        subtotal: fmt_min(d.restraint_main_minutes),
+                        overlap_subtotal: fmt_min(d.overlap_restraint_minutes),
+                        total: fmt_min(d.restraint_total_minutes),
+                        cumulative: fmt_min(d.restraint_cumulative_minutes),
+                        actual_work: fmt_min(d.actual_work_minutes),
+                        overtime: fmt_min(d.overtime_minutes),
+                        late_night: fmt_min(d.late_night_minutes),
+                    }).collect();
+
+                    // 差分検出
+                    let mut diffs = Vec::new();
+                    for (csv_day, sys_day) in csv_d.days.iter().zip(sys_days.iter()) {
+                        if csv_day.is_holiday { continue; }
+                        let checks = [
+                            ("運転", &csv_day.drive, &sys_day.drive),
+                            ("重複運転", &csv_day.overlap_drive, &sys_day.overlap_drive),
+                            ("小計", &csv_day.subtotal, &sys_day.subtotal),
+                            ("重複小計", &csv_day.overlap_subtotal, &sys_day.overlap_subtotal),
+                            ("合計", &csv_day.total, &sys_day.total),
+                            ("累計", &csv_day.cumulative, &sys_day.cumulative),
+                            ("実働", &csv_day.actual_work, &sys_day.actual_work),
+                            ("時間外", &csv_day.overtime, &sys_day.overtime),
+                            ("深夜", &csv_day.late_night, &sys_day.late_night),
+                        ];
+                        for (field, csv_val, sys_val) in checks {
+                            let cv = csv_val.trim();
+                            let sv = sys_val.trim();
+                            if cv != sv && !(cv.is_empty() && sv.is_empty()) {
+                                diffs.push(DiffItem {
+                                    date: csv_day.date.clone(),
+                                    field: field.to_string(),
+                                    csv_val: cv.to_string(),
+                                    sys_val: sv.to_string(),
+                                });
+                            }
+                        }
+                    }
+
+                    let sys_data = SystemDriverData {
+                        days: sys_days,
+                        total_drive: fmt_min(report.monthly_total.drive_minutes),
+                        total_overlap_drive: fmt_min(report.monthly_total.overlap_drive_minutes),
+                        total_restraint: fmt_min(report.monthly_total.restraint_minutes),
+                        total_actual_work: fmt_min(report.monthly_total.actual_work_minutes),
+                        total_overtime: fmt_min(report.monthly_total.overtime_minutes),
+                        total_late_night: fmt_min(report.monthly_total.late_night_minutes),
+                    };
+
+                    (Some(did.to_string()), Some(sys_data), diffs)
+                }
+                Err(_) => (Some(did.to_string()), None, Vec::new()),
+            }
+        } else {
+            (None, None, Vec::new())
+        };
+
+        results.push(CompareResult {
+            driver_name: csv_d.driver_name.clone(),
+            driver_cd: csv_d.driver_cd.clone(),
+            driver_id,
+            csv: CsvDriverData {
+                driver_name: csv_d.driver_name.clone(),
+                driver_cd: csv_d.driver_cd.clone(),
+                days: csv_d.days.iter().map(|d| CsvDayRow {
+                    date: d.date.clone(),
+                    is_holiday: d.is_holiday,
+                    start_time: d.start_time.clone(),
+                    end_time: d.end_time.clone(),
+                    drive: d.drive.clone(),
+                    overlap_drive: d.overlap_drive.clone(),
+                    cargo: d.cargo.clone(),
+                    overlap_cargo: d.overlap_cargo.clone(),
+                    break_time: d.break_time.clone(),
+                    overlap_break: d.overlap_break.clone(),
+                    subtotal: d.subtotal.clone(),
+                    overlap_subtotal: d.overlap_subtotal.clone(),
+                    total: d.total.clone(),
+                    cumulative: d.cumulative.clone(),
+                    rest: d.rest.clone(),
+                    actual_work: d.actual_work.clone(),
+                    overtime: d.overtime.clone(),
+                    late_night: d.late_night.clone(),
+                    ot_late_night: d.ot_late_night.clone(),
+                    remarks: d.remarks.clone(),
+                }).collect(),
+                total_drive: csv_d.total_drive.clone(),
+                total_cargo: csv_d.total_cargo.clone(),
+                total_break: csv_d.total_break.clone(),
+                total_restraint: csv_d.total_restraint.clone(),
+                total_actual_work: csv_d.total_actual_work.clone(),
+                total_overtime: csv_d.total_overtime.clone(),
+                total_late_night: csv_d.total_late_night.clone(),
+                total_ot_late_night: csv_d.total_ot_late_night.clone(),
+            },
+            system: system_data,
+            diffs,
+        });
+    }
+
+    Ok(Json(results))
 }

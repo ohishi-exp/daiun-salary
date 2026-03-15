@@ -471,8 +471,9 @@ fn render_driver_page(
 
     // --- Monthly total row ---
     draw_hline(&mut ops, table_x, table_x + total_w, y, LINE_THICK);
+    let monthly_row_h = if report.monthly_total.overlap_restraint_minutes > 0 { ROW_H } else { SUBTOTAL_ROW_H };
     draw_monthly_total(&mut ops, doc, font_id, table_x, y, &all_widths, &report.monthly_total);
-    y -= SUBTOTAL_ROW_H;
+    y -= monthly_row_h;
     draw_hline(&mut ops, table_x, table_x + total_w, y, LINE_THICK);
 
     // --- 運転平均列 ---
@@ -748,8 +749,10 @@ fn draw_monthly_total(
     total: &crate::routes::restraint_report::MonthlyTotal,
 ) {
     let total_w: f32 = all_widths.iter().sum();
-    let h = SUBTOTAL_ROW_H;
+    let has_overlap = total.overlap_restraint_minutes > 0;
+    let h = if has_overlap { ROW_H } else { SUBTOTAL_ROW_H };
     let ty = y - 1.3;
+    let overlap_ty = y - h * 0.55;
     let fs = FONT_SIZE_BODY;
 
     draw_rect_fill(ops, table_x, y - h, total_w, h, 0.93, 0.93, 0.93);
@@ -770,21 +773,37 @@ fn draw_monthly_total(
     // 3: 運転合計
     draw_vline(ops, x, y, y - h, LINE_THIN);
     add_text_right_in_cell(ops, doc, font_id, x, x + all_widths[3], ty, fs, &fmt_minutes(total.drive_minutes));
+    if has_overlap && total.overlap_drive_minutes > 0 {
+        add_text_right_in_cell(ops, doc, font_id, x, x + all_widths[3], overlap_ty, FONT_SIZE_OVERLAP,
+            &fmt_minutes(total.overlap_drive_minutes));
+    }
     x += all_widths[3];
 
     // 4: 荷役合計
     draw_vline(ops, x, y, y - h, LINE_THIN);
     add_text_right_in_cell(ops, doc, font_id, x, x + all_widths[4], ty, fs, &fmt_minutes(total.cargo_minutes));
+    if has_overlap && total.overlap_cargo_minutes > 0 {
+        add_text_right_in_cell(ops, doc, font_id, x, x + all_widths[4], overlap_ty, FONT_SIZE_OVERLAP,
+            &fmt_minutes(total.overlap_cargo_minutes));
+    }
     x += all_widths[4];
 
     // 5: 休憩合計
     draw_vline(ops, x, y, y - h, LINE_THIN);
     add_text_right_in_cell(ops, doc, font_id, x, x + all_widths[5], ty, fs, &fmt_minutes(total.break_minutes));
+    if has_overlap && total.overlap_break_minutes > 0 {
+        add_text_right_in_cell(ops, doc, font_id, x, x + all_widths[5], overlap_ty, FONT_SIZE_OVERLAP,
+            &fmt_minutes(total.overlap_break_minutes));
+    }
     x += all_widths[5];
 
     // 6: 拘束小計合計
     draw_vline(ops, x, y, y - h, LINE_THIN);
     add_text_right_in_cell(ops, doc, font_id, x, x + all_widths[6], ty, fs, &fmt_minutes(total.restraint_minutes));
+    if has_overlap {
+        add_text_right_in_cell(ops, doc, font_id, x, x + all_widths[6], overlap_ty, FONT_SIZE_OVERLAP,
+            &fmt_minutes(total.overlap_restraint_minutes));
+    }
     x += all_widths[6];
 
     for w in &all_widths[7..10] {

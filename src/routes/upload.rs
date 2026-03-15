@@ -624,6 +624,11 @@ async fn calculate_daily_hours(
     {
         use std::collections::BTreeMap;
 
+        // 秒を切り捨てて分精度に揃える（Excel互換）
+        fn trunc_min(dt: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+            dt.with_second(0).unwrap_or(dt)
+        }
+
         // ドライバーCD → 日付順の (始業, 終業, unko_nos)
         struct DayInfo {
             start: chrono::NaiveDateTime,
@@ -634,8 +639,8 @@ async fn calculate_daily_hours(
         let mut driver_days: HashMap<String, BTreeMap<chrono::NaiveDate, DayInfo>> = HashMap::new();
         for ((driver_cd, date), agg) in &day_map {
             if agg.segments.is_empty() { continue; }
-            let start = agg.segments.iter().map(|s| s.start_at).min().unwrap();
-            let end = agg.segments.iter().map(|s| s.end_at).max().unwrap();
+            let start = trunc_min(agg.segments.iter().map(|s| s.start_at).min().unwrap());
+            let end = trunc_min(agg.segments.iter().map(|s| s.end_at).max().unwrap());
             driver_days.entry(driver_cd.clone()).or_default()
                 .insert(*date, DayInfo { start, end, unko_nos: agg.unko_nos.clone() });
         }
@@ -675,28 +680,30 @@ async fn calculate_daily_hours(
                                 let dur = evt.duration_minutes.unwrap_or(0);
                                 if dur <= 0 { continue; }
 
+                                // イベント開始も分精度に揃える（Excel互換）
+                                let evt_start = trunc_min(evt.start_at);
+
                                 // イベントが窓内かチェック
-                                if evt.start_at >= window_end { continue; }
-                                let evt_end = evt.start_at + chrono::Duration::minutes(dur as i64);
+                                if evt_start >= window_end { continue; }
+                                let evt_end = evt_start + chrono::Duration::minutes(dur as i64);
 
                                 // 当日の終業より前のイベントはスキップ（当日に属する）
                                 if evt_end <= info.end { continue; }
-                                if evt.start_at < info.end { continue; }
+                                if evt_start < info.end { continue; }
 
                                 // 窓内に収まる分だけカウント
                                 // イベント起点はセグメント開始(next_info.start)以降に制限
-                                let overlap_start = evt.start_at.max(next_info.start);
+                                let overlap_start = evt_start.max(next_info.start);
                                 let effective_end = evt_end.min(window_end);
                                 if effective_end <= overlap_start { continue; }
-                                let secs = (effective_end - overlap_start).num_seconds();
-                                let effective_dur = ((secs as f64) / 60.0).round() as i32;
-                                if effective_dur <= 0 { continue; }
+                                let mins = (effective_end - overlap_start).num_minutes() as i32;
+                                if mins <= 0 { continue; }
 
                                 // イベント全体が窓内ならそのまま、部分的なら按分
-                                let actual_dur = if effective_dur >= dur {
+                                let actual_dur = if mins >= dur {
                                     dur
                                 } else {
-                                    effective_dur
+                                    mins
                                 };
 
                                 match cls {
@@ -708,10 +715,9 @@ async fn calculate_daily_hours(
                         }
                     }
 
-                    // 重複拘束時間 = 翌日始業 ～ 窓終了（四捨五入）
+                    // 重複拘束時間 = 翌日始業 ～ 窓終了（分精度）
                     if next_info.start < window_end {
-                        let secs = (window_end - next_info.start).num_seconds();
-                        ol_restraint = ((secs as f64) / 60.0).round() as i32;
+                        ol_restraint = (window_end - next_info.start).num_minutes() as i32;
                     }
 
                     let ol_break = (ol_restraint - ol_drive - ol_cargo).max(0);

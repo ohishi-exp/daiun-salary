@@ -650,7 +650,7 @@ async fn calculate_daily_hours(
             let mut effective_start: Option<chrono::NaiveDateTime> = None;
             let mut prev_end: Option<chrono::NaiveDateTime> = None;
             // 前日から繰り越す重複分の控除（リセットなし時にメイン統合するため）
-            let mut next_day_deduction: Option<(i32, i32, i32)> = None; // (drive, cargo, restraint)
+            let mut next_day_deduction: Option<(i32, i32, i32, i32)> = None; // (drive, cargo, restraint, late_night)
 
             for (idx, &date) in dates.iter().enumerate() {
                 let info = &dates_map[&date];
@@ -669,11 +669,12 @@ async fn calculate_daily_hours(
                 }
 
                 // 前日からの控除を適用（リセットなし時、前日のoverlap分を当日メインから減算）
-                if let Some((ded_drive, ded_cargo, ded_restraint)) = next_day_deduction.take() {
+                if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) = next_day_deduction.take() {
                     if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
                         agg.drive_minutes = (agg.drive_minutes - ded_drive).max(0);
                         agg.cargo_minutes = (agg.cargo_minutes - ded_cargo).max(0);
                         agg.total_work_minutes = (agg.total_work_minutes - ded_restraint).max(0);
+                        agg.late_night_minutes = (agg.late_night_minutes - ded_night).max(0);
                     }
                 }
 
@@ -730,9 +731,23 @@ async fn calculate_daily_hours(
                         }
                     }
 
-                    // 重複拘束時間 = 翌日始業 ～ 窓終了（分精度）
+                    // 重複拘束時間 = 翌日始業 ～ 窓内最終セグメント終了（分精度）
+                    // セグメント間の休息ギャップが窓内にある場合、最終セグメント終了で打ち切る
                     if next_info.start < window_end {
-                        ol_restraint = (window_end - next_info.start).num_minutes() as i32;
+                        let next_date = dates[idx + 1];
+                        let restraint_end = day_map
+                            .get(&(driver_cd.clone(), next_date))
+                            .map(|next_agg| {
+                                next_agg.segments.iter()
+                                    .filter(|s| trunc_min(s.start_at) < window_end)
+                                    .map(|s| trunc_min(s.end_at).min(window_end))
+                                    .max()
+                                    .unwrap_or(window_end)
+                            })
+                            .unwrap_or(window_end);
+                        if restraint_end > next_info.start {
+                            ol_restraint = (restraint_end - next_info.start).num_minutes() as i32;
+                        }
                     }
 
                     let ol_break = (ol_restraint - ol_drive - ol_cargo).max(0);
@@ -742,14 +757,20 @@ async fn calculate_daily_hours(
                     let next_resets = next_gap >= 480;
 
                     if !next_resets && ol_restraint > 0 {
+                        // 重複期間の深夜時間を計算（翌日から当日へ移転するため）
+                        let ol_late_night = {
+                            use crate::csv_parser::work_segments::calc_late_night_mins;
+                            calc_late_night_mins(next_info.start, window_end)
+                        };
                         // 当日メインに統合（overlapは0にする）
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
                             agg.drive_minutes += ol_drive;
                             agg.cargo_minutes += ol_cargo;
                             agg.total_work_minutes += ol_restraint;
+                            agg.late_night_minutes += ol_late_night;
                         }
-                        // 翌日のメインから控除する分を記録
-                        next_day_deduction = Some((ol_drive, ol_cargo, ol_restraint));
+                        // 翌日のメインから控除する分を記録（深夜含む）
+                        next_day_deduction = Some((ol_drive, ol_cargo, ol_restraint, ol_late_night));
                     } else {
                         // 通常: 重複として別表示
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {

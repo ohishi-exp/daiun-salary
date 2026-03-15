@@ -428,7 +428,6 @@ fn render_driver_page(
 
     let mut avg_midpoints: Vec<f32> = Vec::new();
     let mut avg_texts: Vec<String> = Vec::new();
-    let _table_body_top = y;
 
     for day in &report.days {
         let weekly_sub = report.weekly_subtotals.iter().find(|ws| ws.week_end_date == day.date);
@@ -459,6 +458,8 @@ fn render_driver_page(
             draw_weekly_subtotal(&mut ops, doc, font_id, table_x, y, &all_widths, ws);
             y -= SUBTOTAL_ROW_H;
             draw_hline(&mut ops, table_x, table_x + total_w, y, LINE_THIN);
+            avg_midpoints.push((y + y + SUBTOTAL_ROW_H) / 2.0); // 小計中央
+            avg_texts.push(String::new());
         }
     }
 
@@ -470,12 +471,17 @@ fn render_driver_page(
     y -= SUBTOTAL_ROW_H;
     draw_hline(&mut ops, table_x, table_x + total_w, y, LINE_THICK);
 
-    // --- 運転平均列: 白塗り → オフセットグリッド描画 ---
+    // --- 運転平均列 ---
     let avg_grid_top = header_y - HEADER_ROW_H * 1.5;
-    // 1) avg列全体を白塗り（avg_grid_top 〜 table_body_bottom）
+
+    // 白塗り
     draw_rect_fill(&mut ops, avg_x, table_body_bottom, avg_w, avg_grid_top - table_body_bottom, 1.0, 1.0, 1.0);
 
-    // before テキストを先頭に追加
+    // 枠線
+    draw_vline(&mut ops, avg_x, header_y, table_body_bottom, LINE_THIN);
+    draw_vline(&mut ops, avg_right, header_y, table_body_bottom, LINE_THIN);
+
+    // before を先頭に追加
     let before_text = report.days.iter()
         .find(|d| !d.is_holiday)
         .and_then(|d| d.drive_avg_before)
@@ -484,23 +490,15 @@ fn render_driver_page(
     avg_midpoints.insert(0, avg_grid_top);
     avg_texts.insert(0, before_text);
 
-    // 縦線
-    draw_vline(&mut ops, avg_x, header_y, table_body_bottom, LINE_THIN);
-    draw_vline(&mut ops, avg_right, header_y, table_body_bottom, LINE_THIN);
-
-    // 横罫線: 全 midpoints に描画（[0]=avg_grid_top がグリッド上端線）
-    for &mid_y in &avg_midpoints {
-        draw_hline(&mut ops, avg_x, avg_right, mid_y, LINE_THIN);
-    }
-
-    // テキスト: midpoints[i]から固定オフセットで配置
-    for i in 0..avg_texts.len() {
-        if avg_texts[i].is_empty() {
-            continue;
+    // 横罫線 + テキスト
+    for i in 0..avg_midpoints.len() {
+        draw_hline(&mut ops, avg_x, avg_right, avg_midpoints[i], LINE_THIN);
+        if i < avg_texts.len() && !avg_texts[i].is_empty() {
+            add_text_center_in_cell(&mut ops, doc, font_id, avg_x, avg_w,
+                avg_midpoints[i] - 1.5, FONT_SIZE_BODY, &avg_texts[i]);
         }
-        add_text_center_in_cell(&mut ops, doc, font_id, avg_x, avg_w,
-            avg_midpoints[i] - 1.5, FONT_SIZE_BODY, &avg_texts[i]);
     }
+
 
     // --- Footer ---
     y -= 3.0;

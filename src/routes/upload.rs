@@ -400,6 +400,8 @@ async fn calculate_daily_hours(
         overlap_cargo_minutes: i32,
         overlap_break_minutes: i32,
         overlap_restraint_minutes: i32,
+        // 時間外深夜（overlap統合時の深夜分）
+        ot_late_night_minutes: i32,
     }
 
     #[derive(Clone)]
@@ -473,6 +475,7 @@ async fn calculate_daily_hours(
                             overlap_cargo_minutes: 0,
                             overlap_break_minutes: 0,
                             overlap_restraint_minutes: 0,
+                            ot_late_night_minutes: 0,
                         });
 
                     entry.total_work_minutes += ds.work_minutes;
@@ -533,6 +536,7 @@ async fn calculate_daily_hours(
                         overlap_cargo_minutes: 0,
                         overlap_break_minutes: 0,
                         overlap_restraint_minutes: 0,
+                        ot_late_night_minutes: 0,
                     });
 
                 entry.total_work_minutes += total_drive_mins;
@@ -793,6 +797,7 @@ async fn calculate_daily_hours(
                             agg.drive_minutes += ol_drive;
                             agg.cargo_minutes += ol_cargo;
                             agg.total_work_minutes += ol_restraint;
+                            agg.ot_late_night_minutes = ol_late_night;
                         }
                         // 翌日のメインから控除する分を記録（深夜も控除）
                         next_day_deduction = Some((ol_drive, ol_cargo, ol_restraint, ol_late_night));
@@ -839,8 +844,9 @@ async fn calculate_daily_hours(
                 late_night_minutes, drive_minutes, cargo_minutes,
                 total_distance, operation_count, unko_nos,
                 overlap_drive_minutes, overlap_cargo_minutes,
-                overlap_break_minutes, overlap_restraint_minutes
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"#,
+                overlap_break_minutes, overlap_restraint_minutes,
+                ot_late_night_minutes
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"#,
         )
         .bind(tenant_id)
         .bind(driver_id)
@@ -858,6 +864,7 @@ async fn calculate_daily_hours(
         .bind(agg.overlap_cargo_minutes)
         .bind(agg.overlap_break_minutes)
         .bind(agg.overlap_restraint_minutes)
+        .bind(agg.ot_late_night_minutes)
         .execute(&state.pool)
         .await?;
 

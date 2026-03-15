@@ -134,6 +134,7 @@ struct DailyWorkHoursRow {
     pub overlap_cargo_minutes: i32,
     pub overlap_break_minutes: i32,
     pub overlap_restraint_minutes: i32,
+    pub ot_late_night_minutes: i32,
 }
 
 async fn get_restraint_report(
@@ -214,7 +215,8 @@ pub async fn build_report_with_name(
         r#"SELECT work_date, total_work_minutes, total_rest_minutes, late_night_minutes,
                   drive_minutes, cargo_minutes,
                   overlap_drive_minutes, overlap_cargo_minutes,
-                  overlap_break_minutes, overlap_restraint_minutes
+                  overlap_break_minutes, overlap_restraint_minutes,
+                  ot_late_night_minutes
            FROM daily_work_hours
            WHERE tenant_id = $1 AND driver_id = $2
              AND work_date >= $3 AND work_date <= $4"#,
@@ -373,8 +375,11 @@ pub async fn build_report_with_name(
 
             // 実働時間 = drive + cargo
             let actual_work = day_drive + day_cargo;
-            // 時間外 = max(0, 実働 - 8h)
-            let overtime = (actual_work - 480).max(0);
+            // 時間外深夜（overlap統合時の深夜分）
+            let ot_late_night = dwh.map(|r| r.ot_late_night_minutes).unwrap_or(0);
+            // 時間外 = max(0, 実働 - 8h) - 時間外深夜
+            let total_overtime = (actual_work - 480).max(0);
+            let overtime = (total_overtime - ot_late_night).max(0);
 
             // 休息・深夜（dwh は既に上で取得済み）
             let rest_period = dwh
@@ -411,7 +416,7 @@ pub async fn build_report_with_name(
                 actual_work_minutes: actual_work,
                 overtime_minutes: overtime,
                 late_night_minutes: late_night,
-                overtime_late_night_minutes: 0,
+                overtime_late_night_minutes: ot_late_night,
             });
             prev_main_drive = Some(day_drive);
         } else {

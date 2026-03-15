@@ -757,19 +757,19 @@ async fn calculate_daily_hours(
                     let next_resets = next_gap >= 480;
 
                     if !next_resets && ol_restraint > 0 {
-                        // 重複期間の深夜時間を計算（翌日から当日へ移転するため）
+                        // 重複期間の深夜時間を計算（翌日から控除するため）
                         let ol_late_night = {
                             use crate::csv_parser::work_segments::calc_late_night_mins;
                             calc_late_night_mins(next_info.start, window_end)
                         };
                         // 当日メインに統合（overlapは0にする）
+                        // 深夜は重複列で扱うため当日メインには加算しない
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
                             agg.drive_minutes += ol_drive;
                             agg.cargo_minutes += ol_cargo;
                             agg.total_work_minutes += ol_restraint;
-                            agg.late_night_minutes += ol_late_night;
                         }
-                        // 翌日のメインから控除する分を記録（深夜含む）
+                        // 翌日のメインから控除する分を記録（深夜も控除）
                         next_day_deduction = Some((ol_drive, ol_cargo, ol_restraint, ol_late_night));
                     } else {
                         // 通常: 重複として別表示

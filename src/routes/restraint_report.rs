@@ -1052,6 +1052,93 @@ mod tests {
         assert_eq!(diffs[0].sys_val, "9:99");
     }
 
+    /// DB値（daily_work_hours）からbuild_report_with_nameと同じ変換ロジックでSystemDayRowを生成
+    struct MockDwh {
+        day: u32,
+        drive: i32, overlap_drive: i32,
+        cargo: i32, overlap_cargo: i32,
+        restraint: i32, overlap_restraint: i32,
+        late_night: i32, ot_late_night: i32,
+    }
+
+    fn build_sys_days_from_mock(mock_data: &[MockDwh]) -> Vec<SystemDayRow> {
+        let mut rows = Vec::new();
+        let mut cumulative = 0i32;
+        for day_num in 1..=28u32 {
+            let date_str = format!("2月{}日", day_num);
+            if let Some(dwh) = mock_data.iter().find(|m| m.day == day_num) {
+                let actual_work = dwh.drive + dwh.cargo;
+                let overtime = ((actual_work - 480).max(0) - dwh.ot_late_night).max(0);
+                cumulative += dwh.restraint;
+                rows.push(SystemDayRow {
+                    date: date_str,
+                    drive: fmt_min(dwh.drive), overlap_drive: fmt_min(dwh.overlap_drive),
+                    cargo: fmt_min(dwh.cargo), overlap_cargo: fmt_min(dwh.overlap_cargo),
+                    subtotal: fmt_min(dwh.restraint), overlap_subtotal: fmt_min(dwh.overlap_restraint),
+                    total: fmt_min(dwh.restraint + dwh.overlap_restraint),
+                    cumulative: fmt_min(cumulative),
+                    actual_work: fmt_min(actual_work), overtime: fmt_min(overtime),
+                    late_night: fmt_min(dwh.late_night),
+                });
+            } else {
+                rows.push(SystemDayRow {
+                    date: date_str, drive: String::new(), overlap_drive: String::new(),
+                    cargo: String::new(), overlap_cargo: String::new(),
+                    subtotal: String::new(), overlap_subtotal: String::new(),
+                    total: String::new(), cumulative: String::new(),
+                    actual_work: String::new(), overtime: String::new(), late_night: String::new(),
+                });
+            }
+        }
+        rows
+    }
+
+    /// 本番DB値を使った回帰テスト: DB→SystemDayRow変換→CSV比較で0件差分を保証
+    #[test]
+    fn test_compare_1021_with_db_mock() {
+        let drivers = parse_restraint_csv(CSV_1021.as_bytes()).unwrap();
+        let csv_d = &drivers[0];
+
+        // 本番DBから取得した鈴木昭(1021) 2026年2月のdaily_work_hours値
+        let mock = vec![
+            MockDwh { day: 1,  drive: 163, overlap_drive: 12,  cargo: 0,   overlap_cargo: 0, restraint: 318,  overlap_restraint: 12,  late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 2,  drive: 332, overlap_drive: 0,   cargo: 81,  overlap_cargo: 0, restraint: 565,  overlap_restraint: 0,   late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 4,  drive: 300, overlap_drive: 177, cargo: 41,  overlap_cargo: 0, restraint: 459,  overlap_restraint: 177, late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 5,  drive: 519, overlap_drive: 0,   cargo: 0,   overlap_cargo: 0, restraint: 656,  overlap_restraint: 0,   late_night: 34,  ot_late_night: 0 },
+            MockDwh { day: 6,  drive: 169, overlap_drive: 63,  cargo: 37,  overlap_cargo: 0, restraint: 348,  overlap_restraint: 81,  late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 7,  drive: 288, overlap_drive: 68,  cargo: 58,  overlap_cargo: 0, restraint: 490,  overlap_restraint: 68,  late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 8,  drive: 385, overlap_drive: 0,   cargo: 0,   overlap_cargo: 0, restraint: 500,  overlap_restraint: 0,   late_night: 3,   ot_late_night: 0 },
+            MockDwh { day: 9,  drive: 282, overlap_drive: 99,  cargo: 122, overlap_cargo: 0, restraint: 517,  overlap_restraint: 120, late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 10, drive: 580, overlap_drive: 91,  cargo: 0,   overlap_cargo: 0, restraint: 707,  overlap_restraint: 111, late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 11, drive: 407, overlap_drive: 0,   cargo: 0,   overlap_cargo: 0, restraint: 746,  overlap_restraint: 0,   late_night: 58,  ot_late_night: 0 },
+            MockDwh { day: 12, drive: 140, overlap_drive: 20,  cargo: 19,  overlap_cargo: 0, restraint: 520,  overlap_restraint: 24,  late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 13, drive: 188, overlap_drive: 208, cargo: 73,  overlap_cargo: 0, restraint: 517,  overlap_restraint: 226, late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 14, drive: 563, overlap_drive: 9,   cargo: 0,   overlap_cargo: 0, restraint: 728,  overlap_restraint: 9,   late_night: 94,  ot_late_night: 0 },
+            MockDwh { day: 15, drive: 335, overlap_drive: 0,   cargo: 0,   overlap_cargo: 0, restraint: 532,  overlap_restraint: 0,   late_night: 103, ot_late_night: 0 },
+            MockDwh { day: 16, drive: 281, overlap_drive: 0,   cargo: 112, overlap_cargo: 0, restraint: 603,  overlap_restraint: 0,   late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 18, drive: 447, overlap_drive: 0,   cargo: 150, overlap_cargo: 0, restraint: 991,  overlap_restraint: 0,   late_night: 0,   ot_late_night: 66 },
+            MockDwh { day: 19, drive: 517, overlap_drive: 52,  cargo: 0,   overlap_cargo: 0, restraint: 658,  overlap_restraint: 52,  late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 20, drive: 486, overlap_drive: 72,  cargo: 168, overlap_cargo: 0, restraint: 800,  overlap_restraint: 72,  late_night: 1,   ot_late_night: 0 },
+            MockDwh { day: 21, drive: 579, overlap_drive: 36,  cargo: 0,   overlap_cargo: 0, restraint: 823,  overlap_restraint: 36,  late_night: 73,  ot_late_night: 0 },
+            MockDwh { day: 22, drive: 351, overlap_drive: 0,   cargo: 0,   overlap_cargo: 0, restraint: 629,  overlap_restraint: 0,   late_night: 109, ot_late_night: 0 },
+            MockDwh { day: 23, drive: 162, overlap_drive: 0,   cargo: 0,   overlap_cargo: 0, restraint: 494,  overlap_restraint: 0,   late_night: 49,  ot_late_night: 0 },
+            MockDwh { day: 24, drive: 197, overlap_drive: 0,   cargo: 17,  overlap_cargo: 0, restraint: 402,  overlap_restraint: 0,   late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 25, drive: 126, overlap_drive: 111, cargo: 39,  overlap_cargo: 0, restraint: 179,  overlap_restraint: 111, late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 26, drive: 405, overlap_drive: 98,  cargo: 0,   overlap_cargo: 0, restraint: 438,  overlap_restraint: 98,  late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 27, drive: 322, overlap_drive: 66,  cargo: 14,  overlap_cargo: 0, restraint: 451,  overlap_restraint: 66,  late_night: 0,   ot_late_night: 0 },
+            MockDwh { day: 28, drive: 290, overlap_drive: 0,   cargo: 3,   overlap_cargo: 0, restraint: 489,  overlap_restraint: 0,   late_night: 0,   ot_late_night: 0 },
+        ];
+
+        let sys_days = build_sys_days_from_mock(&mock);
+        let diffs = detect_diffs(&csv_d.days, &sys_days);
+        assert_eq!(
+            diffs.len(), 0,
+            "Expected 0 diffs for 鈴木昭(1021) but got {}:\n{}",
+            diffs.len(),
+            diffs.iter().map(|d| format!("  {} {}: csv={} sys={}", d.date, d.field, d.csv_val, d.sys_val)).collect::<Vec<_>>().join("\n")
+        );
+    }
+
     #[test]
     fn test_fmt_min() {
         assert_eq!(fmt_min(0), "");

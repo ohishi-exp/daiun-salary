@@ -390,7 +390,11 @@ fn render_driver_page(
     draw_vline(&mut ops, x, header_y, header_y - HEADER_ROW_H * 2.0, LINE_THIN);
 
     y = header_y - HEADER_ROW_H;
-    draw_hline(&mut ops, table_x, table_x + total_w, y, LINE_THIN);
+    // ヘッダー中間線: col 8(拘束累計), 9(運転平均), 10(休息時間)をスキップ
+    let skip_left: f32 = table_x + all_widths[0..8].iter().sum::<f32>();
+    let skip_right: f32 = skip_left + all_widths[8] + all_widths[9] + all_widths[10];
+    draw_hline(&mut ops, table_x, skip_left, y, LINE_THIN);
+    draw_hline(&mut ops, skip_right, table_x + total_w, y, LINE_THIN);
 
     // Row 2: sub-headers
     let row2: Vec<(&str, f32)> = vec![

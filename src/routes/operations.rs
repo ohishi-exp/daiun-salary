@@ -35,6 +35,14 @@ struct CalendarResponse {
 struct CalendarDateEntry {
     date: chrono::NaiveDate,
     count: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scrapes: Vec<ScrapeStatus>,
+}
+
+#[derive(serde::Serialize)]
+struct ScrapeStatus {
+    comp_id: String,
+    status: String,
 }
 
 async fn calendar_dates(
@@ -70,10 +78,49 @@ async fn calendar_dates(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let dates = rows
-        .into_iter()
-        .map(|(date, count)| CalendarDateEntry { date, count })
-        .collect();
+    // スクレイプ履歴: 企業ごとの最新ステータスを取得
+    let scrape_rows = sqlx::query_as::<_, (chrono::NaiveDate, String, String)>(
+        r#"SELECT DISTINCT ON (target_date, comp_id)
+                  target_date, comp_id, status
+           FROM scrape_history
+           WHERE tenant_id = $1
+             AND target_date >= $2
+             AND target_date <= $3
+           ORDER BY target_date, comp_id, created_at DESC"#,
+    )
+    .bind(auth_user.tenant_id)
+    .bind(date_from)
+    .bind(date_to)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    use std::collections::HashMap;
+    let mut scrape_map: HashMap<chrono::NaiveDate, Vec<ScrapeStatus>> = HashMap::new();
+    for (date, comp_id, status) in scrape_rows {
+        scrape_map.entry(date).or_default().push(ScrapeStatus { comp_id, status });
+    }
+
+    // operations + scrape_history を統合
+    let mut date_map: HashMap<chrono::NaiveDate, CalendarDateEntry> = HashMap::new();
+    for (date, count) in &rows {
+        let scrapes = scrape_map.remove(date).unwrap_or_default();
+        date_map.insert(*date, CalendarDateEntry {
+            date: *date,
+            count: *count,
+            scrapes,
+        });
+    }
+    for (date, scrapes) in scrape_map {
+        date_map.entry(date).or_insert(CalendarDateEntry {
+            date,
+            count: 0,
+            scrapes,
+        });
+    }
+
+    let mut dates: Vec<CalendarDateEntry> = date_map.into_values().collect();
+    dates.sort_by_key(|d| d.date);
 
     Ok(Json(CalendarResponse {
         year: q.year,

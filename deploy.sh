@@ -31,7 +31,10 @@ gcloud run deploy daiun-salary \
   --set-env-vars "R2_ACCESS_KEY=${R2_ACCESS_KEY}" \
   --set-env-vars "R2_SECRET_KEY=${R2_SECRET_KEY}" \
   --set-env-vars "GATEWAY_SECRET=${GATEWAY_SECRET}" \
-  --set-env-vars "SCRAPER_URL=${SCRAPER_URL}"
+  --set-env-vars "SCRAPER_URL=${SCRAPER_URL}" \
+  --set-env-vars "CLOUD_TASKS_QUEUE=projects/cloudsql-sv/locations/asia-northeast1/queues/csv-split" \
+  --set-env-vars "SELF_URL=https://daiun-salary-566bls5vfq-an.a.run.app" \
+  --set-env-vars "SERVICE_ACCOUNT_EMAIL=747065218280-compute@developer.gserviceaccount.com"
 
 echo "==> Done!"
 gcloud run services describe daiun-salary --region=asia-northeast1 --format="value(status.url)"

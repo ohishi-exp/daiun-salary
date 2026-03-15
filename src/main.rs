@@ -23,6 +23,17 @@ use crate::storage::StorageBackend;
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub storage: Arc<dyn StorageBackend>,
+    pub cloud_tasks: Option<CloudTasksConfig>,
+}
+
+#[derive(Clone)]
+pub struct CloudTasksConfig {
+    /// e.g. "projects/cloudsql-sv/locations/asia-northeast1/queues/csv-split"
+    pub queue_path: String,
+    /// e.g. "https://daiun-salary-566bls5vfq-an.a.run.app"
+    pub self_url: String,
+    /// Service account email for OIDC token
+    pub service_account_email: String,
 }
 
 #[tokio::main]
@@ -73,7 +84,31 @@ async fn main() -> anyhow::Result<()> {
             .expect("Failed to initialize R2 backend"),
     );
 
-    let state = AppState { pool, storage };
+    // Cloud Tasks config (optional — disabled in dev)
+    let cloud_tasks = match (
+        std::env::var("CLOUD_TASKS_QUEUE"),
+        std::env::var("SELF_URL"),
+        std::env::var("SERVICE_ACCOUNT_EMAIL"),
+    ) {
+        (Ok(queue_path), Ok(self_url), Ok(sa_email)) => {
+            tracing::info!("Cloud Tasks enabled: queue={}", queue_path);
+            Some(CloudTasksConfig {
+                queue_path,
+                self_url,
+                service_account_email: sa_email,
+            })
+        }
+        _ => {
+            tracing::info!("Cloud Tasks disabled (env vars not set)");
+            None
+        }
+    };
+
+    let state = AppState {
+        pool,
+        storage,
+        cloud_tasks,
+    };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

@@ -1,6 +1,8 @@
 use axum::{
+    body::Body,
     extract::{Multipart, Path, State},
     http::StatusCode,
+    response::Response,
     routing::{post, get},
     Extension, Json, Router,
 };
@@ -23,6 +25,8 @@ pub fn internal_router() -> Router<AppState> {
         .route("/internal/upload", post(internal_upload_zip))
         .route("/internal/store", post(internal_store_zip))
         .route("/internal/rerun/{upload_id}", post(internal_rerun))
+        .route("/internal/split-csv/{upload_id}", post(internal_split_csv))
+        .route("/internal/download/{upload_id}", get(internal_download))
         .route("/internal/pending", get(list_pending_uploads))
 }
 
@@ -162,41 +166,7 @@ async fn process_zip(
     let kudgivt_rows = parse_kudgivt(&kudgivt_text)?;
     tracing::info!("KUDGIVT parsed: {} rows (tenant={})", kudgivt_rows.len(), tenant_id);
 
-    // 4. Save all CSV files to R2 (grouped by unko_no)
-    for (name, bytes) in &files {
-        if name.to_lowercase().ends_with(".csv") {
-            let utf8_text = csv_parser::decode_shift_jis(bytes);
-            let header = csv_parser::csv_header(&utf8_text);
-            let grouped = csv_parser::group_csv_by_unko_no(&utf8_text);
-
-            for (unko_no, lines) in &grouped {
-                let csv_name = name
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(name)
-                    .to_uppercase()
-                    .replace(".CSV", ".csv");
-                let key = format!("{}/unko/{}/{}", tenant_id, unko_no, csv_name);
-                let mut content = String::new();
-                if let Some(h) = header {
-                    content.push_str(h);
-                    content.push('\n');
-                }
-                for line in lines {
-                    content.push_str(line);
-                    content.push('\n');
-                }
-                let _ = state
-                    .storage
-                    .upload(&key, content.as_bytes(), "text/csv")
-                    .await;
-            }
-        }
-    }
-
-    tracing::info!("R2 CSV upload done (tenant={})", tenant_id);
-
-    // 5. Upsert masters and insert operations
+    // 4. Upsert masters and insert operations
     let mut operations_count = 0i32;
     for row in &rows {
         // Upsert office
@@ -271,9 +241,14 @@ async fn process_zip(
 
     tracing::info!("DB upsert done: {} operations (tenant={})", operations_count, tenant_id);
 
-    // 6. Calculate daily_work_hours using KUDGIVT events
+    // 5. Calculate daily_work_hours using KUDGIVT events
     calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows).await?;
     tracing::info!("calculate_daily_hours done (tenant={})", tenant_id);
+
+    // 6. Enqueue CSV split task (async, non-blocking)
+    if let Err(e) = enqueue_csv_split(state, upload_id).await {
+        tracing::warn!("Cloud Tasks enqueue failed (will not block): {e}");
+    }
 
     Ok(operations_count)
 }
@@ -836,6 +811,179 @@ async fn internal_store_zip(
     }))
 }
 
+/// Cloud Tasks に CSV 分割タスクをエンキュー
+async fn enqueue_csv_split(state: &AppState, upload_id: Uuid) -> Result<(), anyhow::Error> {
+    let config = match &state.cloud_tasks {
+        Some(c) => c,
+        None => {
+            tracing::info!("Cloud Tasks not configured, running CSV split inline");
+            split_csv_from_r2(state, upload_id).await?;
+            return Ok(());
+        }
+    };
+
+    // GCP メタデータサーバーからアクセストークンを取得
+    let token_url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .get(token_url)
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    let access_token = token_resp["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No access_token in metadata response"))?;
+
+    let task_url = format!(
+        "{}/internal/split-csv/{}",
+        config.self_url, upload_id
+    );
+
+    let task_body = serde_json::json!({
+        "task": {
+            "httpRequest": {
+                "httpMethod": "POST",
+                "url": task_url,
+                "oidcToken": {
+                    "serviceAccountEmail": config.service_account_email,
+                }
+            }
+        }
+    });
+
+    let api_url = format!(
+        "https://cloudtasks.googleapis.com/v2/{}/tasks",
+        config.queue_path
+    );
+
+    let resp = client
+        .post(&api_url)
+        .bearer_auth(access_token)
+        .json(&task_body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Cloud Tasks API error: {}", body);
+    }
+
+    tracing::info!("CSV split task enqueued for upload_id={}", upload_id);
+    Ok(())
+}
+
+/// R2 から ZIP をダウンロードして CSV を unko_no 別に分割アップロード
+async fn split_csv_from_r2(state: &AppState, upload_id: Uuid) -> Result<(), anyhow::Error> {
+    let record = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT tenant_id, r2_zip_key FROM upload_history WHERE id = $1",
+    )
+    .bind(upload_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("upload {} not found", upload_id))?;
+
+    let (tenant_id, r2_zip_key) = record;
+
+    let zip_bytes = state.storage.download(&r2_zip_key).await
+        .map_err(|e| anyhow::anyhow!("R2 download failed: {e}"))?;
+
+    let files = csv_parser::extract_zip(&zip_bytes)?;
+
+    let mut csv_count = 0usize;
+    for (name, bytes) in &files {
+        if name.to_lowercase().ends_with(".csv") {
+            let utf8_text = csv_parser::decode_shift_jis(bytes);
+            let header = csv_parser::csv_header(&utf8_text);
+            let grouped = csv_parser::group_csv_by_unko_no(&utf8_text);
+
+            for (unko_no, lines) in &grouped {
+                let csv_name = name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(name)
+                    .to_uppercase()
+                    .replace(".CSV", ".csv");
+                let key = format!("{}/unko/{}/{}", tenant_id, unko_no, csv_name);
+                let mut content = String::new();
+                if let Some(h) = header {
+                    content.push_str(h);
+                    content.push('\n');
+                }
+                for line in lines {
+                    content.push_str(line);
+                    content.push('\n');
+                }
+                let _ = state
+                    .storage
+                    .upload(&key, content.as_bytes(), "text/csv")
+                    .await;
+                csv_count += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        "CSV split done: {} files uploaded (upload_id={}, tenant={})",
+        csv_count, upload_id, tenant_id
+    );
+    Ok(())
+}
+
+/// Cloud Tasks から呼ばれる CSV 分割エンドポイント
+async fn internal_split_csv(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    tracing::info!("split-csv called: upload_id={}", upload_id);
+
+    split_csv_from_r2(&state, upload_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "status": "ok", "upload_id": upload_id })))
+}
+
+/// R2 に保存済みの ZIP をダウンロード
+async fn internal_download(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+) -> Result<Response, (StatusCode, String)> {
+    let record = sqlx::query_as::<_, (String, String)>(
+        "SELECT r2_zip_key, filename FROM upload_history WHERE id = $1",
+    )
+    .bind(upload_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal_err)?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("upload {} not found", upload_id)))?;
+
+    let (r2_zip_key, filename) = record;
+
+    let zip_bytes = state
+        .storage
+        .download(&r2_zip_key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("R2 download failed: {e}")))?;
+
+    // ASCII-safe filename fallback
+    let safe_name = filename
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect::<String>();
+    let safe_name = if safe_name.is_empty() { "download.zip".to_string() } else { safe_name };
+
+    Ok(Response::builder()
+        .header("Content-Type", "application/zip")
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", safe_name),
+        )
+        .body(Body::from(zip_bytes))
+        .unwrap())
+}
+
 /// R2 に保存済みの ZIP を再処理
 async fn internal_rerun(
     State(state): State<AppState>,
@@ -897,8 +1045,8 @@ async fn internal_rerun(
 async fn list_pending_uploads(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<String>)>(
-        r#"SELECT id, tenant_id, filename, status, error_message
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>)>(
+        r#"SELECT id, tenant_id, filename, status, error_message, created_at
            FROM upload_history
            WHERE status IN ('pending_retry', 'failed')
            ORDER BY created_at DESC
@@ -910,13 +1058,14 @@ async fn list_pending_uploads(
 
     let items: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, tenant_id, filename, status, error)| {
+        .map(|(id, tenant_id, filename, status, error, created_at)| {
             serde_json::json!({
-                "upload_id": id,
+                "id": id,
                 "tenant_id": tenant_id,
                 "filename": filename,
                 "status": status,
                 "error_message": error,
+                "created_at": created_at.to_rfc3339(),
             })
         })
         .collect();

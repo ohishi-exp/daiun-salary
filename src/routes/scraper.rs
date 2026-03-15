@@ -153,11 +153,16 @@ async fn trigger_scrape(
         let mut stream = res.bytes_stream();
         use futures::StreamExt;
         let mut buffer = String::new();
+        let mut event_count = 0usize;
+
+        tracing::info!("SSE proxy stream started");
 
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    let chunk_str = String::from_utf8_lossy(&bytes);
+                    tracing::debug!("SSE chunk: {} bytes", bytes.len());
+                    buffer.push_str(&chunk_str);
 
                     // SSE の "data: ...\n\n" を1行ずつパース
                     while let Some(pos) = buffer.find("\n\n") {
@@ -168,8 +173,11 @@ async fn trigger_scrape(
                             if let Some(data) = line.strip_prefix("data:") {
                                 let data = data.trim();
                                 if !data.is_empty() {
+                                    event_count += 1;
+
                                     // DB に result イベントを保存
                                     if let Ok(evt) = serde_json::from_str::<SseEvent>(data) {
+                                        tracing::info!("SSE event #{}: {:?}", event_count, evt.event);
                                         if evt.event.as_deref() == Some("result") {
                                             if let Some(ref comp_id) = evt.comp_id {
                                                 let status = evt.status.as_deref().unwrap_or("error");
@@ -189,15 +197,23 @@ async fn trigger_scrape(
                                         }
                                     }
 
-                                    let _ = tx.send(Ok(Event::default().data(data.to_string()))).await;
+                                    if tx.send(Ok(Event::default().data(data.to_string()))).await.is_err() {
+                                        tracing::warn!("SSE proxy: client disconnected");
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!("SSE proxy stream error: {e}");
+                    break;
+                }
             }
         }
+
+        tracing::info!("SSE proxy stream ended, {} events relayed", event_count);
     });
 
     let stream = ReceiverStream::new(rx);

@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+
+echo "==> Running restraint_report tests..."
+cargo test restraint_report --quiet
+
+echo "==> Tests passed."

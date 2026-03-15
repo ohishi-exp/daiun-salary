@@ -649,6 +649,8 @@ async fn calculate_daily_hours(
             let dates: Vec<chrono::NaiveDate> = dates_map.keys().copied().collect();
             let mut effective_start: Option<chrono::NaiveDateTime> = None;
             let mut prev_end: Option<chrono::NaiveDateTime> = None;
+            // 前日から繰り越す重複分の控除（リセットなし時にメイン統合するため）
+            let mut next_day_deduction: Option<(i32, i32, i32)> = None; // (drive, cargo, restraint)
 
             for (idx, &date) in dates.iter().enumerate() {
                 let info = &dates_map[&date];
@@ -660,6 +662,19 @@ async fn calculate_daily_hours(
                 };
                 if reset {
                     effective_start = Some(info.start);
+                    next_day_deduction = None;
+                } else {
+                    // リセットなし: 前日の24h窓終了時点から新しい24h窓を開始
+                    effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
+                }
+
+                // 前日からの控除を適用（リセットなし時、前日のoverlap分を当日メインから減算）
+                if let Some((ded_drive, ded_cargo, ded_restraint)) = next_day_deduction.take() {
+                    if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
+                        agg.drive_minutes = (agg.drive_minutes - ded_drive).max(0);
+                        agg.cargo_minutes = (agg.cargo_minutes - ded_cargo).max(0);
+                        agg.total_work_minutes = (agg.total_work_minutes - ded_restraint).max(0);
+                    }
                 }
 
                 let window_end = effective_start.unwrap() + chrono::Duration::hours(24);
@@ -722,11 +737,27 @@ async fn calculate_daily_hours(
 
                     let ol_break = (ol_restraint - ol_drive - ol_cargo).max(0);
 
-                    if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
-                        agg.overlap_drive_minutes = ol_drive;
-                        agg.overlap_cargo_minutes = ol_cargo;
-                        agg.overlap_break_minutes = ol_break;
-                        agg.overlap_restraint_minutes = ol_restraint;
+                    // 翌日がリセットなし（8h未満の休息）→ 重複を当日メインに統合
+                    let next_gap = (next_info.start - info.end).num_minutes();
+                    let next_resets = next_gap >= 480;
+
+                    if !next_resets && ol_restraint > 0 {
+                        // 当日メインに統合（overlapは0にする）
+                        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
+                            agg.drive_minutes += ol_drive;
+                            agg.cargo_minutes += ol_cargo;
+                            agg.total_work_minutes += ol_restraint;
+                        }
+                        // 翌日のメインから控除する分を記録
+                        next_day_deduction = Some((ol_drive, ol_cargo, ol_restraint));
+                    } else {
+                        // 通常: 重複として別表示
+                        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
+                            agg.overlap_drive_minutes = ol_drive;
+                            agg.overlap_cargo_minutes = ol_cargo;
+                            agg.overlap_break_minutes = ol_break;
+                            agg.overlap_restraint_minutes = ol_restraint;
+                        }
                     }
                 }
 

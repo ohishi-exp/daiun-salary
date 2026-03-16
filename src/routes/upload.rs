@@ -782,9 +782,19 @@ async fn calculate_daily_hours(
                     agg.total_work_minutes = event_total;
                 }
             }
-            // 深夜時間はセグメントベース（拘束時間中の22:00-05:00全体）を使用
+            // 深夜時間をイベントベース(Drive/Cargo during 22:00-05:00)で上書き
+            for (date, night) in &day_late_night {
+                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
+                    agg.late_night_minutes = *night;
+                }
+            }
+            // 深夜イベントがない日は0にリセット
+            for ((dc, _date), agg) in day_map.iter_mut() {
+                if dc == driver_cd && !day_late_night.contains_key(_date) {
+                    agg.late_night_minutes = 0;
+                }
+            }
             // ot_late_night = 始業+8h(所定労働)後に発生するDrive/Cargo深夜時間
-            // 深夜帯22:00-05:00が全て所定内(始業+8h後に深夜帯がない)→ot_late_night=0
             for (date, night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
                     let shigyo = agg.segments.iter().map(|s| s.start_at).min();

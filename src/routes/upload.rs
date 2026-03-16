@@ -765,11 +765,38 @@ async fn calculate_daily_hours(
                 }
             }
             // 深夜時間はセグメントベース（拘束時間中の22:00-05:00全体）を使用
-            // イベントベース（Drive/Cargoのみ）では不足するため上書きしない
-            // ot_late_night用にイベントベースの深夜時間を保持
+            // ot_late_night = 始業+8h(所定労働)後に発生するDrive/Cargo深夜時間
+            // 深夜帯22:00-05:00が全て所定内(始業+8h後に深夜帯がない)→ot_late_night=0
             for (date, night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
-                    agg.ot_late_night_minutes = *night;
+                    let shigyo = agg.segments.iter().map(|s| s.start_at).min();
+                    let ot_night = if let Some(start) = shigyo {
+                        let overtime_start = start + chrono::Duration::minutes(480);
+                        // 深夜帯: 始業日の22:00と翌05:00
+                        let night_start_22 = start.date().and_hms_opt(22, 0, 0).unwrap();
+                        let night_end_05 = (start.date() + chrono::Duration::days(1))
+                            .and_hms_opt(5, 0, 0).unwrap();
+                        // 始業が22:00-05:00の場合、深夜帯の終了は始業当日の05:00または翌05:00
+                        let effective_night_end = if start.hour() < 5 {
+                            // 始業が0-5時 → 深夜帯終了は当日05:00
+                            start.date().and_hms_opt(5, 0, 0).unwrap()
+                        } else {
+                            night_end_05
+                        };
+                        if overtime_start >= effective_night_end {
+                            // 始業+8hが深夜帯終了以降 → 深夜帯は全て所定労働内
+                            0
+                        } else if overtime_start <= night_start_22 {
+                            // 始業+8hが22:00より前 → 深夜帯は全て時間外
+                            *night
+                        } else {
+                            // 部分的: overtime_startが深夜帯内 → 近似値
+                            *night
+                        }
+                    } else {
+                        0
+                    };
+                    agg.ot_late_night_minutes = ot_night;
                 }
             }
         }

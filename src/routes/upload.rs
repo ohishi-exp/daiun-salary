@@ -775,19 +775,8 @@ async fn calculate_daily_hours(
                     agg.cargo_minutes = *cargo;
                 }
             }
-            // total_work_minutes をイベント合計(drive+cargo+break)で上書き
-            // イベントのduration_minutesは整数分で正確（セグメントwall-clockは秒切り捨てでズレる）
-            // 204(その他)→cargo, 205(待機)→breakに分類修正済み
-            for ((dc, date), agg) in day_map.iter_mut() {
-                if dc != driver_cd { continue; }
-                let d = day_drive.get(date).copied().unwrap_or(0);
-                let c = day_cargo.get(date).copied().unwrap_or(0);
-                let b = day_break.get(date).copied().unwrap_or(0);
-                let event_total = d + c + b;
-                if event_total > 0 {
-                    agg.total_work_minutes = event_total;
-                }
-            }
+            // total_work_minutesはセグメントwall-clock合計を維持
+            // (イベント帰属とセグメント帰属の日付が異なるケースがあるため)
             // 深夜時間をイベントベース(Drive/Cargo during 22:00-05:00)で上書き
             for (date, night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {

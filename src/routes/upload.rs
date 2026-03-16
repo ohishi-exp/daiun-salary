@@ -762,11 +762,22 @@ async fn calculate_daily_hours(
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
                         // イベントの帰属日: セグメントのタイムスタンプ範囲で判定
-                        // セグメント処理(L607-610)と同じロジックで一貫性を保つ
+                        // 休息ギャップ中のイベントは直後のセグメントに帰属させる
                         let (event_date, event_start_time) = unko_segments.get(unko_no)
-                            .and_then(|segs| segs.iter()
-                                .find(|(start, end, _, _)| evt.start_at >= *start && evt.start_at < *end)
-                                .map(|(_, _, wd, st)| (*wd, *st)))
+                            .and_then(|segs| {
+                                // まずセグメント範囲内を探す
+                                segs.iter()
+                                    .find(|(start, end, _, _)| evt.start_at >= *start && evt.start_at < *end)
+                                    .or_else(|| {
+                                        // 休息ギャップ: 直後のセグメント（evt < seg.start の最初）
+                                        segs.iter().find(|(start, _, _, _)| evt.start_at < *start)
+                                    })
+                                    .or_else(|| {
+                                        // 全セグメントより後: 最後のセグメント
+                                        segs.last()
+                                    })
+                                    .map(|(_, _, wd, st)| (*wd, *st))
+                            })
                             .unwrap_or((evt.start_at.date(), chrono::NaiveTime::from_hms_opt(0,0,0).unwrap()));
                         let cls = classifications.get(&evt.event_cd);
                         match cls {

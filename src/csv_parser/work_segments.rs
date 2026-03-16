@@ -193,8 +193,7 @@ pub fn split_segments_by_day(segments: &[WorkSegment]) -> Vec<DailyWorkSegment> 
                     .unwrap()
             };
 
-            // 秒を四捨五入して分に変換（CSVのイベント合計は整数分なので切り捨てだとズレる）
-            let work_mins = ((day_end - day_start).num_seconds() as f64 / 60.0).round() as i32;
+            let work_mins = (day_end - day_start).num_minutes() as i32;
             if work_mins <= 0 {
                 current += chrono::Duration::days(1);
                 continue;

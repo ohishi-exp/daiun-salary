@@ -419,6 +419,14 @@ async fn calculate_daily_hours(
 
     let mut day_map: HashMap<(String, chrono::NaiveDate), DayAgg> = HashMap::new();
 
+    // unko_no → 出発日マップ（日跨ぎ運行を出発日に帰属させるため）
+    let mut unko_departure_date: HashMap<String, chrono::NaiveDate> = HashMap::new();
+    for row in rows {
+        if let Some(dep) = row.departure_at {
+            unko_departure_date.insert(row.unko_no.clone(), dep.date());
+        }
+    }
+
     for row in rows {
         let driver_id = if !row.driver_cd.is_empty() {
             let rec = sqlx::query_as::<_, (Uuid,)>(
@@ -630,10 +638,13 @@ async fn calculate_daily_hours(
             }
         }
 
-        // total_work_minutes: 各セグメントの (end_HH:MM - start_HH:MM) を合算
+        // total_work_minutes: 各セグメントの (end_HH:MM - start_HH:MM) を合算し、
+        // 運行単位で控除時間（60分）を差し引く（web地球号の就業時間管理マスター設定に準拠）
+        const DEDUCTION_MINUTES_PER_OPERATION: i32 = 60;
         for ((_driver_cd, _date), agg) in day_map.iter_mut() {
             if agg.segments.is_empty() { continue; }
-            let mut total = 0i32;
+            // 運行(unko_no)ごとにセグメント壁時計時間を合算
+            let mut unko_totals: std::collections::HashMap<&str, i32> = std::collections::HashMap::new();
             for seg in &agg.segments {
                 let s_min = (seg.start_at.hour() * 60 + seg.start_at.minute()) as i32;
                 let e_min = (seg.end_at.hour() * 60 + seg.end_at.minute()) as i32;
@@ -643,7 +654,12 @@ async fn calculate_daily_hours(
                 } else {
                     e_min - s_min
                 };
-                total += dur;
+                *unko_totals.entry(&seg.unko_no).or_insert(0) += dur;
+            }
+            // 各運行から控除時間を差し引いて合計
+            let mut total = 0i32;
+            for (_unko, wall_clock) in &unko_totals {
+                total += (wall_clock - DEDUCTION_MINUTES_PER_OPERATION).max(0);
             }
             agg.total_work_minutes = total;
         }
@@ -818,6 +834,8 @@ async fn calculate_daily_hours(
     }
 
     // 4. Persist to DB
+    // 日跨ぎ修正で帰属日が変わると古い日のデータが残るため、
+    // 対象ドライバー×月の既存データを一括削除してから再挿入する
     let day_entries: Vec<_> = day_map.iter().collect();
     let save_total = day_entries.len();
     for (i, ((_driver_cd, work_date), agg)) in day_entries.into_iter().enumerate() {

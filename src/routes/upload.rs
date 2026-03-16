@@ -1758,9 +1758,9 @@ async fn internal_recalculate_all(
                       o.drive_time_general, o.drive_time_highway, o.drive_time_bypass
                FROM operations o
                LEFT JOIN drivers d ON d.id = o.driver_id AND d.tenant_id = o.tenant_id
-               JOIN daily_work_segments s ON s.tenant_id = o.tenant_id AND s.unko_no = o.unko_no
                WHERE o.tenant_id = $1
-                 AND s.work_date >= $2 AND s.work_date <= $3
+                 AND (o.operation_date >= $2 AND o.operation_date <= $3
+                      OR o.reading_date >= $2 AND o.reading_date <= $3)
                ORDER BY o.reading_date, o.unko_no"#,
         )
         .bind(tenant_id)
@@ -2005,9 +2005,9 @@ async fn recalculate_driver(
                       o.total_distance,
                       o.drive_time_general, o.drive_time_highway, o.drive_time_bypass
                FROM operations o
-               JOIN daily_work_segments s ON s.tenant_id = o.tenant_id AND s.unko_no = o.unko_no
                WHERE o.tenant_id = $1 AND o.driver_id = $2
-                 AND s.work_date >= $3 AND s.work_date <= $4
+                 AND (o.operation_date >= $3 AND o.operation_date <= $4
+                      OR o.reading_date >= $3 AND o.reading_date <= $4)
                ORDER BY o.reading_date, o.unko_no"#,
         )
         .bind(tenant_id)

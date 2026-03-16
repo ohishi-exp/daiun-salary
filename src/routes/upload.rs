@@ -728,17 +728,13 @@ async fn calculate_daily_hours(
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
-                        // イベントの帰属日: day_mapにカレンダー日のエントリがあればそれを使用
-                        // なければ前日を試す（夜行運行で0時跨ぎの場合）
+                        // イベントの帰属日: 直前の始業（day_mapでイベント日以前の最も近い日付）に寄せる
                         let cal_date = evt.start_at.date();
-                        let prev_date = cal_date - chrono::Duration::days(1);
-                        let event_date = if day_map.contains_key(&(driver_cd.clone(), cal_date)) {
-                            cal_date
-                        } else if day_map.contains_key(&(driver_cd.clone(), prev_date)) {
-                            prev_date
-                        } else {
-                            cal_date
-                        };
+                        let event_date = day_map.keys()
+                            .filter(|(dc, d)| dc == driver_cd && *d <= cal_date)
+                            .map(|(_, d)| *d)
+                            .max()
+                            .unwrap_or(cal_date);
                         let cls = classifications.get(&evt.event_cd);
                         match cls {
                             Some(EventClass::Drive) => {

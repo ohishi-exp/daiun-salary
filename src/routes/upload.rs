@@ -591,10 +591,27 @@ async fn calculate_daily_hours(
                 let segments = work_segments::split_segments_at_24h(segments);
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 
+                // この運行の302イベントからworkday境界を決定（始業ポイント）
+                let rest_events_for_unko: Vec<(chrono::NaiveDateTime, i32)> = event_slice.iter()
+                    .filter(|e| classifications.get(&e.event_cd) == Some(&EventClass::RestSplit))
+                    .filter_map(|e| e.duration_minutes.filter(|&d| d > 0).map(|d| (e.start_at, d)))
+                    .collect();
+                let workdays = work_segments::determine_workdays(&rest_events_for_unko, dep, ret);
+
+                // セグメント→始業時刻マッピング: 各セグメントが属するworkdayのstartをstart_timeとする
+                // これにより同unko_no内で休息基準未満の分割は同一start_timeに集約される
+                let find_start_time = |ts: chrono::NaiveDateTime| -> chrono::NaiveTime {
+                    workdays.iter()
+                        .find(|wd| ts >= wd.start && ts < wd.end)
+                        .or_else(|| workdays.iter().rev().find(|wd| ts >= wd.start))
+                        .map(|wd| wd.start.time())
+                        .unwrap_or(dep.time())
+                };
+
                 // セグメント情報を保存（イベント帰属判定用）
-                // (seg.start, seg.end, work_date=seg.start.date())
+                // (seg.start, seg.end, work_date, start_time)
                 let seg_entries: Vec<_> = segments.iter()
-                    .map(|seg| (seg.start, seg.end, seg.start.date(), seg.start.time()))
+                    .map(|seg| (seg.start, seg.end, seg.start.date(), find_start_time(seg.start)))
                     .collect();
                 unko_segments.insert(row.unko_no.clone(), seg_entries);
 
@@ -609,11 +626,12 @@ async fn calculate_daily_hours(
                     };
                     let day_distance = total_distance * ratio;
 
-                    // work_date + start_time: WorkSegmentの開始日時で帰属を決定
+                    // work_date: セグメントの開始日
+                    // start_time: workday境界の始業時刻（休息基準で判定）
                     let parent_seg = segments.iter()
                         .find(|seg| ds.start >= seg.start && ds.start < seg.end);
                     let work_date = parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date);
-                    let start_time = parent_seg.map(|seg| seg.start.time()).unwrap_or(chrono::NaiveTime::from_hms_opt(0,0,0).unwrap());
+                    let start_time = find_start_time(ds.start);
                     let entry = day_map
                         .entry((row.driver_cd.clone(), work_date, start_time))
                         .or_insert(DayAgg {

@@ -891,8 +891,23 @@ async fn compare_csv(
 
                     // 差分検出
                     let mut diffs = Vec::new();
-                    for (csv_day, sys_day) in csv_d.days.iter().zip(sys_days.iter()) {
+                    // 日付+始業でマッチ（行番号zipだと休日行のずれで全行ずれる）
+                    let mut sys_idx = 0;
+                    for csv_day in &csv_d.days {
                         if csv_day.is_holiday { continue; }
+                        // 同じ日付のsys_dayを探す（複数行対応: sys_idxから順に探す）
+                        let sys_day = sys_days[sys_idx..].iter()
+                            .find(|s| s.date == csv_day.date);
+                        let sys_day = match sys_day {
+                            Some(sd) => {
+                                // sys_idxを進める
+                                if let Some(pos) = sys_days[sys_idx..].iter().position(|s| std::ptr::eq(s, sd)) {
+                                    sys_idx += pos + 1;
+                                }
+                                sd
+                            }
+                            None => continue, // システムにない日はスキップ
+                        };
                         let checks = [
                             ("運転", &csv_day.drive, &sys_day.drive),
                             ("重複運転", &csv_day.overlap_drive, &sys_day.overlap_drive),

@@ -817,6 +817,16 @@ async fn calculate_daily_hours(
                     agg.cargo_minutes = *cargo;
                 }
             }
+            // total_work_minutes(拘束時間小計)をイベントduration_minutes合計で上書き
+            // 小計 = Σ運転 + Σ荷役 + Σ休憩（フェリーは後段で控除）
+            for ((date, st), _) in day_drive.iter().chain(day_cargo.iter()).chain(day_break.iter()) {
+                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
+                    let d = day_drive.get(&(*date, *st)).copied().unwrap_or(0);
+                    let c = day_cargo.get(&(*date, *st)).copied().unwrap_or(0);
+                    let b = day_break.get(&(*date, *st)).copied().unwrap_or(0);
+                    agg.total_work_minutes = d + c + b;
+                }
+            }
             // 深夜時間をイベントベース(Drive/Cargo during 22:00-05:00)で上書き
             for ((date, st), night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
@@ -875,12 +885,7 @@ async fn calculate_daily_hours(
                 }
             }
             if ferry_deduction > 0 {
-                // フェリーありの場合、セグメント秒切り捨てによる+N分を補正
-                // 各セグメントの開始秒 > 0 なら壁時計が1分多くカウントされている
-                let sec_adjust: i32 = agg.segments.iter()
-                    .filter(|s| s.start_at.second() > 0)
-                    .count() as i32;
-                agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction - sec_adjust).max(0);
+                agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
             }
         }
     }

@@ -253,7 +253,9 @@ async fn process_zip(
     tracing::info!("DB upsert done: {} operations (tenant={})", operations_count, tenant_id);
 
     // 5. Calculate daily_work_hours using KUDGIVT events
-    calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows, None).await?;
+    // フェリー時間はCSV分割時にR2のKUDGFRYから取得済み（アップロード時はまだ未保存）
+    let ferry_minutes: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows, &ferry_minutes, None).await?;
     tracing::info!("calculate_daily_hours done (tenant={})", tenant_id);
 
     // 6. CSV split (inline)
@@ -333,14 +335,155 @@ async fn upsert_driver(
     Ok(Some(rec.0))
 }
 
+/// 運行を「ワークデイ」にグルーピングする。
+/// 休息基準（原則540分以上）を満たした場合、次の拘束開始を新規始業とする。
+/// 満たさない場合は前の始業の日に帰属し続ける。24時間が最大。
+/// Returns: unko_no → work_date のマッピング
+fn group_operations_into_work_days(rows: &[KudguriRow]) -> std::collections::HashMap<String, chrono::NaiveDate> {
+    use std::collections::HashMap;
+
+    const REST_THRESHOLD_MINUTES: i64 = 540; // 原則休息基準
+    const MAX_WORK_DAY_MINUTES: i64 = 1440; // 24時間
+
+    let mut unko_work_date: HashMap<String, chrono::NaiveDate> = HashMap::new();
+
+    // ドライバーごとにグルーピング
+    let mut driver_rows: HashMap<String, Vec<&KudguriRow>> = HashMap::new();
+    for row in rows {
+        if !row.driver_cd.is_empty() {
+            driver_rows.entry(row.driver_cd.clone()).or_default().push(row);
+        }
+    }
+
+    for (_driver_cd, mut ops) in driver_rows {
+        // departure_at でソート（Noneは末尾）
+        ops.sort_by(|a, b| {
+            let da = a.departure_at.or(a.garage_out_at);
+            let db = b.departure_at.or(b.garage_out_at);
+            da.cmp(&db)
+        });
+
+        let mut current_shigyo: Option<chrono::NaiveDateTime> = None; // 始業時刻
+        let mut current_work_date: Option<chrono::NaiveDate> = None;
+        let mut last_end: Option<chrono::NaiveDateTime> = None;
+
+        for row in &ops {
+            let dep = match row.departure_at.or(row.garage_out_at) {
+                Some(d) => d,
+                None => {
+                    // departure_at がない場合は operation_date / reading_date で帰属
+                    let wd = row.operation_date.unwrap_or(row.reading_date);
+                    unko_work_date.insert(row.unko_no.clone(), wd);
+                    continue;
+                }
+            };
+            let ret = row.return_at.or(row.garage_in_at).unwrap_or(dep);
+
+            let mut new_day = false;
+
+            if let (Some(shigyo), Some(prev_end)) = (current_shigyo, last_end) {
+                let gap_minutes = (dep - prev_end).num_minutes();
+                let since_shigyo_minutes = (dep - shigyo).num_minutes();
+
+                if gap_minutes >= REST_THRESHOLD_MINUTES {
+                    // 休息基準を満たした → 新規始業
+                    new_day = true;
+                } else if since_shigyo_minutes >= MAX_WORK_DAY_MINUTES {
+                    // 24時間超過 → 強制日締め
+                    new_day = true;
+                }
+            } else {
+                // 最初の運行
+                new_day = true;
+            }
+
+            if new_day {
+                current_shigyo = Some(dep);
+                current_work_date = Some(dep.date());
+            }
+
+            unko_work_date.insert(row.unko_no.clone(), current_work_date.unwrap());
+
+            // last_end を更新（より遅い終了時刻を保持）
+            last_end = Some(match last_end {
+                Some(prev) if ret > prev => ret,
+                Some(prev) => prev,
+                None => ret,
+            });
+        }
+    }
+
+    unko_work_date
+}
+
+/// R2のKUDGFRYからフェリー乗船時間(分)を取得
+/// Returns: unko_no → ferry_minutes のマッピング
+async fn load_ferry_minutes(
+    state: &AppState,
+    tenant_id: Uuid,
+    rows: &[KudguriRow],
+) -> std::collections::HashMap<String, i32> {
+    use std::collections::HashMap;
+
+    let mut ferry_map: HashMap<String, i32> = HashMap::new();
+
+    let futures: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let r2_key = format!("{}/unko/{}/KUDGFRY.csv", tenant_id, row.unko_no);
+            let storage = state.storage.clone();
+            let unko_no = row.unko_no.clone();
+            async move { (unko_no, storage.download(&r2_key).await) }
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    for (unko_no, result) in results {
+        if let Ok(bytes) = result {
+            // KUDGFRY.csv: col 10=開始日時, col 11=終了日時
+            // フェリー時間 = 終了 - 開始（分）
+            let text = crate::csv_parser::decode_shift_jis(&bytes);
+            let mut total_ferry = 0i32;
+            for line in text.lines().skip(1) {
+                let cols: Vec<&str> = line.split(',').collect();
+                if cols.len() > 11 {
+                    if let (Some(start), Some(end)) = (
+                        chrono::NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S").ok()
+                            .or_else(|| chrono::NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+                        chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S").ok()
+                            .or_else(|| chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+                    ) {
+                        let mins = (end - start).num_minutes() as i32;
+                        if mins > 0 {
+                            total_ferry += mins;
+                            tracing::debug!("Ferry {}: {}min ({} → {})", unko_no, mins, start, end);
+                        }
+                    }
+                }
+            }
+            if total_ferry > 0 {
+                ferry_map.insert(unko_no, total_ferry);
+            }
+        }
+    }
+
+    tracing::info!("Ferry minutes loaded: {} operations with ferry", ferry_map.len());
+    ferry_map
+}
+
 async fn calculate_daily_hours(
     state: &AppState,
     tenant_id: Uuid,
     rows: &[KudguriRow],
     kudgivt_rows: &[KudgivtRow],
+    ferry_minutes: &std::collections::HashMap<String, i32>,
     progress_tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<(), anyhow::Error> {
     use std::collections::HashMap;
+
+    // 0. 始業ベースのワークデイグルーピング（unko_no → work_date）
+    let unko_work_date = group_operations_into_work_days(rows);
 
     // 1. Load or initialize event classifications
     let classifications = load_or_init_classifications(state, tenant_id, kudgivt_rows).await?;
@@ -354,31 +497,19 @@ async fn calculate_daily_hours(
             .push(row);
     }
 
-    // 2.5. 302休息イベントを日別に集計
+    // 2.5. 302休息イベントを始業ベースのワークデイで集計
     let mut rest_event_map: HashMap<(String, chrono::NaiveDate), i32> = HashMap::new();
     for row in kudgivt_rows {
         if classifications.get(&row.event_cd) == Some(&EventClass::RestSplit) {
             let dur = row.duration_minutes.unwrap_or(0);
             if dur <= 0 { continue; }
-            let start = row.start_at;
-            let end = start + chrono::Duration::minutes(dur as i64);
-            // 日跨ぎ分割
-            let mut current = start;
-            while current < end {
-                let day = current.date();
-                let day_end = chrono::NaiveDate::succ_opt(&day)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap();
-                let segment_end = end.min(day_end);
-                let mins = (segment_end - current).num_minutes() as i32;
-                if mins > 0 {
-                    *rest_event_map
-                        .entry((row.driver_cd.clone(), day))
-                        .or_insert(0) += mins;
-                }
-                current = segment_end;
-            }
+            // unko_no からワークデイを取得（始業ベース帰属）
+            let work_date = unko_work_date.get(&row.unko_no)
+                .copied()
+                .unwrap_or(row.start_at.date());
+            *rest_event_map
+                .entry((row.driver_cd.clone(), work_date))
+                .or_insert(0) += dur;
         }
     }
 
@@ -465,8 +596,12 @@ async fn calculate_daily_hours(
                     };
                     let day_distance = total_distance * ratio;
 
+                    // 始業ベースのワークデイに帰属（カレンダー日ではなく）
+                    let work_date = unko_work_date.get(&row.unko_no)
+                        .copied()
+                        .unwrap_or(ds.date);
                     let entry = day_map
-                        .entry((row.driver_cd.clone(), ds.date))
+                        .entry((row.driver_cd.clone(), work_date))
                         .or_insert(DayAgg {
                             driver_id,
                             total_work_minutes: 0,
@@ -585,17 +720,22 @@ async fn calculate_daily_hours(
             let mut day_late_night: HashMap<chrono::NaiveDate, i32> = HashMap::new();
 
             for unko_no in unko_nos {
+                // 始業ベースのワークデイを取得
+                let attr_date = unko_work_date.get(unko_no)
+                    .copied();
                 if let Some(events) = kudgivt_by_unko.get(unko_no) {
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
+                        // イベントの帰属日 = 運行のワークデイ（始業ベース）
+                        let event_date = attr_date.unwrap_or(evt.start_at.date());
                         let cls = classifications.get(&evt.event_cd);
                         match cls {
                             Some(EventClass::Drive) => {
-                                *day_drive.entry(evt.start_at.date()).or_insert(0) += dur;
+                                *day_drive.entry(event_date).or_insert(0) += dur;
                             }
                             Some(EventClass::Cargo) => {
-                                *day_cargo.entry(evt.start_at.date()).or_insert(0) += dur;
+                                *day_cargo.entry(event_date).or_insert(0) += dur;
                             }
                             _ => {}
                         }
@@ -605,7 +745,7 @@ async fn calculate_daily_hours(
                                 let evt_end = evt.start_at + chrono::Duration::minutes(dur as i64);
                                 let night = crate::csv_parser::work_segments::calc_late_night_mins(evt.start_at, evt_end);
                                 if night > 0 {
-                                    *day_late_night.entry(evt.start_at.date()).or_insert(0) += night;
+                                    *day_late_night.entry(event_date).or_insert(0) += night;
                                 }
                             }
                             _ => {}
@@ -624,44 +764,29 @@ async fn calculate_daily_hours(
                     agg.cargo_minutes = *cargo;
                 }
             }
-            // 深夜時間をイベントベースで上書き（セグメント時間ベースから変更）
+            // 深夜時間はセグメントベース（拘束時間中の22:00-05:00全体）を使用
+            // イベントベース（Drive/Cargoのみ）では不足するため上書きしない
+            // ot_late_night用にイベントベースの深夜時間を保持
             for (date, night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
-                    agg.late_night_minutes = *night;
-                }
-            }
-            // 深夜イベントがない日は0にリセット
-            for ((dc, _date), agg) in day_map.iter_mut() {
-                if dc == driver_cd && !day_late_night.contains_key(&_date) {
-                    agg.late_night_minutes = 0;
+                    agg.ot_late_night_minutes = *night;
                 }
             }
         }
 
-        // total_work_minutes: 各セグメントの (end_HH:MM - start_HH:MM) を合算し、
-        // 運行単位で控除時間（60分）を差し引く（web地球号の就業時間管理マスター設定に準拠）
-        const DEDUCTION_MINUTES_PER_OPERATION: i32 = 60;
+        // total_work_minutes: 拘束時間小計 = セグメント壁時計合計 - フェリー乗船時間
+        // セグメントは休息(302)で分割済みなので休息時間は既に除外されている
+        // フェリー時間はKUDGFRYから取得し、運行単位で控除する
         for ((_driver_cd, _date), agg) in day_map.iter_mut() {
-            if agg.segments.is_empty() { continue; }
-            // 運行(unko_no)ごとにセグメント壁時計時間を合算
-            let mut unko_totals: std::collections::HashMap<&str, i32> = std::collections::HashMap::new();
-            for seg in &agg.segments {
-                let s_min = (seg.start_at.hour() * 60 + seg.start_at.minute()) as i32;
-                let e_min = (seg.end_at.hour() * 60 + seg.end_at.minute()) as i32;
-                let dur = if seg.end_at.date() > seg.start_at.date() {
-                    let days = (seg.end_at.date() - seg.start_at.date()).num_days() as i32;
-                    e_min + days * 1440 - s_min
-                } else {
-                    e_min - s_min
-                };
-                *unko_totals.entry(&seg.unko_no).or_insert(0) += dur;
+            let mut ferry_deduction = 0i32;
+            for unko in &agg.unko_nos {
+                if let Some(&fm) = ferry_minutes.get(unko) {
+                    ferry_deduction += fm;
+                }
             }
-            // 各運行から控除時間を差し引いて合計
-            let mut total = 0i32;
-            for (_unko, wall_clock) in &unko_totals {
-                total += (wall_clock - DEDUCTION_MINUTES_PER_OPERATION).max(0);
+            if ferry_deduction > 0 {
+                agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
             }
-            agg.total_work_minutes = total;
         }
     }
 
@@ -835,7 +960,45 @@ async fn calculate_daily_hours(
 
     // 4. Persist to DB
     // 日跨ぎ修正で帰属日が変わると古い日のデータが残るため、
-    // 対象ドライバー×月の既存データを一括削除してから再挿入する
+    // 対象ドライバー×unko_noの既存データを一括削除してから再挿入する
+    {
+        // 全対象 unko_no を収集
+        let mut all_unko_nos: Vec<String> = Vec::new();
+        let mut driver_ids_seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for ((_dc, _wd), agg) in &day_map {
+            if let Some(did) = agg.driver_id {
+                driver_ids_seen.insert(did);
+            }
+            for u in &agg.unko_nos {
+                if !all_unko_nos.contains(u) {
+                    all_unko_nos.push(u.clone());
+                }
+            }
+        }
+        // unko_noベースで古いセグメント・daily_work_hours を削除
+        for did in &driver_ids_seen {
+            for unko in &all_unko_nos {
+                sqlx::query(
+                    "DELETE FROM daily_work_segments WHERE tenant_id = $1 AND driver_id = $2 AND unko_no = $3",
+                )
+                .bind(tenant_id)
+                .bind(did)
+                .bind(unko)
+                .execute(&state.pool)
+                .await?;
+            }
+            // unko_nosカラム（配列）に含まれるエントリも削除
+            sqlx::query(
+                "DELETE FROM daily_work_hours WHERE tenant_id = $1 AND driver_id = $2 AND unko_nos && $3",
+            )
+            .bind(tenant_id)
+            .bind(did)
+            .bind(&all_unko_nos)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
+
     let day_entries: Vec<_> = day_map.iter().collect();
     let save_total = day_entries.len();
     for (i, ((_driver_cd, work_date), agg)) in day_entries.into_iter().enumerate() {
@@ -1661,8 +1824,11 @@ async fn internal_recalculate_all(
             "step": "calculate"
         })).await;
 
+        // 2.5. KUDGFRYからフェリー時間を取得
+        let ferry_minutes = load_ferry_minutes(&state, tenant_id, &ops).await;
+
         // 3. 再計算
-        match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, Some(tx.clone())).await {
+        match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, &ferry_minutes, Some(tx.clone())).await {
             Ok(()) => {
                 send(serde_json::json!({
                     "event": "done",
@@ -1878,8 +2044,11 @@ async fn recalculate_driver(
             "step": "calculate"
         })).await;
 
+        // 2.5. KUDGFRYからフェリー時間を取得
+        let ferry_minutes = load_ferry_minutes(&state, tenant_id, &ops).await;
+
         // 3. 再計算
-        match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, Some(tx.clone())).await {
+        match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, &ferry_minutes, Some(tx.clone())).await {
             Ok(()) => {
                 send(serde_json::json!({
                     "event": "done",

@@ -548,7 +548,8 @@ async fn calculate_daily_hours(
         cargo_minutes: i32,
     }
 
-    let mut day_map: HashMap<(String, chrono::NaiveDate), DayAgg> = HashMap::new();
+    // キー: (driver_cd, work_date, start_time) — 同日複数運行を始業時刻で区別
+    let mut day_map: HashMap<(String, chrono::NaiveDate, chrono::NaiveTime), DayAgg> = HashMap::new();
 
     // unko_no → 出発日マップ（日跨ぎ運行を出発日に帰属させるため）
     let mut unko_departure_date: HashMap<String, chrono::NaiveDate> = HashMap::new();
@@ -557,6 +558,10 @@ async fn calculate_daily_hours(
             unko_departure_date.insert(row.unko_no.clone(), dep.date());
         }
     }
+
+    // unko_no → WorkSegments マッピング（イベント帰属判定用）
+    // (seg.start, seg.end, work_date, start_time)
+    let mut unko_segments: HashMap<String, Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime, chrono::NaiveDate, chrono::NaiveTime)>> = HashMap::new();
 
     for row in rows {
         let driver_id = if !row.driver_cd.is_empty() {
@@ -586,6 +591,13 @@ async fn calculate_daily_hours(
                 let segments = work_segments::split_segments_at_24h(segments);
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 
+                // セグメント情報を保存（イベント帰属判定用）
+                // (seg.start, seg.end, work_date=seg.start.date())
+                let seg_entries: Vec<_> = segments.iter()
+                    .map(|seg| (seg.start, seg.end, seg.start.date(), seg.start.time()))
+                    .collect();
+                unko_segments.insert(row.unko_no.clone(), seg_entries);
+
                 // 総拘束時間（走行距離按分用）
                 let total_work_mins: i32 = daily_segments.iter().map(|s| s.work_minutes).sum();
 
@@ -597,15 +609,13 @@ async fn calculate_daily_hours(
                     };
                     let day_distance = total_distance * ratio;
 
-                    // work_date: 各DailyWorkSegmentが属するWorkSegment(休息分割後)の開始日を使用
-                    // → 日跨ぎ(00:00分割)は親セグメントの開始日に帰属
-                    // → 休息で分割された場合は新しいセグメントの開始日に帰属
-                    let work_date = segments.iter()
-                        .find(|seg| ds.start >= seg.start && ds.start < seg.end)
-                        .map(|seg| seg.start.date())
-                        .unwrap_or(ds.date);
+                    // work_date + start_time: WorkSegmentの開始日時で帰属を決定
+                    let parent_seg = segments.iter()
+                        .find(|seg| ds.start >= seg.start && ds.start < seg.end);
+                    let work_date = parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date);
+                    let start_time = parent_seg.map(|seg| seg.start.time()).unwrap_or(chrono::NaiveTime::from_hms_opt(0,0,0).unwrap());
                     let entry = day_map
-                        .entry((row.driver_cd.clone(), work_date))
+                        .entry((row.driver_cd.clone(), work_date, start_time))
                         .or_insert(DayAgg {
                             driver_id,
                             total_work_minutes: 0,
@@ -665,8 +675,9 @@ async fn calculate_daily_hours(
                     + row.drive_time_highway.unwrap_or(0)
                     + row.drive_time_bypass.unwrap_or(0);
 
+                let default_time = chrono::NaiveTime::from_hms_opt(0,0,0).unwrap();
                 let entry = day_map
-                    .entry((row.driver_cd.clone(), work_date))
+                    .entry((row.driver_cd.clone(), work_date, default_time))
                     .or_insert(DayAgg {
                         driver_id,
                         total_work_minutes: 0,
@@ -700,8 +711,11 @@ async fn calculate_daily_hours(
 
     // 3.5. rest_event_mapをday_mapに反映
     for ((driver_cd, date), rest_mins) in &rest_event_map {
-        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
-            agg.rest_event_minutes = *rest_mins;
+        // date一致のエントリを全て探す（start_timeが不明なため）
+        for ((dc, d, _st), agg) in day_map.iter_mut() {
+            if dc == driver_cd && d == date {
+                agg.rest_event_minutes = *rest_mins;
+            }
         }
     }
 
@@ -709,7 +723,7 @@ async fn calculate_daily_hours(
     //       total_work_minutes はセグメントから秒単位で四捨五入
     {
         let mut driver_unko_map: HashMap<String, Vec<String>> = HashMap::new();
-        for ((driver_cd, _), agg) in &day_map {
+        for ((driver_cd, _, _start_time), agg) in &day_map {
             let entry = driver_unko_map.entry(driver_cd.clone()).or_default();
             for u in &agg.unko_nos {
                 if !entry.contains(u) {
@@ -719,35 +733,33 @@ async fn calculate_daily_hours(
         }
 
         for (driver_cd, unko_nos) in &driver_unko_map {
-            let mut day_drive: HashMap<chrono::NaiveDate, i32> = HashMap::new();
-            let mut day_cargo: HashMap<chrono::NaiveDate, i32> = HashMap::new();
-            let mut day_break: HashMap<chrono::NaiveDate, i32> = HashMap::new();
-            let mut day_late_night: HashMap<chrono::NaiveDate, i32> = HashMap::new();
+            let mut day_drive: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
+            let mut day_cargo: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
+            let mut day_break: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
+            let mut day_late_night: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
 
             for unko_no in unko_nos {
                 if let Some(events) = kudgivt_by_unko.get(unko_no) {
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
-                        // イベントの帰属日: unko_noを含むday_mapエントリのうち
-                        // イベント日以前で最も近いwork_dateを使用
-                        // (多日運行では同一unko_noが複数日に存在するため)
-                        let cal_date = evt.start_at.date();
-                        let event_date = day_map.iter()
-                            .filter(|((dc, d), agg)| dc == driver_cd && *d <= cal_date && agg.unko_nos.contains(unko_no))
-                            .map(|((_, d), _)| *d)
-                            .max()
-                            .unwrap_or(cal_date);
+                        // イベントの帰属日: セグメントのタイムスタンプ範囲で判定
+                        // セグメント処理(L607-610)と同じロジックで一貫性を保つ
+                        let (event_date, event_start_time) = unko_segments.get(unko_no)
+                            .and_then(|segs| segs.iter()
+                                .find(|(start, end, _, _)| evt.start_at >= *start && evt.start_at < *end)
+                                .map(|(_, _, wd, st)| (*wd, *st)))
+                            .unwrap_or((evt.start_at.date(), chrono::NaiveTime::from_hms_opt(0,0,0).unwrap()));
                         let cls = classifications.get(&evt.event_cd);
                         match cls {
                             Some(EventClass::Drive) => {
-                                *day_drive.entry(event_date).or_insert(0) += dur;
+                                *day_drive.entry((event_date, event_start_time)).or_insert(0) += dur;
                             }
                             Some(EventClass::Cargo) => {
-                                *day_cargo.entry(event_date).or_insert(0) += dur;
+                                *day_cargo.entry((event_date, event_start_time)).or_insert(0) += dur;
                             }
                             Some(EventClass::Break) => {
-                                *day_break.entry(event_date).or_insert(0) += dur;
+                                *day_break.entry((event_date, event_start_time)).or_insert(0) += dur;
                             }
                             _ => {}
                         }
@@ -757,7 +769,7 @@ async fn calculate_daily_hours(
                                 let evt_end = evt.start_at + chrono::Duration::minutes(dur as i64);
                                 let night = crate::csv_parser::work_segments::calc_late_night_mins(evt.start_at, evt_end);
                                 if night > 0 {
-                                    *day_late_night.entry(event_date).or_insert(0) += night;
+                                    *day_late_night.entry((event_date, event_start_time)).or_insert(0) += night;
                                 }
                             }
                             _ => {}
@@ -766,33 +778,33 @@ async fn calculate_daily_hours(
                 }
             }
 
-            for (date, drive) in &day_drive {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
+            for ((date, st), drive) in &day_drive {
+                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
                     agg.drive_minutes = *drive;
                 }
             }
-            for (date, cargo) in &day_cargo {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
+            for ((date, st), cargo) in &day_cargo {
+                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
                     agg.cargo_minutes = *cargo;
                 }
             }
             // total_work_minutesはセグメントwall-clock合計を維持
             // (イベント帰属とセグメント帰属の日付が異なるケースがあるため)
             // 深夜時間をイベントベース(Drive/Cargo during 22:00-05:00)で上書き
-            for (date, night) in &day_late_night {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
+            for ((date, st), night) in &day_late_night {
+                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
                     agg.late_night_minutes = *night;
                 }
             }
             // 深夜イベントがない日は0にリセット
-            for ((dc, _date), agg) in day_map.iter_mut() {
-                if dc == driver_cd && !day_late_night.contains_key(_date) {
+            for ((dc, _date, _st), agg) in day_map.iter_mut() {
+                if dc == driver_cd && !day_late_night.contains_key(&(*_date, *_st)) {
                     agg.late_night_minutes = 0;
                 }
             }
             // ot_late_night = 始業+8h(所定労働)後に発生するDrive/Cargo深夜時間
-            for (date, night) in &day_late_night {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
+            for ((date, st), night) in &day_late_night {
+                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
                     let shigyo = agg.segments.iter().map(|s| s.start_at).min();
                     let ot_night = if let Some(start) = shigyo {
                         let overtime_start = start + chrono::Duration::minutes(480);
@@ -828,7 +840,7 @@ async fn calculate_daily_hours(
         // total_work_minutes: 拘束時間小計 = セグメント壁時計合計 - フェリー乗船時間
         // セグメントは休息(302)で分割済みなので休息時間は既に除外されている
         // フェリー時間はKUDGFRYから取得し、運行単位で控除する
-        for ((_driver_cd, _date), agg) in day_map.iter_mut() {
+        for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
             let mut ferry_deduction = 0i32;
             for unko in &agg.unko_nos {
                 if let Some(&fm) = ferry_minutes.get(unko) {
@@ -857,24 +869,24 @@ async fn calculate_daily_hours(
             unko_nos: Vec<String>,
         }
 
-        let mut driver_days: HashMap<String, BTreeMap<chrono::NaiveDate, DayInfo>> = HashMap::new();
-        for ((driver_cd, date), agg) in &day_map {
+        let mut driver_days: HashMap<String, BTreeMap<(chrono::NaiveDate, chrono::NaiveTime), DayInfo>> = HashMap::new();
+        for ((driver_cd, date, st), agg) in &day_map {
             if agg.segments.is_empty() { continue; }
             let start = trunc_min(agg.segments.iter().map(|s| s.start_at).min().unwrap());
             let end = trunc_min(agg.segments.iter().map(|s| s.end_at).max().unwrap());
             driver_days.entry(driver_cd.clone()).or_default()
-                .insert(*date, DayInfo { start, end, unko_nos: agg.unko_nos.clone() });
+                .insert((*date, *st), DayInfo { start, end, unko_nos: agg.unko_nos.clone() });
         }
 
         for (driver_cd, dates_map) in &driver_days {
-            let dates: Vec<chrono::NaiveDate> = dates_map.keys().copied().collect();
+            let dates: Vec<(chrono::NaiveDate, chrono::NaiveTime)> = dates_map.keys().copied().collect();
             let mut effective_start: Option<chrono::NaiveDateTime> = None;
             let mut prev_end: Option<chrono::NaiveDateTime> = None;
             // 前日から繰り越す重複分の控除（リセットなし時にメイン統合するため）
             let mut next_day_deduction: Option<(i32, i32, i32, i32)> = None; // (drive, cargo, restraint, late_night)
 
-            for (idx, &date) in dates.iter().enumerate() {
-                let info = &dates_map[&date];
+            for (idx, &(date, st)) in dates.iter().enumerate() {
+                let info = &dates_map[&(date, st)];
 
                 // effective_start の判定（8時間ルール）
                 let reset = match prev_end {
@@ -891,7 +903,7 @@ async fn calculate_daily_hours(
 
                 // 前日からの控除を適用（リセットなし時、前日のoverlap分を当日メインから減算）
                 if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) = next_day_deduction.take() {
-                    if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
+                    if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                         agg.drive_minutes = (agg.drive_minutes - ded_drive).max(0);
                         agg.cargo_minutes = (agg.cargo_minutes - ded_cargo).max(0);
                         agg.total_work_minutes = (agg.total_work_minutes - ded_restraint).max(0);
@@ -903,7 +915,8 @@ async fn calculate_daily_hours(
 
                 // 翌稼働日のKUDGIVTイベントで window_end 以前のものを直接集計
                 if idx + 1 < dates.len() {
-                    let next_info = &dates_map[&dates[idx + 1]];
+                    let (next_date, next_st) = dates[idx + 1];
+                    let next_info = &dates_map[&(next_date, next_st)];
 
                     // 翌日の全unko_noのイベントを取得
                     let mut ol_drive = 0i32;
@@ -955,9 +968,8 @@ async fn calculate_daily_hours(
                     // 重複拘束時間 = 翌日始業 ～ 窓内最終セグメント終了（分精度）
                     // セグメント間の休息ギャップが窓内にある場合、最終セグメント終了で打ち切る
                     if next_info.start < window_end {
-                        let next_date = dates[idx + 1];
                         let restraint_end = day_map
-                            .get(&(driver_cd.clone(), next_date))
+                            .get(&(driver_cd.clone(), next_date, next_st))
                             .map(|next_agg| {
                                 next_agg.segments.iter()
                                     .filter(|s| trunc_min(s.start_at) < window_end)
@@ -985,7 +997,7 @@ async fn calculate_daily_hours(
                         };
                         // 当日メインに統合（overlapは0にする）
                         // 深夜は重複列で扱うため当日メインには加算しない
-                        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
+                        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                             agg.drive_minutes += ol_drive;
                             agg.cargo_minutes += ol_cargo;
                             agg.total_work_minutes += ol_restraint;
@@ -995,7 +1007,7 @@ async fn calculate_daily_hours(
                         next_day_deduction = Some((ol_drive, ol_cargo, ol_restraint, ol_late_night));
                     } else {
                         // 通常: 重複として別表示
-                        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date)) {
+                        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                             agg.overlap_drive_minutes = ol_drive;
                             agg.overlap_cargo_minutes = ol_cargo;
                             agg.overlap_break_minutes = ol_break;
@@ -1016,7 +1028,7 @@ async fn calculate_daily_hours(
         // 全対象 unko_no を収集
         let mut all_unko_nos: Vec<String> = Vec::new();
         let mut driver_ids_seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        for ((_dc, _wd), agg) in &day_map {
+        for ((_dc, _wd, _st), agg) in &day_map {
             if let Some(did) = agg.driver_id {
                 driver_ids_seen.insert(did);
             }
@@ -1052,37 +1064,39 @@ async fn calculate_daily_hours(
 
     let day_entries: Vec<_> = day_map.iter().collect();
     let save_total = day_entries.len();
-    for (i, ((_driver_cd, work_date), agg)) in day_entries.into_iter().enumerate() {
+    for (i, ((_driver_cd, work_date, _start_time), agg)) in day_entries.into_iter().enumerate() {
         let Some(driver_id) = agg.driver_id else {
             continue;
         };
 
         let rest_minutes = agg.rest_event_minutes;
 
-        // Delete existing for re-upload
+        // Delete existing for re-upload (start_time含めて正確に削除)
         sqlx::query(
-            "DELETE FROM daily_work_hours WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3",
+            "DELETE FROM daily_work_hours WHERE tenant_id = $1 AND driver_id = $2 AND work_date = $3 AND start_time = $4",
         )
         .bind(tenant_id)
         .bind(driver_id)
         .bind(work_date)
+        .bind(_start_time)
         .execute(&state.pool)
         .await?;
 
         sqlx::query(
             r#"INSERT INTO daily_work_hours (
-                tenant_id, driver_id, work_date,
+                tenant_id, driver_id, work_date, start_time,
                 total_work_minutes, total_drive_minutes, total_rest_minutes,
                 late_night_minutes, drive_minutes, cargo_minutes,
                 total_distance, operation_count, unko_nos,
                 overlap_drive_minutes, overlap_cargo_minutes,
                 overlap_break_minutes, overlap_restraint_minutes,
                 ot_late_night_minutes
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"#,
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"#,
         )
         .bind(tenant_id)
         .bind(driver_id)
         .bind(work_date)
+        .bind(_start_time)
         .bind(agg.total_work_minutes)
         .bind(agg.total_labor_minutes)
         .bind(rest_minutes)

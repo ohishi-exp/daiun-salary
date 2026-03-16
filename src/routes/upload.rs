@@ -717,6 +717,7 @@ async fn calculate_daily_hours(
         for (driver_cd, unko_nos) in &driver_unko_map {
             let mut day_drive: HashMap<chrono::NaiveDate, i32> = HashMap::new();
             let mut day_cargo: HashMap<chrono::NaiveDate, i32> = HashMap::new();
+            let mut day_break: HashMap<chrono::NaiveDate, i32> = HashMap::new();
             let mut day_late_night: HashMap<chrono::NaiveDate, i32> = HashMap::new();
 
             for unko_no in unko_nos {
@@ -736,6 +737,9 @@ async fn calculate_daily_hours(
                             }
                             Some(EventClass::Cargo) => {
                                 *day_cargo.entry(event_date).or_insert(0) += dur;
+                            }
+                            Some(EventClass::Break) => {
+                                *day_break.entry(event_date).or_insert(0) += dur;
                             }
                             _ => {}
                         }
@@ -762,6 +766,18 @@ async fn calculate_daily_hours(
             for (date, cargo) in &day_cargo {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date)) {
                     agg.cargo_minutes = *cargo;
+                }
+            }
+            // total_work_minutes をイベント合計(drive+cargo+break)で上書き
+            // セグメントwall-clockは秒の切り捨てで±1分ズレるが、イベント合計は整数分で正確
+            for ((dc, date), agg) in day_map.iter_mut() {
+                if dc != driver_cd { continue; }
+                let d = day_drive.get(date).copied().unwrap_or(0);
+                let c = day_cargo.get(date).copied().unwrap_or(0);
+                let b = day_break.get(date).copied().unwrap_or(0);
+                let event_total = d + c + b;
+                if event_total > 0 {
+                    agg.total_work_minutes = event_total;
                 }
             }
             // 深夜時間はセグメントベース（拘束時間中の22:00-05:00全体）を使用

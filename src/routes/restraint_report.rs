@@ -1297,32 +1297,43 @@ mod tests {
         // generate_mock.sh 1021 で自動生成。recalculate_and_test.shで自動更新される
         let mock = vec![
             // MOCK_1021_START
-            MockDwh { day: 1 , start_time: "14:25", end_time: "15:14", drive:  163, overlap_drive:  12, cargo:   0, overlap_cargo: 0, restraint:  317, overlap_restraint:  12, late_night:   0, ot_late_night: 0 },
+            MockDwh { day: 1 , start_time: "14:25", end_time: "15:14", drive:  163, overlap_drive:  12, cargo:   0, overlap_cargo: 0, restraint:  318, overlap_restraint:  12, late_night:   0, ot_late_night: 0 },
             MockDwh { day: 2 , start_time: "14:25", end_time: "15:08", drive:  332, overlap_drive:   0, cargo:  81, overlap_cargo: 0, restraint:  565, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
             MockDwh { day: 4 , start_time: "7:23 ", end_time: "15:02", drive:  300, overlap_drive: 177, cargo:  41, overlap_cargo: 0, restraint:  459, overlap_restraint: 177, late_night:   0, ot_late_night: 0 },
             MockDwh { day: 5 , start_time: "7:23 ", end_time: "15:22", drive:  519, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  656, overlap_restraint:   0, late_night:  34, ot_late_night: 0 },
-            MockDwh { day: 6 , start_time: "7:23 ", end_time: "13:14", drive:  169, overlap_drive:  63, cargo:  37, overlap_cargo: 0, restraint:  347, overlap_restraint:  81, late_night:   0, ot_late_night: 0 },
+            MockDwh { day: 6 , start_time: "7:23 ", end_time: "13:14", drive:  169, overlap_drive:  63, cargo:  37, overlap_cargo: 0, restraint:  348, overlap_restraint:  81, late_night:   0, ot_late_night: 0 },
             MockDwh { day: 7 , start_time: "7:23 ", end_time: "14:15", drive:  288, overlap_drive:  68, cargo:  58, overlap_cargo: 0, restraint:  490, overlap_restraint:  68, late_night:   0, ot_late_night: 0 },
             MockDwh { day: 8 , start_time: "7:23 ", end_time: "13:17", drive:  385, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  500, overlap_restraint:   0, late_night:   3, ot_late_night: 0 },
-            MockDwh { day: 9 , start_time: "7:23 ", end_time: "16:10", drive:  282, overlap_drive:  99, cargo: 122, overlap_cargo: 0, restraint:  516, overlap_restraint: 120, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 10, start_time: "7:23 ", end_time: "17:20", drive:  580, overlap_drive:  91, cargo:   0, overlap_cargo: 0, restraint:  706, overlap_restraint: 111, late_night:   0, ot_late_night: 0 },
+            MockDwh { day: 9 , start_time: "7:23 ", end_time: "16:10", drive:  282, overlap_drive:  99, cargo: 122, overlap_cargo: 0, restraint:  517, overlap_restraint: 120, late_night:   0, ot_late_night: 0 },
+            MockDwh { day: 10, start_time: "7:23 ", end_time: "17:20", drive:  580, overlap_drive:  91, cargo:   0, overlap_cargo: 0, restraint:  707, overlap_restraint: 111, late_night:   0, ot_late_night: 0 },
             MockDwh { day: 11, start_time: "7:23 ", end_time: "16:08", drive:  407, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  746, overlap_restraint:   0, late_night:  58, ot_late_night: 0 },
-            MockDwh { day: 12, start_time: "7:23 ", end_time: "16:16", drive:  140, overlap_drive:  20, cargo:  19, overlap_cargo: 0, restraint:  519, overlap_restraint:  24, late_night:   0, ot_late_night: 0 },
+            MockDwh { day: 12, start_time: "7:23 ", end_time: "16:16", drive:  140, overlap_drive:  20, cargo:  19, overlap_cargo: 0, restraint:  520, overlap_restraint:  24, late_night:   0, ot_late_night: 0 },
             MockDwh { day: 13, start_time: "7:23 ", end_time: "15:49", drive:  188, overlap_drive: 208, cargo:  73, overlap_cargo: 0, restraint:  517, overlap_restraint: 226, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 14, start_time: "7:23 ", end_time: "15:34", drive:  563, overlap_drive:   9, cargo:   0, overlap_cargo: 0, restraint:  727, overlap_restraint:   9, late_night:  94, ot_late_night: 0 },
+            MockDwh { day: 14, start_time: "7:23 ", end_time: "15:34", drive:  563, overlap_drive:   9, cargo:   0, overlap_cargo: 0, restraint:  728, overlap_restraint:   9, late_night:  94, ot_late_night: 0 },
             MockDwh { day: 15, start_time: "7:23 ", end_time: "12:09", drive:  335, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  532, overlap_restraint:   0, late_night: 103, ot_late_night: 0 },
             MockDwh { day: 16, start_time: "7:23 ", end_time: "15:50", drive:  281, overlap_drive:   0, cargo: 112, overlap_cargo: 0, restraint:  603, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 18, start_time: "5:51 ", end_time: "20:25", drive:  447, overlap_drive:   0, cargo: 150, overlap_cargo: 0, restraint:  990, overlap_restraint:   0, late_night:   0, ot_late_night: 66 },
+            MockDwh { day: 18, start_time: "5:51 ", end_time: "20:25", drive:  447, overlap_drive:   0, cargo: 150, overlap_cargo: 0, restraint:  991, overlap_restraint:   0, late_night:   0, ot_late_night: 66 },
             MockDwh { day: 19, start_time: "5:51 ", end_time: "16:49", drive:  517, overlap_drive:  52, cargo:   0, overlap_cargo: 0, restraint:  658, overlap_restraint:  52, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 20, start_time: "5:51 ", end_time: "18:19", drive:  486, overlap_drive:  72, cargo: 168, overlap_cargo: 0, restraint:  799, overlap_restraint:  72, late_night:   1, ot_late_night: 0 },
+            MockDwh { day: 20, start_time: "5:51 ", end_time: "18:19", drive:  486, overlap_drive:  72, cargo: 168, overlap_cargo: 0, restraint:  800, overlap_restraint:  72, late_night:   1, ot_late_night: 0 },
             MockDwh { day: 21, start_time: "5:51 ", end_time: "17:30", drive:  579, overlap_drive:  36, cargo:   0, overlap_cargo: 0, restraint:  823, overlap_restraint:  36, late_night:  73, ot_late_night: 0 },
             MockDwh { day: 22, start_time: "5:51 ", end_time: "13:40", drive:  351, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  629, overlap_restraint:   0, late_night: 109, ot_late_night: 0 },
-            MockDwh { day: 23, start_time: "5:51 ", end_time: "12:25", drive:  162, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  493, overlap_restraint:   0, late_night:  49, ot_late_night: 0 },
+            MockDwh { day: 23, start_time: "5:51 ", end_time: "12:25", drive:  162, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  494, overlap_restraint:   0, late_night:  49, ot_late_night: 0 },
             MockDwh { day: 24, start_time: "5:51 ", end_time: "13:55", drive:  197, overlap_drive:   0, cargo:  17, overlap_cargo: 0, restraint:  402, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 25, start_time: "10:04", end_time: "16:41", drive:  126, overlap_drive: 111, cargo:  39, overlap_cargo: 0, restraint:  178, overlap_restraint: 111, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 26, start_time: "10:04", end_time: "15:31", drive:  405, overlap_drive:  98, cargo:   0, overlap_cargo: 0, restraint:  437, overlap_restraint:  98, late_night:   0, ot_late_night: 0 },
+            MockDwh { day: 25, start_time: "10:04", end_time: "16:41", drive:  126, overlap_drive: 111, cargo:  39, overlap_cargo: 0, restraint:  179, overlap_restraint: 111, late_night:   0, ot_late_night: 0 },
+            MockDwh { day: 26, start_time: "10:04", end_time: "15:31", drive:  405, overlap_drive:  98, cargo:   0, overlap_cargo: 0, restraint:  438, overlap_restraint:  98, late_night:   0, ot_late_night: 0 },
             MockDwh { day: 27, start_time: "10:04", end_time: "18:23", drive:  322, overlap_drive:  66, cargo:  14, overlap_cargo: 0, restraint:  451, overlap_restraint:  66, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 28, start_time: "10:04", end_time: "18:12", drive:  290, overlap_drive:   0, cargo:   3, overlap_cargo: 0, restraint:  488, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
+            MockDwh { day: 28, start_time: "10:04", end_time: "18:12", drive:  290, overlap_drive:   0, cargo:   3, overlap_cargo: 0, restraint:  489, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
+
+
+
+
+
+
+
+
+
+
+
 
             // MOCK_1021_END
         ];
@@ -1391,26 +1402,37 @@ mod tests {
         // generate_mock.sh 1026 で自動生成。recalculate_and_test.shで自動更新される
         let mock = vec![
             // MOCK_1026_START
-            MockDwh { day: 2 , start_time: "1:17 ", end_time: "15:06", drive:  925, overlap_drive:   0, cargo: 451, overlap_cargo: 0, restraint: 1622, overlap_restraint:   0, late_night: 346, ot_late_night: 0 },
-            MockDwh { day: 4 , start_time: "1:20 ", end_time: "15:10", drive:  402, overlap_drive:   9, cargo: 137, overlap_cargo: 0, restraint:  761, overlap_restraint:   9, late_night: 210, ot_late_night: 0 },
-            MockDwh { day: 5 , start_time: "1:11 ", end_time: "16:24", drive:  981, overlap_drive:   0, cargo: 400, overlap_cargo: 0, restraint: 1680, overlap_restraint:   0, late_night: 357, ot_late_night: 0 },
+            MockDwh { day: 2 , start_time: "1:17 ", end_time: "15:06", drive:  925, overlap_drive:   0, cargo: 451, overlap_cargo: 0, restraint: 1623, overlap_restraint:   0, late_night: 542, ot_late_night: 0 },
+            MockDwh { day: 4 , start_time: "1:20 ", end_time: "15:10", drive:  402, overlap_drive:   9, cargo: 137, overlap_cargo: 0, restraint:  762, overlap_restraint:   9, late_night: 210, ot_late_night: 0 },
+            MockDwh { day: 5 , start_time: "1:11 ", end_time: "16:24", drive:  981, overlap_drive:   0, cargo: 400, overlap_cargo: 0, restraint: 1681, overlap_restraint:   0, late_night: 571, ot_late_night: 0 },
             MockDwh { day: 7 , start_time: "1:26 ", end_time: "15:48", drive:  440, overlap_drive:   0, cargo: 166, overlap_cargo: 0, restraint:  788, overlap_restraint:   0, late_night: 204, ot_late_night: 0 },
-            MockDwh { day: 9 , start_time: "23:45", end_time: "14:14", drive:  389, overlap_drive:  26, cargo: 135, overlap_cargo: 0, restraint:  793, overlap_restraint:  26, late_night:  92, ot_late_night: 0 },
-            MockDwh { day: 10, start_time: "23:19", end_time: "15:47", drive:  510, overlap_drive:   0, cargo: 295, overlap_cargo: 0, restraint:  874, overlap_restraint:   0, late_night: 135, ot_late_night: 0 },
-            MockDwh { day: 11, start_time: "23:54", end_time: "14:16", drive:  407, overlap_drive:  31, cargo: 255, overlap_cargo: 0, restraint:  792, overlap_restraint:  31, late_night:  92, ot_late_night: 0 },
-            MockDwh { day: 12, start_time: "23:23", end_time: "15:36", drive:  509, overlap_drive:   0, cargo: 315, overlap_cargo: 0, restraint:  902, overlap_restraint:   0, late_night: 128, ot_late_night: 0 },
+            MockDwh { day: 9 , start_time: "23:45", end_time: "14:14", drive:  389, overlap_drive:  26, cargo: 135, overlap_cargo: 0, restraint:  794, overlap_restraint:  26, late_night: 305, ot_late_night: 0 },
+            MockDwh { day: 10, start_time: "23:19", end_time: "15:47", drive:  510, overlap_drive:   0, cargo: 295, overlap_cargo: 0, restraint:  875, overlap_restraint:   0, late_night: 341, ot_late_night: 0 },
+            MockDwh { day: 11, start_time: "23:54", end_time: "14:16", drive:  407, overlap_drive:  31, cargo: 255, overlap_cargo: 0, restraint:  793, overlap_restraint:  31, late_night: 306, ot_late_night: 0 },
+            MockDwh { day: 12, start_time: "23:23", end_time: "15:36", drive:  509, overlap_drive:   0, cargo: 315, overlap_cargo: 0, restraint:  903, overlap_restraint:   0, late_night: 337, ot_late_night: 0 },
             MockDwh { day: 14, start_time: "1:25 ", end_time: "15:24", drive:  414, overlap_drive:   0, cargo: 189, overlap_cargo: 0, restraint:  769, overlap_restraint:   0, late_night: 214, ot_late_night: 0 },
-            MockDwh { day: 15, start_time: "23:37", end_time: "14:27", drive:  497, overlap_drive:   1, cargo: 241, overlap_cargo: 0, restraint:  889, overlap_restraint:   1, late_night: 116, ot_late_night: 0 },
-            MockDwh { day: 16, start_time: "23:36", end_time: "14:28", drive:  493, overlap_drive:   1, cargo: 173, overlap_cargo: 0, restraint:  891, overlap_restraint:   1, late_night: 113, ot_late_night: 0 },
-            MockDwh { day: 17, start_time: "23:35", end_time: "14:26", drive:  496, overlap_drive:   0, cargo: 261, overlap_cargo: 0, restraint:  890, overlap_restraint:   0, late_night: 122, ot_late_night: 0 },
-            MockDwh { day: 18, start_time: "23:36", end_time: "13:34", drive:  217, overlap_drive:   0, cargo: 148, overlap_cargo: 0, restraint:  852, overlap_restraint:   0, late_night:   0, ot_late_night: 96 },
-            MockDwh { day: 19, start_time: "23:36", end_time: "14:36", drive:  781, overlap_drive:   0, cargo: 273, overlap_cargo: 0, restraint:  894, overlap_restraint:   0, late_night:  79, ot_late_night: 175 },
-            MockDwh { day: 22, start_time: "23:33", end_time: "13:33", drive:  960, overlap_drive:   0, cargo: 434, overlap_cargo: 0, restraint:  839, overlap_restraint:   0, late_night: 226, ot_late_night: 0 },
-            MockDwh { day: 23, start_time: "23:35", end_time: "14:22", drive:  476, overlap_drive:   0, cargo: 213, overlap_cargo: 0, restraint:  886, overlap_restraint:   0, late_night: 124, ot_late_night: 0 },
-            MockDwh { day: 24, start_time: "23:36", end_time: "14:45", drive:  509, overlap_drive:   0, cargo: 185, overlap_cargo: 0, restraint:  908, overlap_restraint:   0, late_night: 117, ot_late_night: 0 },
-            MockDwh { day: 25, start_time: "23:37", end_time: "14:16", drive:  480, overlap_drive:   4, cargo: 207, overlap_cargo: 0, restraint:  878, overlap_restraint:   4, late_night: 119, ot_late_night: 0 },
-            MockDwh { day: 26, start_time: "23:33", end_time: "14:22", drive:  496, overlap_drive:   0, cargo: 168, overlap_cargo: 0, restraint:  888, overlap_restraint:   0, late_night: 120, ot_late_night: 0 },
-            MockDwh { day: 27, start_time: "23:37", end_time: "14:48", drive:  500, overlap_drive:   0, cargo: 165, overlap_cargo: 0, restraint:  910, overlap_restraint:   0, late_night: 114, ot_late_night: 0 },
+            MockDwh { day: 15, start_time: "23:37", end_time: "14:27", drive:  497, overlap_drive:   1, cargo: 241, overlap_cargo: 0, restraint:  890, overlap_restraint:   1, late_night: 323, ot_late_night: 0 },
+            MockDwh { day: 16, start_time: "23:36", end_time: "14:28", drive:  493, overlap_drive:   1, cargo: 173, overlap_cargo: 0, restraint:  892, overlap_restraint:   1, late_night: 324, ot_late_night: 0 },
+            MockDwh { day: 17, start_time: "23:35", end_time: "14:26", drive:  496, overlap_drive:   0, cargo: 261, overlap_cargo: 0, restraint:  891, overlap_restraint:   0, late_night: 325, ot_late_night: 0 },
+            MockDwh { day: 18, start_time: "23:36", end_time: "13:34", drive:  217, overlap_drive:   0, cargo: 148, overlap_cargo: 0, restraint:  853, overlap_restraint:   0, late_night: 202, ot_late_night: 96 },
+            MockDwh { day: 19, start_time: "23:36", end_time: "14:36", drive:  781, overlap_drive:   0, cargo: 273, overlap_cargo: 0, restraint:  895, overlap_restraint:   0, late_night: 284, ot_late_night: 380 },
+            MockDwh { day: 22, start_time: "23:33", end_time: "13:33", drive:  960, overlap_drive:   0, cargo: 434, overlap_cargo: 0, restraint:  840, overlap_restraint:   0, late_night: 654, ot_late_night: 0 },
+            MockDwh { day: 23, start_time: "23:35", end_time: "14:22", drive:  476, overlap_drive:   0, cargo: 213, overlap_cargo: 0, restraint:  887, overlap_restraint:   0, late_night: 325, ot_late_night: 0 },
+            MockDwh { day: 24, start_time: "23:36", end_time: "14:45", drive:  509, overlap_drive:   0, cargo: 185, overlap_cargo: 0, restraint:  909, overlap_restraint:   0, late_night: 324, ot_late_night: 0 },
+            MockDwh { day: 25, start_time: "23:37", end_time: "14:16", drive:  480, overlap_drive:   4, cargo: 207, overlap_cargo: 0, restraint:  879, overlap_restraint:   4, late_night: 323, ot_late_night: 0 },
+            MockDwh { day: 26, start_time: "23:33", end_time: "14:22", drive:  496, overlap_drive:   0, cargo: 168, overlap_cargo: 0, restraint:  889, overlap_restraint:   0, late_night: 327, ot_late_night: 0 },
+            MockDwh { day: 27, start_time: "23:37", end_time: "14:48", drive:  500, overlap_drive:   0, cargo: 165, overlap_cargo: 0, restraint:  911, overlap_restraint:   0, late_night: 323, ot_late_night: 0 },
+
+
+
+
+
+
+
+
+
+
+
 
             // MOCK_1026_END
         ];

@@ -583,6 +583,7 @@ async fn calculate_daily_hours(
                     .unwrap_or_default();
 
                 let segments = work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
+                let segments = work_segments::split_segments_at_24h(segments);
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 
                 // 総拘束時間（走行距離按分用）

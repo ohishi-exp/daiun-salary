@@ -3,6 +3,125 @@ use std::collections::HashMap;
 
 use super::kudgivt::KudgivtRow;
 
+/// 改善基準告示の休息基準（分）
+const REST_THRESHOLD_PRINCIPAL: i32 = 540;  // 原則: 連続540分以上
+const REST_SPLIT_MIN: i32 = 180;            // 分割特例: 1回180分以上
+const REST_SPLIT_2_TOTAL: i32 = 600;        // 2分割: 合計600分以上
+const REST_SPLIT_3_TOTAL: i32 = 720;        // 3分割: 合計720分以上
+const MAX_WORK_HOURS: i64 = 24 * 60;        // 24時間ルール（分）
+
+/// 1つの勤務日（始業〜終業）
+#[derive(Debug, Clone)]
+pub struct Workday {
+    pub start: NaiveDateTime,  // 始業
+    pub end: NaiveDateTime,    // 終業
+    pub date: NaiveDate,       // 帰属日 = start.date()
+}
+
+/// ドライバーの全302イベントから勤務日（始業〜終業）を決定する
+///
+/// ルール（改善基準告示 令和6年4月）:
+/// 1. 休息基準を満たした場合 → 休息開始で終業、休息終了後の次の拘束開始で新規始業
+///    - [原則] 連続540分以上
+///    - [分割特例] 1回180分以上の休息の累計が 2分割=600分 / 3分割=720分
+/// 2. 始業から24h経過で休息基準未達 → 強制日締め
+///
+/// - `rest_events`: 302イベント（時系列ソート済み）
+/// - `first_start`: 最初の拘束開始（出社日時等）
+/// - `last_end`: 最後の拘束終了
+pub fn determine_workdays(
+    rest_events: &[(NaiveDateTime, i32)], // (start_at, duration_minutes)
+    first_start: NaiveDateTime,
+    last_end: NaiveDateTime,
+) -> Vec<Workday> {
+    let mut workdays = Vec::new();
+    let mut current_start = first_start;
+    let mut split_rests: Vec<i32> = Vec::new(); // 分割特例用: 180分以上の休息を蓄積
+    tracing::debug!("determine_workdays: first_start={}, last_end={}, rest_events={}", first_start, last_end, rest_events.len());
+
+    for &(rest_start, rest_duration) in rest_events {
+        let rest_end = rest_start + chrono::Duration::minutes(rest_duration as i64);
+
+        // 24時間ルール: 始業から24h経過していたら強制日締め（複数回分割の可能性）
+        loop {
+            let max_end = current_start + chrono::Duration::minutes(MAX_WORK_HOURS);
+            if rest_start >= max_end {
+                workdays.push(Workday {
+                    start: current_start,
+                    end: max_end,
+                    date: current_start.date(),
+                });
+                current_start = max_end;
+                split_rests.clear();
+            } else {
+                break;
+            }
+        }
+
+        // 原則: 連続540分以上
+        if rest_duration >= REST_THRESHOLD_PRINCIPAL {
+            workdays.push(Workday {
+                start: current_start,
+                end: rest_start,
+                date: current_start.date(),
+            });
+            current_start = rest_end;
+            split_rests.clear();
+            continue;
+        }
+
+        // 分割特例: 180分以上の休息を蓄積してチェック
+        if rest_duration >= REST_SPLIT_MIN {
+            split_rests.push(rest_duration);
+            let total: i32 = split_rests.iter().sum();
+            let threshold = match split_rests.len() {
+                2 => REST_SPLIT_2_TOTAL,
+                n if n >= 3 => REST_SPLIT_3_TOTAL,
+                _ => i32::MAX, // 1回だけでは分割特例不成立
+            };
+            if total >= threshold {
+                workdays.push(Workday {
+                    start: current_start,
+                    end: rest_start,
+                    date: current_start.date(),
+                });
+                current_start = rest_end;
+                split_rests.clear();
+                continue;
+            }
+        }
+    }
+
+    // 最後の勤務日（24hルールで複数日に分割される可能性あり）
+    tracing::debug!("determine_workdays: after loop, current_start={}, last_end={}, workdays_so_far={}", current_start, last_end, workdays.len());
+    for (i, wd) in workdays.iter().enumerate() {
+        if wd.date >= chrono::NaiveDate::from_ymd_opt(2026, 2, 17).unwrap()
+            && wd.date <= chrono::NaiveDate::from_ymd_opt(2026, 2, 20).unwrap() {
+            tracing::debug!("  workday[{}]: date={}, start={}, end={}", i, wd.date, wd.start, wd.end);
+        }
+    }
+    while current_start < last_end {
+        let max_end = current_start + chrono::Duration::minutes(MAX_WORK_HOURS);
+        if last_end > max_end {
+            workdays.push(Workday {
+                start: current_start,
+                end: max_end,
+                date: current_start.date(),
+            });
+            current_start = max_end;
+        } else {
+            workdays.push(Workday {
+                start: current_start,
+                end: last_end,
+                date: current_start.date(),
+            });
+            break;
+        }
+    }
+
+    workdays
+}
+
 /// イベント分類
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventClass {
@@ -37,11 +156,32 @@ pub struct DailyWorkSegment {
 }
 
 /// day_start〜day_end 間の深夜時間（22:00〜翌5:00）を分単位で返す
-/// 同一日内の区間を想定。day_endが翌日0:00の場合は1440(24:00)として扱う
+/// 日跨ぎ対応: 0:00境界で分割して各日の深夜時間を合算する
 pub fn calc_late_night_mins(day_start: NaiveDateTime, day_end: NaiveDateTime) -> i32 {
+    // 同一日 or ちょうど翌日0:00 → 単一日ロジック
+    if day_end.date() == day_start.date()
+        || (day_end.date() == day_start.date().succ_opt().unwrap()
+            && day_end.hour() == 0 && day_end.minute() == 0)
+    {
+        return calc_late_night_single_day(day_start, day_end);
+    }
+    // 日跨ぎ: 0:00境界で分割して合算
+    let mut total = 0i32;
+    let mut cur = day_start;
+    while cur.date() < day_end.date() {
+        let midnight = cur.date().succ_opt().unwrap()
+            .and_hms_opt(0, 0, 0).unwrap();
+        total += calc_late_night_single_day(cur, midnight);
+        cur = midnight;
+    }
+    total += calc_late_night_single_day(cur, day_end);
+    total
+}
+
+/// 同一日内（day_endが翌日0:00含む）の深夜時間を計算
+fn calc_late_night_single_day(day_start: NaiveDateTime, day_end: NaiveDateTime) -> i32 {
     let mut total = 0i32;
     let start_h = day_start.hour() * 60 + day_start.minute();
-    // day_endが翌日の0:00の場合、1440(24:00)として扱う
     let end_h = if day_end.date() > day_start.date() && day_end.hour() == 0 && day_end.minute() == 0 {
         1440u32
     } else {
@@ -150,6 +290,40 @@ pub fn split_by_rest(
     segments
 }
 
+/// 24時間超のセグメントを24h境界で強制分割する（休息未取得時例外）
+/// 改善基準告示: 集計開始時刻の24時間後を日締め時刻とする
+pub fn split_segments_at_24h(segments: Vec<WorkSegment>) -> Vec<WorkSegment> {
+    let max_mins = 24 * 60i64;
+    let mut result = Vec::new();
+    for seg in segments {
+        let total_mins = (seg.end - seg.start).num_minutes();
+        if total_mins <= max_mins {
+            result.push(seg);
+            continue;
+        }
+        // 24h超: 分割
+        let mut cur_start = seg.start;
+        let total_labor = seg.labor_minutes as f64;
+        let total_drive = seg.drive_minutes as f64;
+        let total_cargo = seg.cargo_minutes as f64;
+        let total_wall = total_mins as f64;
+        while cur_start < seg.end {
+            let cur_end = (cur_start + chrono::Duration::minutes(max_mins)).min(seg.end);
+            let chunk_mins = (cur_end - cur_start).num_minutes() as f64;
+            let ratio = chunk_mins / total_wall;
+            result.push(WorkSegment {
+                start: cur_start,
+                end: cur_end,
+                labor_minutes: (total_labor * ratio).round() as i32,
+                drive_minutes: (total_drive * ratio).round() as i32,
+                cargo_minutes: (total_cargo * ratio).round() as i32,
+            });
+            cur_start = cur_end;
+        }
+    }
+    result
+}
+
 /// 指定範囲内のイベントを運転/荷役に分けて duration_minutes を合計
 fn sum_events_in_range(
     events: &[&&KudgivtRow],
@@ -177,7 +351,10 @@ pub fn split_segments_by_day(segments: &[WorkSegment]) -> Vec<DailyWorkSegment> 
     for seg in segments {
         let mut current = seg.start.date();
         let end_date = seg.end.date();
-        let total_work_mins = (seg.end - seg.start).num_minutes().max(1) as f64;
+        // 秒を切り捨ててHH:MM精度に揃える（web地球号互換）
+        let start_trunc = seg.start.with_second(0).unwrap_or(seg.start);
+        let end_trunc = seg.end.with_second(0).unwrap_or(seg.end);
+        let total_work_mins = (end_trunc - start_trunc).num_minutes().max(1) as f64;
 
         while current <= end_date {
             let day_start = if current == seg.start.date() {
@@ -193,7 +370,10 @@ pub fn split_segments_by_day(segments: &[WorkSegment]) -> Vec<DailyWorkSegment> 
                     .unwrap()
             };
 
-            let work_mins = (day_end - day_start).num_minutes() as i32;
+            // 秒を切り捨ててHH:MM精度に揃える（web地球号互換）
+            let day_start_trunc = day_start.with_second(0).unwrap_or(day_start);
+            let day_end_trunc = day_end.with_second(0).unwrap_or(day_end);
+            let work_mins = (day_end_trunc - day_start_trunc).num_minutes() as i32;
             if work_mins <= 0 {
                 current += chrono::Duration::days(1);
                 continue;

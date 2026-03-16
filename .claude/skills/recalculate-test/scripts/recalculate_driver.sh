@@ -38,19 +38,12 @@ print(jwt.encode({
 }, '$JWT_SECRET', algorithm='HS256'))
 ")
 
-# 3. Check server
-if ! curl -s -o /dev/null -w '' http://localhost:8080/health 2>/dev/null; then
-  echo "Server not running on :8080. Starting..."
-  cargo build 2>&1 | tail -2
-  source .env && cargo run &
-  sleep 5
-fi
-
-# 4. Call recalculate-driver
-echo "Recalculating driver $DRIVER_CD for $YEAR-$MONTH..."
+# 3. Call recalculate-driver (Cloud Run)
+API_BASE="${API_BASE:-https://daiun-salary-747065218280.asia-northeast1.run.app}"
+echo "Recalculating driver $DRIVER_CD for $YEAR-$MONTH... ($API_BASE)"
 timeout 300 curl -s -N -X POST \
   -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/api/recalculate-driver?year=$YEAR&month=$MONTH&driver_id=$DRIVER_ID" 2>&1
+  "$API_BASE/api/recalculate-driver?year=$YEAR&month=$MONTH&driver_id=$DRIVER_ID" 2>&1
 
 echo ""
 

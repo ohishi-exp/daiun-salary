@@ -596,9 +596,12 @@ async fn calculate_daily_hours(
                     };
                     let day_distance = total_distance * ratio;
 
-                    // 始業ベースのワークデイに帰属（カレンダー日ではなく）
-                    let work_date = unko_work_date.get(&row.unko_no)
-                        .copied()
+                    // work_date: 各DailyWorkSegmentが属するWorkSegment(休息分割後)の開始日を使用
+                    // → 日跨ぎ(00:00分割)は親セグメントの開始日に帰属
+                    // → 休息で分割された場合は新しいセグメントの開始日に帰属
+                    let work_date = segments.iter()
+                        .find(|seg| ds.start >= seg.start && ds.start < seg.end)
+                        .map(|seg| seg.start.date())
                         .unwrap_or(ds.date);
                     let entry = day_map
                         .entry((row.driver_cd.clone(), work_date))

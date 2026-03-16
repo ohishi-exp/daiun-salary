@@ -723,26 +723,22 @@ async fn calculate_daily_hours(
             let mut day_break: HashMap<chrono::NaiveDate, i32> = HashMap::new();
             let mut day_late_night: HashMap<chrono::NaiveDate, i32> = HashMap::new();
 
-            // day_mapからunko_no→work_datesマッピングを構築（イベント帰属用）
-            let mut unko_work_dates: HashMap<&str, Vec<(chrono::NaiveDate, chrono::NaiveDateTime, chrono::NaiveDateTime)>> = HashMap::new();
-            for ((dc, wd), agg) in &day_map {
-                if dc != driver_cd { continue; }
-                for seg in &agg.segments {
-                    unko_work_dates.entry(&seg.unko_no).or_default().push((*wd, seg.start_at, seg.end_at));
-                }
-            }
-
             for unko_no in unko_nos {
                 if let Some(events) = kudgivt_by_unko.get(unko_no) {
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
-                        // イベントの帰属日 = イベントが属するセグメントのwork_date
-                        let event_date = unko_work_dates.get(unko_no.as_str())
-                            .and_then(|wds| wds.iter()
-                                .find(|(_, start, end)| evt.start_at >= *start && evt.start_at < *end)
-                                .map(|(wd, _, _)| *wd))
-                            .unwrap_or(evt.start_at.date());
+                        // イベントの帰属日: day_mapにカレンダー日のエントリがあればそれを使用
+                        // なければ前日を試す（夜行運行で0時跨ぎの場合）
+                        let cal_date = evt.start_at.date();
+                        let prev_date = cal_date - chrono::Duration::days(1);
+                        let event_date = if day_map.contains_key(&(driver_cd.clone(), cal_date)) {
+                            cal_date
+                        } else if day_map.contains_key(&(driver_cd.clone(), prev_date)) {
+                            prev_date
+                        } else {
+                            cal_date
+                        };
                         let cls = classifications.get(&evt.event_cd);
                         match cls {
                             Some(EventClass::Drive) => {

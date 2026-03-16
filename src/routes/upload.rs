@@ -724,15 +724,13 @@ async fn calculate_daily_hours(
             let mut day_late_night: HashMap<chrono::NaiveDate, i32> = HashMap::new();
 
             for unko_no in unko_nos {
-                // 始業ベースのワークデイを取得
-                let attr_date = unko_work_date.get(unko_no)
-                    .copied();
                 if let Some(events) = kudgivt_by_unko.get(unko_no) {
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
-                        // イベントの帰属日 = 運行のワークデイ（始業ベース）
-                        let event_date = attr_date.unwrap_or(evt.start_at.date());
+                        // イベントの帰属日 = イベント開始日（カレンダー日）
+                        // day_mapのキーはWorkSegment基準の開始日なのでカレンダー日とマッチ
+                        let event_date = evt.start_at.date();
                         let cls = classifications.get(&evt.event_cd);
                         match cls {
                             Some(EventClass::Drive) => {

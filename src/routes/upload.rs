@@ -753,9 +753,10 @@ async fn calculate_daily_hours(
         }
 
         for (driver_cd, unko_nos) in &driver_unko_map {
-            let mut day_drive: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
-            let mut day_cargo: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
-            let mut day_break: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
+            // 秒単位で合算し、最後に分変換（区間時間の切り上げ端数を排除）
+            let mut day_drive_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> = HashMap::new();
+            let mut day_cargo_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> = HashMap::new();
+            let mut day_break_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> = HashMap::new();
             let mut day_late_night: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
 
             for unko_no in unko_nos {
@@ -763,6 +764,8 @@ async fn calculate_daily_hours(
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
+                        // 実秒数を計算（start_at→end_at）
+                        let dur_secs = (evt.start_at + chrono::Duration::minutes(dur as i64) - evt.start_at).num_seconds().max(0);
                         // イベントの帰属日: セグメントのタイムスタンプ範囲で判定
                         // 休息ギャップ中のイベントは直後のセグメントに帰属させる
                         let (event_date, event_start_time) = unko_segments.get(unko_no)
@@ -784,13 +787,13 @@ async fn calculate_daily_hours(
                         let cls = classifications.get(&evt.event_cd);
                         match cls {
                             Some(EventClass::Drive) => {
-                                *day_drive.entry((event_date, event_start_time)).or_insert(0) += dur;
+                                *day_drive_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
                             }
                             Some(EventClass::Cargo) => {
-                                *day_cargo.entry((event_date, event_start_time)).or_insert(0) += dur;
+                                *day_cargo_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
                             }
                             Some(EventClass::Break) => {
-                                *day_break.entry((event_date, event_start_time)).or_insert(0) += dur;
+                                *day_break_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
                             }
                             _ => {}
                         }
@@ -809,24 +812,25 @@ async fn calculate_daily_hours(
                 }
             }
 
-            for ((date, st), drive) in &day_drive {
+            // 秒合計→分変換してday_mapに書き込み
+            for ((date, st), secs) in &day_drive_secs {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    agg.drive_minutes = *drive;
+                    agg.drive_minutes = (*secs / 60) as i32;
                 }
             }
-            for ((date, st), cargo) in &day_cargo {
+            for ((date, st), secs) in &day_cargo_secs {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    agg.cargo_minutes = *cargo;
+                    agg.cargo_minutes = (*secs / 60) as i32;
                 }
             }
-            // total_work_minutes(拘束時間小計)をイベントduration_minutes合計で上書き
-            // 小計 = Σ運転 + Σ荷役 + Σ休憩（フェリーは後段で控除）
-            for ((date, st), _) in day_drive.iter().chain(day_cargo.iter()).chain(day_break.iter()) {
+            // total_work_minutes(拘束時間小計) = (drive_secs + cargo_secs + break_secs) / 60
+            // 秒合計してから分変換で端数を排除（フェリーは後段で控除）
+            for ((date, st), _) in day_drive_secs.iter().chain(day_cargo_secs.iter()).chain(day_break_secs.iter()) {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    let d = day_drive.get(&(*date, *st)).copied().unwrap_or(0);
-                    let c = day_cargo.get(&(*date, *st)).copied().unwrap_or(0);
-                    let b = day_break.get(&(*date, *st)).copied().unwrap_or(0);
-                    agg.total_work_minutes = d + c + b;
+                    let d = day_drive_secs.get(&(*date, *st)).copied().unwrap_or(0);
+                    let c = day_cargo_secs.get(&(*date, *st)).copied().unwrap_or(0);
+                    let b = day_break_secs.get(&(*date, *st)).copied().unwrap_or(0);
+                    agg.total_work_minutes = ((d + c + b) / 60) as i32;
                 }
             }
             // 深夜時間をイベントベース(Drive/Cargo during 22:00-05:00)で上書き

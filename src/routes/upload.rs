@@ -454,7 +454,9 @@ async fn load_ferry_minutes(
                         chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S").ok()
                             .or_else(|| chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()),
                     ) {
-                        let mins = (end - start).num_minutes() as i32;
+                        // フェリー時間は秒を切り上げ（web地球号互換）
+                        let secs = (end - start).num_seconds();
+                        let mins = ((secs + 59) / 60) as i32; // ceiling
                         if mins > 0 {
                             total_ferry += mins;
                             tracing::debug!("Ferry {}: {}min ({} → {})", unko_no, mins, start, end);

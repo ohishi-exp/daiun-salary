@@ -429,6 +429,7 @@ mod tests {
             driver_name: "テスト".to_string(),
             crew_role: 1,
             start_at,
+            end_at: duration.map(|d| start_at + chrono::Duration::minutes(d as i64)),
             event_cd: event_cd.to_string(),
             event_name: "test".to_string(),
             duration_minutes: duration,

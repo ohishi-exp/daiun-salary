@@ -764,8 +764,7 @@ async fn calculate_daily_hours(
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
-                        // 実秒数を計算（start_at→end_at）
-                        let dur_secs = (evt.start_at + chrono::Duration::minutes(dur as i64) - evt.start_at).num_seconds().max(0);
+                        let dur_secs = dur as i64 * 60;
                         // イベントの帰属日: セグメントのタイムスタンプ範囲で判定
                         // 休息ギャップ中のイベントは直後のセグメントに帰属させる
                         let (event_date, event_start_time) = unko_segments.get(unko_no)
@@ -880,20 +879,7 @@ async fn calculate_daily_hours(
             }
         }
 
-        // total_work_minutes: 拘束時間小計 = セグメント壁時計合計 - フェリー乗船時間
-        // セグメントは休息(302)で分割済みなので休息時間は既に除外されている
-        // フェリー時間はKUDGFRYから取得し、運行単位で控除する
-        for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
-            let mut ferry_deduction = 0i32;
-            for unko in &agg.unko_nos {
-                if let Some(&fm) = ferry_minutes.get(unko) {
-                    ferry_deduction += fm;
-                }
-            }
-            if ferry_deduction > 0 {
-                agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
-            }
-        }
+        // フェリー控除はoverlap計算後（DB書き込み直前）に移動
     }
 
     // 3.6. 24時間窓ベースの重複時間を計算（KUDGIVTイベント直接集計）
@@ -1102,6 +1088,20 @@ async fn calculate_daily_hours(
             .bind(&all_unko_nos)
             .execute(&state.pool)
             .await?;
+        }
+    }
+
+    // フェリー控除（overlap計算後、DB書き込み直前）
+    // total_work_minutes(拘束時間小計)からフェリー乗船時間を控除
+    for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
+        let mut ferry_deduction = 0i32;
+        for unko in &agg.unko_nos {
+            if let Some(&fm) = ferry_minutes.get(unko) {
+                ferry_deduction += fm;
+            }
+        }
+        if ferry_deduction > 0 {
+            agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
         }
     }
 

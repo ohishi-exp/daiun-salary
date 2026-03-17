@@ -556,6 +556,7 @@ pub fn process_zip(
     }
 
     // ---- DayAgg: 日別集計 ----
+    #[derive(Clone)]
     struct DayAgg {
         total_work_minutes: i32,
         late_night_minutes: i32,
@@ -1294,6 +1295,93 @@ pub fn process_zip(
             agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
             agg.drive_minutes =
                 (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
+        }
+    }
+
+    // ---- 同一日の異なる運行エントリを構内結合 ----
+    // 条件: 異なる運行 + 短ギャップ(< 180分) → 構内時間として結合
+    {
+        let keys: Vec<_> = day_map.keys().cloned().collect();
+        let mut driver_date_keys: HashMap<(String, NaiveDate), Vec<(String, NaiveDate, NaiveTime)>> =
+            HashMap::new();
+        for (dc, d, st) in &keys {
+            driver_date_keys
+                .entry((dc.clone(), *d))
+                .or_default()
+                .push((dc.clone(), *d, *st));
+        }
+
+        for ((_dc, _d), mut entries) in driver_date_keys {
+            if entries.len() < 2 {
+                continue;
+            }
+            entries.sort_by_key(|(_, _, st)| *st);
+
+            // ペアごとに結合判定
+            let mut merged_any = true;
+            while merged_any {
+                merged_any = false;
+                for i in 0..entries.len().saturating_sub(1) {
+                    let key_a = entries[i].clone();
+                    let key_b = entries[i + 1].clone();
+                    // 結合判定に必要な情報を先に取得
+                    let merge_info = {
+                        let agg_a = match day_map.get(&key_a) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let agg_b = match day_map.get(&key_b) {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        let different_ops =
+                            !agg_a.unko_nos.iter().any(|u| agg_b.unko_nos.contains(u));
+                        let gap_info = match (
+                            agg_a.segments.iter().map(|s| s.end_at).max(),
+                            agg_b.segments.iter().map(|s| s.start_at).min(),
+                        ) {
+                            (Some(pe), Some(ns)) => {
+                                let gap = (ns - pe).num_minutes();
+                                if gap >= 0 && gap < 180 {
+                                    Some(gap as i32)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        if different_ops {
+                            gap_info
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(gap_mins) = merge_info {
+                        // agg_b を agg_a に結合
+                        let b_clone = day_map.get(&key_b).unwrap().clone();
+                        let agg_a_mut = day_map.get_mut(&key_a).unwrap();
+                        agg_a_mut.drive_minutes += b_clone.drive_minutes;
+                        agg_a_mut.cargo_minutes += b_clone.cargo_minutes;
+                        agg_a_mut.total_work_minutes += b_clone.total_work_minutes + gap_mins;
+                        agg_a_mut.late_night_minutes += b_clone.late_night_minutes;
+                        agg_a_mut.overlap_drive_minutes += b_clone.overlap_drive_minutes;
+                        agg_a_mut.overlap_cargo_minutes += b_clone.overlap_cargo_minutes;
+                        agg_a_mut.overlap_break_minutes += b_clone.overlap_break_minutes;
+                        agg_a_mut.overlap_restraint_minutes += b_clone.overlap_restraint_minutes;
+                        agg_a_mut.ot_late_night_minutes += b_clone.ot_late_night_minutes;
+                        agg_a_mut.segments.extend(b_clone.segments);
+                        for u in &b_clone.unko_nos {
+                            if !agg_a_mut.unko_nos.contains(u) {
+                                agg_a_mut.unko_nos.push(u.clone());
+                            }
+                        }
+                        day_map.remove(&key_b);
+                        entries.remove(i + 1);
+                        merged_any = true;
+                        break;
+                    }
+                }
+            }
         }
     }
 

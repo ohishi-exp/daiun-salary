@@ -1237,10 +1237,20 @@ pub fn process_zip(
                     None => true,
                 };
                 if reset {
-                    effective_start = Some(info.start);
-                    // resetされた場合、前のmergeで設定された24h境界を削除
-                    // （独立した始業として元のworkday境界を使用）
-                    workday_boundaries.remove(&(driver_cd.clone(), date, st));
+                    let key = (driver_cd.clone(), date, st);
+                    if let Some(&(wb_start, _)) = workday_boundaries.get(&key) {
+                        // merge由来の24h境界がある → chain最終日
+                        // effective_startは24h境界から（window計算に使用）
+                        effective_start = Some(wb_start);
+                        // endは実際のsegment endに更新
+                        let seg_end = day_map
+                            .get(&key)
+                            .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
+                            .unwrap_or(info.end);
+                        workday_boundaries.insert(key, (wb_start, seg_end));
+                    } else {
+                        effective_start = Some(info.start);
+                    }
                 } else {
                     effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
                 }

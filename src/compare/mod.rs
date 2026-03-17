@@ -378,6 +378,7 @@ fn default_classifications() -> HashMap<String, EventClass> {
     m.insert("201".to_string(), EventClass::Drive);
     m.insert("202".to_string(), EventClass::Cargo);
     m.insert("203".to_string(), EventClass::Cargo);
+    m.insert("204".to_string(), EventClass::Cargo); // その他 → 荷役
     m.insert("302".to_string(), EventClass::RestSplit);
     m.insert("301".to_string(), EventClass::Break);
     m
@@ -567,6 +568,7 @@ pub fn process_zip(
         overlap_break_minutes: i32,
         overlap_restraint_minutes: i32,
         ot_late_night_minutes: i32,
+        from_multi_op: bool,
     }
     #[derive(Clone)]
     struct SegRec {
@@ -626,6 +628,7 @@ pub fn process_zip(
                     overlap_break_minutes: 0,
                     overlap_restraint_minutes: 0,
                     ot_late_night_minutes: 0,
+                    from_multi_op: false,
                 });
             entry.total_work_minutes += total_drive_mins;
             entry.unko_nos.push(row.unko_no.clone());
@@ -729,6 +732,7 @@ pub fn process_zip(
                             overlap_break_minutes: 0,
                             overlap_restraint_minutes: 0,
                             ot_late_night_minutes: 0,
+                    from_multi_op: false,
                         });
                     entry.total_work_minutes += ds.work_minutes;
                     entry.late_night_minutes += ds.late_night_minutes;
@@ -753,22 +757,34 @@ pub fn process_zip(
             let merged_ret = valid_ops.iter().filter_map(|r| r.return_at).max().unwrap();
 
             let merged_dep_trunc = trunc_min(merged_dep);
-            let boundary_24h = merged_dep_trunc + chrono::Duration::hours(24);
-            let mut virtual_workdays: Vec<Workday> = vec![Workday {
-                date: merged_dep.date(),
-                start: merged_dep,
-                end: boundary_24h.min(merged_ret),
-            }];
-            if merged_ret > boundary_24h {
+            // 24h単位でvirtual workdayを生成（3日以上のスパンに対応）
+            let mut virtual_workdays: Vec<Workday> = Vec::new();
+            let mut boundaries_24h: Vec<NaiveDateTime> = Vec::new();
+            let mut boundary = merged_dep_trunc;
+            loop {
+                let next_boundary = boundary + chrono::Duration::hours(24);
+                let wd_start = if virtual_workdays.is_empty() {
+                    merged_dep
+                } else {
+                    boundary
+                };
+                let wd_end = next_boundary.min(merged_ret);
                 virtual_workdays.push(Workday {
-                    date: boundary_24h.date(),
-                    start: boundary_24h,
-                    end: merged_ret,
+                    date: wd_start.date(),
+                    start: wd_start,
+                    end: wd_end,
                 });
+                boundaries_24h.push(next_boundary);
+                if wd_end >= merged_ret {
+                    break;
+                }
+                boundary = next_boundary;
             }
 
             for row in &valid_ops {
-                multi_op_boundaries.insert(row.unko_no.clone(), boundary_24h);
+                // 最初の24h境界をlegacy互換で保存
+                multi_op_boundaries
+                    .insert(row.unko_no.clone(), boundaries_24h[0]);
             }
 
             let driver_cd = &valid_ops[0].driver_cd;
@@ -805,7 +821,10 @@ pub fn process_zip(
                 let segments =
                     work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
                 let segments = work_segments::split_segments_at_24h(segments);
-                let segments = split_work_segments_at_boundary(segments, boundary_24h);
+                let mut segments = segments;
+                for &b in &boundaries_24h {
+                    segments = split_work_segments_at_boundary(segments, b);
+                }
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 
                 let seg_entries: Vec<_> = segments
@@ -838,7 +857,9 @@ pub fn process_zip(
                             overlap_break_minutes: 0,
                             overlap_restraint_minutes: 0,
                             ot_late_night_minutes: 0,
+                            from_multi_op: true,
                         });
+                    entry.from_multi_op = true;
                     entry.total_work_minutes += ds.work_minutes;
                     entry.late_night_minutes += ds.late_night_minutes;
                     entry.drive_minutes += ds.drive_minutes;
@@ -1051,17 +1072,7 @@ pub fn process_zip(
             for (idx, &(date, st)) in dates.iter().enumerate() {
                 let info = &dates_map[&(date, st)];
 
-                let reset = match prev_end {
-                    Some(pe) => (info.start - pe).num_minutes() >= 480,
-                    None => true,
-                };
-                if reset {
-                    effective_start = Some(info.start);
-                    next_day_deduction = None;
-                } else {
-                    effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
-                }
-
+                // deductionは先に適用（resetで消される前に）
                 if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) =
                     next_day_deduction.take()
                 {
@@ -1071,6 +1082,16 @@ pub fn process_zip(
                         agg.total_work_minutes = (agg.total_work_minutes - ded_restraint).max(0);
                         agg.late_night_minutes = (agg.late_night_minutes - ded_night).max(0);
                     }
+                }
+
+                let reset = match prev_end {
+                    Some(pe) => (info.start - pe).num_minutes() >= 480,
+                    None => true,
+                };
+                if reset {
+                    effective_start = Some(info.start);
+                } else {
+                    effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
                 }
 
                 let window_end = effective_start.unwrap() + chrono::Duration::hours(24);
@@ -1140,7 +1161,14 @@ pub fn process_zip(
                     }
 
                     let next_gap = (next_info.start - info.end).num_minutes();
-                    let next_resets = next_gap >= 480;
+                    // multi-op由来のエントリは540閾値（同一workday内の24h分割）
+                    // 通常エントリは480閾値
+                    let is_multi_op = day_map
+                        .get(&(driver_cd.clone(), date, st))
+                        .map(|a| a.from_multi_op)
+                        .unwrap_or(false);
+                    let rest_threshold = if is_multi_op { 540 } else { 480 };
+                    let next_resets = next_gap >= rest_threshold;
 
                     if !next_resets && ol_restraint > 0 {
                         let ol_late_night = calc_late_night_mins(next_info.start, window_end);

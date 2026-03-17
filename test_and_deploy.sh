@@ -41,10 +41,18 @@ echo "  OK"
 
 if [ "$SKIP_COMPARE" = false ]; then
     echo ""
-    echo "=== Step 4/4: CSV比較 (ZIP→計算→参照CSV) ==="
+    echo "=== Step 4/5: CSV比較 (1018/1021/1026) ==="
     cargo run --bin compare -- \
         "test_data/csvdata-202602-1018-1021-1026.zip" \
         "test_data/拘束時間管理表_202602-1018-1021-1026.csv" \
+        --json | tail -5
+    echo "  OK（差分なし）"
+
+    echo ""
+    echo "=== Step 5/5: CSV比較 (1029/1032/1036/1037) ==="
+    cargo run --bin compare -- \
+        "test_data/csvdata-202602-1029-1032-1036-1037.zip" \
+        "test_data/拘束時間管理表_202602-1029-1032-1036-1037.csv" \
         --json | tail -5
     echo "  OK（差分なし）"
 else

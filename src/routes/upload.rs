@@ -1714,6 +1714,7 @@ fn default_classification(event_cd: &str) -> (&'static str, EventClass) {
         "201" => ("drive", EventClass::Drive),          // 走行(運転)
         "202" => ("cargo", EventClass::Cargo),          // 積み
         "203" => ("cargo", EventClass::Cargo),          // 降し
+        "204" => ("cargo", EventClass::Cargo),          // その他 → 荷役
         "302" => ("rest_split", EventClass::RestSplit), // 休息
         "301" => ("break", EventClass::Break),          // 休憩
         _ => ("ignore", EventClass::Ignore),            // その他は無視

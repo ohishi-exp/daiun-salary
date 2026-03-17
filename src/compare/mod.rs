@@ -1215,6 +1215,7 @@ pub fn process_zip(
             let mut effective_start: Option<NaiveDateTime> = None;
             let mut prev_end: Option<NaiveDateTime> = None;
             let mut next_day_deduction: Option<(i32, i32, i32, i32)> = None;
+            let mut split_rests: Vec<i32> = Vec::new();
 
             for (idx, &(date, st)) in dates.iter().enumerate() {
                 let info = &dates_map[&(date, st)];
@@ -1318,14 +1319,40 @@ pub fn process_zip(
                     }
 
                     let next_gap = (next_info.start - info.end).num_minutes();
-                    // multi-op由来のエントリは540閾値（同一workday内の24h分割）
-                    // 通常エントリは480閾値
-                    let is_multi_op = day_map
-                        .get(&(driver_cd.clone(), date, st))
-                        .map(|a| a.from_multi_op)
-                        .unwrap_or(false);
-                    let rest_threshold = if is_multi_op { 540 } else { 480 };
-                    let next_resets = next_gap >= rest_threshold;
+                    // 長距離判定: 現在or次のエントリの運行が日跨ぎ（宿泊伴う）なら480（例外）、
+                    // それ以外は540（原則）
+                    let is_long_distance = {
+                        let check_unko = |unko_nos: &[String]| -> bool {
+                            unko_nos.iter().any(|u| {
+                                kudguri_rows.iter().any(|r| {
+                                    r.unko_no == *u
+                                        && r.departure_at
+                                            .zip(r.return_at)
+                                            .map(|(dep, ret)| dep.date() != ret.date())
+                                            .unwrap_or(false)
+                                })
+                            })
+                        };
+                        check_unko(&info.unko_nos) || check_unko(&next_info.unko_nos)
+                    };
+                    let rest_threshold = if is_long_distance { 480 } else { 540 };
+                    let mut next_resets = next_gap >= rest_threshold;
+                    // 分割特例: 180分以上の休息を蓄積して判定
+                    if !next_resets && next_gap >= 180 {
+                        split_rests.push(next_gap as i32);
+                        let total: i32 = split_rests.iter().sum();
+                        let threshold = match split_rests.len() {
+                            2 => 600,
+                            n if n >= 3 => 720,
+                            _ => i32::MAX,
+                        };
+                        if total >= threshold {
+                            next_resets = true;
+                            split_rests.clear();
+                        }
+                    } else if next_resets {
+                        split_rests.clear();
+                    }
 
                     // 同日かつ長めのgap(≥180分)は重複表示（24h境界の分割）
                     let same_date_long_gap = date == next_date && next_gap >= 180;

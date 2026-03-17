@@ -668,11 +668,6 @@ pub fn process_zip(
                 let events = kudgivt_by_unko.get(&row.unko_no);
                 let event_slice: Vec<&KudgivtRow> = events.map(|e| e.to_vec()).unwrap_or_default();
 
-                let segments =
-                    work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
-                let segments = work_segments::split_segments_at_24h(segments);
-                let daily_segments = work_segments::split_segments_by_day(&segments);
-
                 let rest_events_for_unko: Vec<(NaiveDateTime, i32)> = event_slice
                     .iter()
                     .filter(|e| classifications.get(&e.event_cd) == Some(&EventClass::RestSplit))
@@ -683,6 +678,35 @@ pub fn process_zip(
                     })
                     .collect();
                 let workdays = work_segments::determine_workdays(&rest_events_for_unko, dep, ret);
+
+                let segments =
+                    work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
+                let segments = work_segments::split_segments_at_24h(segments);
+                // workday境界でセグメントを分割（長距離運行の24hルール対応）
+                // 条件: 3日以上スパン、分割後の両パートが60分以上
+                let span_days = (ret.date() - dep.date()).num_days();
+                let segments = if span_days >= 3 && workdays.len() >= 2 {
+                    let mut segs = segments;
+                    for wd in &workdays {
+                        if wd.end < ret {
+                            let sig_split = segs.iter().any(|seg| {
+                                seg.start < wd.end
+                                    && wd.end < seg.end
+                                    && (wd.end - seg.start).num_minutes() >= 180
+                                    && (seg.end - wd.end).num_minutes() >= 180
+                            });
+                            if sig_split {
+                                segs = split_work_segments_at_boundary(segs, wd.end);
+                                multi_op_boundaries
+                                    .insert(row.unko_no.clone(), wd.end);
+                            }
+                        }
+                    }
+                    segs
+                } else {
+                    segments
+                };
+                let daily_segments = work_segments::split_segments_by_day(&segments);
 
                 for wd in &workdays {
                     workday_boundaries.insert(

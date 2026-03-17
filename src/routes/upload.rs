@@ -1975,121 +1975,158 @@ async fn recalculate_drivers_batch(
         };
 
         let fetch_end = month_end + chrono::Duration::days(1);
+        let all_kudgivt = std::sync::Arc::new(all_kudgivt);
 
-        for (i, driver_id) in driver_ids.iter().enumerate() {
-            // driver_cd取得
-            let driver_cd: Option<String> = match sqlx::query_scalar(
-                "SELECT driver_cd FROM drivers WHERE id = $1 AND tenant_id = $2",
-            )
-            .bind(driver_id)
-            .bind(tenant_id)
-            .fetch_optional(&state.pool)
-            .await
-            {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            let Some(driver_cd) = driver_cd else {
-                continue;
-            };
+        // 5並列で処理、10人ごとにSSE通知
+        let done_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let error_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-            send(serde_json::json!({
-                "event": "driver_start",
-                "current": i + 1,
-                "total": total_drivers,
-                "driver_cd": &driver_cd
-            }))
-            .await;
+        use futures::StreamExt;
+        let chunks: Vec<Vec<Uuid>> = driver_ids.chunks(10).map(|c| c.to_vec()).collect();
 
-            // operations取得
-            #[derive(sqlx::FromRow)]
-            struct OpRow {
-                unko_no: String,
-                reading_date: chrono::NaiveDate,
-                operation_date: Option<chrono::NaiveDate>,
-                departure_at: Option<chrono::DateTime<chrono::Utc>>,
-                return_at: Option<chrono::DateTime<chrono::Utc>>,
-                total_distance: Option<f64>,
-                drive_time_general: Option<i32>,
-                drive_time_highway: Option<i32>,
-                drive_time_bypass: Option<i32>,
-            }
-
-            let op_rows = match sqlx::query_as::<_, OpRow>(
-                r#"SELECT DISTINCT o.unko_no, o.reading_date, o.operation_date,
-                          o.departure_at, o.return_at, o.total_distance,
-                          o.drive_time_general, o.drive_time_highway, o.drive_time_bypass
-                   FROM operations o
-                   WHERE o.tenant_id = $1 AND o.driver_id = $2
-                     AND (o.operation_date >= $3 AND o.operation_date <= $4
-                          OR o.reading_date >= $3 AND o.reading_date <= $4)
-                   ORDER BY o.reading_date, o.unko_no"#,
-            )
-            .bind(tenant_id)
-            .bind(driver_id)
-            .bind(month_start)
-            .bind(fetch_end)
-            .fetch_all(&state.pool)
-            .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    send(serde_json::json!({"event":"driver_error","driver_cd":&driver_cd,"message":format!("{e}")})).await;
-                    continue;
-                }
-            };
-
-            let ops: Vec<KudguriRow> = op_rows
+        for chunk in chunks {
+            let futs: Vec<_> = chunk
                 .iter()
-                .map(|r| KudguriRow {
-                    unko_no: r.unko_no.clone(),
-                    reading_date: r.reading_date,
-                    operation_date: r.operation_date,
-                    office_cd: String::new(),
-                    office_name: String::new(),
-                    vehicle_cd: String::new(),
-                    vehicle_name: String::new(),
-                    driver_cd: driver_cd.clone(),
-                    driver_name: String::new(),
-                    crew_role: 0,
-                    departure_at: r.departure_at.map(|dt| dt.naive_utc()),
-                    return_at: r.return_at.map(|dt| dt.naive_utc()),
-                    garage_out_at: None,
-                    garage_in_at: None,
-                    meter_start: None,
-                    meter_end: None,
-                    total_distance: r.total_distance,
-                    drive_time_general: r.drive_time_general,
-                    drive_time_highway: r.drive_time_highway,
-                    drive_time_bypass: r.drive_time_bypass,
-                    safety_score: None,
-                    economy_score: None,
-                    total_score: None,
-                    raw_data: serde_json::Value::Null,
+                .map(|driver_id| {
+                    let state = state.clone();
+                    let all_kudgivt = all_kudgivt.clone();
+                    let done_count = done_count.clone();
+                    let error_count = error_count.clone();
+                    let driver_id = *driver_id;
+                    async move {
+                        // driver_cd取得
+                        let driver_cd: Option<String> = sqlx::query_scalar(
+                            "SELECT driver_cd FROM drivers WHERE id = $1 AND tenant_id = $2",
+                        )
+                        .bind(driver_id)
+                        .bind(tenant_id)
+                        .fetch_optional(&state.pool)
+                        .await
+                        .ok()
+                        .flatten();
+                        let Some(driver_cd) = driver_cd else {
+                            error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        };
+
+                        #[derive(sqlx::FromRow)]
+                        struct OpRow {
+                            unko_no: String,
+                            reading_date: chrono::NaiveDate,
+                            operation_date: Option<chrono::NaiveDate>,
+                            departure_at: Option<chrono::DateTime<chrono::Utc>>,
+                            return_at: Option<chrono::DateTime<chrono::Utc>>,
+                            total_distance: Option<f64>,
+                            drive_time_general: Option<i32>,
+                            drive_time_highway: Option<i32>,
+                            drive_time_bypass: Option<i32>,
+                        }
+
+                        let op_rows = sqlx::query_as::<_, OpRow>(
+                            r#"SELECT DISTINCT o.unko_no, o.reading_date, o.operation_date,
+                                      o.departure_at, o.return_at, o.total_distance,
+                                      o.drive_time_general, o.drive_time_highway, o.drive_time_bypass
+                               FROM operations o
+                               WHERE o.tenant_id = $1 AND o.driver_id = $2
+                                 AND (o.operation_date >= $3 AND o.operation_date <= $4
+                                      OR o.reading_date >= $3 AND o.reading_date <= $4)
+                               ORDER BY o.reading_date, o.unko_no"#,
+                        )
+                        .bind(tenant_id)
+                        .bind(driver_id)
+                        .bind(month_start)
+                        .bind(fetch_end)
+                        .fetch_all(&state.pool)
+                        .await;
+
+                        let op_rows = match op_rows {
+                            Ok(o) => o,
+                            Err(_) => {
+                                error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        };
+
+                        let ops: Vec<KudguriRow> = op_rows
+                            .iter()
+                            .map(|r| KudguriRow {
+                                unko_no: r.unko_no.clone(),
+                                reading_date: r.reading_date,
+                                operation_date: r.operation_date,
+                                office_cd: String::new(),
+                                office_name: String::new(),
+                                vehicle_cd: String::new(),
+                                vehicle_name: String::new(),
+                                driver_cd: driver_cd.clone(),
+                                driver_name: String::new(),
+                                crew_role: 0,
+                                departure_at: r.departure_at.map(|dt| dt.naive_utc()),
+                                return_at: r.return_at.map(|dt| dt.naive_utc()),
+                                garage_out_at: None,
+                                garage_in_at: None,
+                                meter_start: None,
+                                meter_end: None,
+                                total_distance: r.total_distance,
+                                drive_time_general: r.drive_time_general,
+                                drive_time_highway: r.drive_time_highway,
+                                drive_time_bypass: r.drive_time_bypass,
+                                safety_score: None,
+                                economy_score: None,
+                                total_score: None,
+                                raw_data: serde_json::Value::Null,
+                            })
+                            .collect();
+
+                        let ferry_minutes = load_ferry_minutes(&state, tenant_id, &ops).await;
+
+                        match calculate_daily_hours(
+                            &state,
+                            tenant_id,
+                            &ops,
+                            &all_kudgivt,
+                            &ferry_minutes,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                done_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
                 })
                 .collect();
 
-            let ferry_minutes = load_ferry_minutes(&state, tenant_id, &ops).await;
+            // 5並列で実行
+            futures::StreamExt::collect::<Vec<()>>(futures::stream::iter(futs).buffer_unordered(5))
+                .await;
 
-            match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, &ferry_minutes, None)
-                .await
-            {
-                Ok(()) => {
-                    send(serde_json::json!({
-                        "event": "driver_done",
-                        "current": i + 1,
-                        "total": total_drivers,
-                        "driver_cd": &driver_cd
-                    }))
-                    .await;
-                }
-                Err(e) => {
-                    send(serde_json::json!({"event":"driver_error","driver_cd":&driver_cd,"message":format!("{e}")})).await;
-                }
-            }
+            // チャンク（10人）完了ごとにSSE通知
+            let done = done_count.load(std::sync::atomic::Ordering::Relaxed);
+            let errors = error_count.load(std::sync::atomic::Ordering::Relaxed);
+            send(serde_json::json!({
+                "event": "progress",
+                "current": done + errors,
+                "total": total_drivers,
+                "done": done,
+                "errors": errors,
+                "step": "calculate"
+            }))
+            .await;
         }
 
-        send(serde_json::json!({"event":"batch_done","total":total_drivers})).await;
+        let done = done_count.load(std::sync::atomic::Ordering::Relaxed);
+        let errors = error_count.load(std::sync::atomic::Ordering::Relaxed);
+        send(serde_json::json!({
+            "event": "batch_done",
+            "total": total_drivers,
+            "done": done,
+            "errors": errors
+        }))
+        .await;
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)

@@ -1137,7 +1137,8 @@ pub fn process_zip(
                             agg_b.segments.iter().map(|s| s.start_at).min(),
                         ) {
                             (Some(pe), Some(ns)) => {
-                                let gap = (ns - pe).num_minutes();
+                                let gap_secs = (ns - pe).num_seconds();
+                                let gap = ((gap_secs + 30) / 60) as i64; // 四捨五入
                                 if gap >= 0 && gap < 180 {
                                     Some(gap as i32)
                                 } else {

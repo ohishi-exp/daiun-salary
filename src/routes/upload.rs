@@ -254,7 +254,7 @@ async fn process_zip(
 
     // 5. Calculate daily_work_hours using KUDGIVT events
     // フェリー時間はCSV分割時にR2のKUDGFRYから取得済み（アップロード時はまだ未保存）
-    let ferry_minutes: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    let ferry_minutes: std::collections::HashMap<String, FerryData> = std::collections::HashMap::new();
     calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows, &ferry_minutes, None).await?;
     tracing::info!("calculate_daily_hours done (tenant={})", tenant_id);
 
@@ -416,16 +416,22 @@ fn group_operations_into_work_days(rows: &[KudguriRow]) -> std::collections::Has
     unko_work_date
 }
 
+/// フェリーデータ（合計分 + 各エントリの開始時刻）
+struct FerryData {
+    total_minutes: i32,
+    start_times: Vec<chrono::NaiveDateTime>,
+}
+
 /// R2のKUDGFRYからフェリー乗船時間(分)を取得
-/// Returns: unko_no → ferry_minutes のマッピング
+/// Returns: unko_no → FerryData のマッピング
 async fn load_ferry_minutes(
     state: &AppState,
     tenant_id: Uuid,
     rows: &[KudguriRow],
-) -> std::collections::HashMap<String, i32> {
+) -> std::collections::HashMap<String, FerryData> {
     use std::collections::HashMap;
 
-    let mut ferry_map: HashMap<String, i32> = HashMap::new();
+    let mut ferry_map: HashMap<String, FerryData> = HashMap::new();
 
     let futures: Vec<_> = rows
         .iter()
@@ -441,10 +447,9 @@ async fn load_ferry_minutes(
 
     for (unko_no, result) in results {
         if let Ok(bytes) = result {
-            // KUDGFRY.csv: col 10=開始日時, col 11=終了日時
-            // フェリー時間 = 終了 - 開始（分）
             let text = crate::csv_parser::decode_shift_jis(&bytes);
             let mut total_ferry = 0i32;
+            let mut start_times = Vec::new();
             for line in text.lines().skip(1) {
                 let cols: Vec<&str> = line.split(',').collect();
                 if cols.len() > 11 {
@@ -454,18 +459,18 @@ async fn load_ferry_minutes(
                         chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S").ok()
                             .or_else(|| chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()),
                     ) {
-                        // フェリー時間は秒を四捨五入（web地球号互換）
                         let secs = (end - start).num_seconds();
                         let mins = ((secs + 30) / 60) as i32;
                         if mins > 0 {
                             total_ferry += mins;
+                            start_times.push(start);
                             tracing::debug!("Ferry {}: {}min ({} → {})", unko_no, mins, start, end);
                         }
                     }
                 }
             }
             if total_ferry > 0 {
-                ferry_map.insert(unko_no, total_ferry);
+                ferry_map.insert(unko_no, FerryData { total_minutes: total_ferry, start_times });
             }
         }
     }
@@ -479,7 +484,7 @@ async fn calculate_daily_hours(
     tenant_id: Uuid,
     rows: &[KudguriRow],
     kudgivt_rows: &[KudgivtRow],
-    ferry_minutes: &std::collections::HashMap<String, i32>,
+    ferry_minutes: &std::collections::HashMap<String, FerryData>,
     progress_tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<(), anyhow::Error> {
     use std::collections::HashMap;
@@ -1105,17 +1110,31 @@ async fn calculate_daily_hours(
     }
 
     // フェリー控除（overlap計算後、DB書き込み直前）
-    // total_work_minutes(拘束時間小計)からフェリー乗船時間を控除
-    // drive_minutesは調整しない（restraint_reportの表示レイヤーで処理）
+    // KUDGFRY開始時刻ごとに最も近い301イベントをマッチし、丸め差をdrive_minutesで吸収
     for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
         let mut ferry_deduction = 0i32;
+        let mut ferry_break_deduction = 0i32;
         for unko in &agg.unko_nos {
-            if let Some(&fm) = ferry_minutes.get(unko) {
-                ferry_deduction += fm;
+            if let Some(fd) = ferry_minutes.get(unko) {
+                ferry_deduction += fd.total_minutes;
+                // 各フェリー開始時刻に最も近い301イベントを個別マッチ
+                if let Some(events) = kudgivt_by_unko.get(unko) {
+                    for ferry_start in &fd.start_times {
+                        let matched_301 = events.iter()
+                            .filter(|e| classifications.get(&e.event_cd) == Some(&EventClass::Break))
+                            .filter(|e| e.duration_minutes.unwrap_or(0) > 0)
+                            .min_by_key(|e| (e.start_at - *ferry_start).num_seconds().abs());
+                        if let Some(evt) = matched_301 {
+                            ferry_break_deduction += evt.duration_minutes.unwrap_or(0);
+                        }
+                    }
+                }
             }
         }
         if ferry_deduction > 0 {
             agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
+            // drive = drive_from_201 - (ferry_KUDGFRY合計 - ferry_301合計)
+            agg.drive_minutes = (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
         }
     }
 

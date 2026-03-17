@@ -107,8 +107,8 @@ impl GoogleTokenVerifier {
         let header = decode_header(id_token).map_err(|_| VerifyError::InvalidToken)?;
         let kid = header.kid.ok_or(VerifyError::InvalidToken)?;
         let key = self.get_key(&kid).await?;
-        let decoding_key =
-            DecodingKey::from_rsa_components(&key.n, &key.e).map_err(|_| VerifyError::InvalidKey)?;
+        let decoding_key = DecodingKey::from_rsa_components(&key.n, &key.e)
+            .map_err(|_| VerifyError::InvalidKey)?;
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[GOOGLE_ISSUER, "accounts.google.com"]);

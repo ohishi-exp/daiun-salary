@@ -147,8 +147,7 @@ pub fn parse_kudguri(csv_text: &str) -> Result<Vec<KudguriRow>, anyhow::Error> {
     let mut lines = csv_text.lines();
     let header_line = lines.next().ok_or_else(|| anyhow::anyhow!("empty CSV"))?;
     let headers: Vec<&str> = header_line.split(',').collect();
-    let col_idx =
-        build_column_index(&headers).map_err(|e| anyhow::anyhow!(e))?;
+    let col_idx = build_column_index(&headers).map_err(|e| anyhow::anyhow!(e))?;
 
     let mut rows = Vec::new();
     for line in lines {
@@ -178,8 +177,7 @@ pub fn parse_kudguri(csv_text: &str) -> Result<Vec<KudguriRow>, anyhow::Error> {
         rows.push(KudguriRow {
             unko_no,
             reading_date,
-            operation_date: get_opt_field(&fields, col_idx.operation_date)
-                .and_then(parse_date),
+            operation_date: get_opt_field(&fields, col_idx.operation_date).and_then(parse_date),
             office_cd: get_field(&fields, col_idx.office_cd).to_string(),
             office_name: get_field(&fields, col_idx.office_name).to_string(),
             vehicle_cd: get_field(&fields, col_idx.vehicle_cd).to_string(),
@@ -187,32 +185,22 @@ pub fn parse_kudguri(csv_text: &str) -> Result<Vec<KudguriRow>, anyhow::Error> {
             driver_cd: get_field(&fields, col_idx.driver_cd).to_string(),
             driver_name: get_field(&fields, col_idx.driver_name).to_string(),
             crew_role,
-            departure_at: get_opt_field(&fields, col_idx.departure_at)
-                .and_then(parse_datetime),
-            return_at: get_opt_field(&fields, col_idx.return_at)
-                .and_then(parse_datetime),
-            garage_out_at: get_opt_field(&fields, col_idx.garage_out_at)
-                .and_then(parse_datetime),
-            garage_in_at: get_opt_field(&fields, col_idx.garage_in_at)
-                .and_then(parse_datetime),
-            meter_start: get_opt_field(&fields, col_idx.meter_start)
-                .and_then(parse_f64),
-            meter_end: get_opt_field(&fields, col_idx.meter_end)
-                .and_then(parse_f64),
-            total_distance: get_opt_field(&fields, col_idx.total_distance)
-                .and_then(parse_f64),
+            departure_at: get_opt_field(&fields, col_idx.departure_at).and_then(parse_datetime),
+            return_at: get_opt_field(&fields, col_idx.return_at).and_then(parse_datetime),
+            garage_out_at: get_opt_field(&fields, col_idx.garage_out_at).and_then(parse_datetime),
+            garage_in_at: get_opt_field(&fields, col_idx.garage_in_at).and_then(parse_datetime),
+            meter_start: get_opt_field(&fields, col_idx.meter_start).and_then(parse_f64),
+            meter_end: get_opt_field(&fields, col_idx.meter_end).and_then(parse_f64),
+            total_distance: get_opt_field(&fields, col_idx.total_distance).and_then(parse_f64),
             drive_time_general: get_opt_field(&fields, col_idx.drive_time_general)
                 .and_then(parse_i32),
             drive_time_highway: get_opt_field(&fields, col_idx.drive_time_highway)
                 .and_then(parse_i32),
             drive_time_bypass: get_opt_field(&fields, col_idx.drive_time_bypass)
                 .and_then(parse_i32),
-            safety_score: get_opt_field(&fields, col_idx.safety_score)
-                .and_then(parse_f64),
-            economy_score: get_opt_field(&fields, col_idx.economy_score)
-                .and_then(parse_f64),
-            total_score: get_opt_field(&fields, col_idx.total_score)
-                .and_then(parse_f64),
+            safety_score: get_opt_field(&fields, col_idx.safety_score).and_then(parse_f64),
+            economy_score: get_opt_field(&fields, col_idx.economy_score).and_then(parse_f64),
+            total_score: get_opt_field(&fields, col_idx.total_score).and_then(parse_f64),
             raw_data: serde_json::Value::Object(raw_map),
         });
     }
@@ -233,7 +221,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.unko_no, "2602241025060000000272");
-        assert_eq!(row.reading_date, NaiveDate::from_ymd_opt(2026, 2, 27).unwrap());
+        assert_eq!(
+            row.reading_date,
+            NaiveDate::from_ymd_opt(2026, 2, 27).unwrap()
+        );
         assert_eq!(row.office_cd, "1");
         assert_eq!(row.office_name, "本社");
         assert_eq!(row.vehicle_cd, "272");

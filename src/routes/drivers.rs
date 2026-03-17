@@ -1,9 +1,4 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::get,
-    Extension, Json, Router,
-};
+use axum::{extract::State, http::StatusCode, routing::get, Extension, Json, Router};
 
 use crate::db::models::Driver;
 use crate::middleware::auth::AuthUser;

@@ -3,20 +3,20 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::Response,
-    routing::{post, get},
+    routing::{get, post},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use chrono::Timelike;
-use tokio_stream::StreamExt;
 use crate::csv_parser;
-use crate::csv_parser::kudguri::{parse_kudguri, KudguriRow};
 use crate::csv_parser::kudgivt::{parse_kudgivt, KudgivtRow};
+use crate::csv_parser::kudguri::{parse_kudguri, KudguriRow};
 use crate::csv_parser::work_segments::{self, EventClass};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
+use chrono::Timelike;
+use tokio_stream::StreamExt;
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/upload", post(upload_zip))
@@ -106,7 +106,9 @@ async fn upload_zip(
     }
 }
 
-async fn extract_file(multipart: &mut Multipart) -> Result<(String, Vec<u8>), (StatusCode, String)> {
+async fn extract_file(
+    multipart: &mut Multipart,
+) -> Result<(String, Vec<u8>), (StatusCode, String)> {
     while let Some(field) = multipart
         .next_field()
         .await
@@ -114,10 +116,7 @@ async fn extract_file(multipart: &mut Multipart) -> Result<(String, Vec<u8>), (S
     {
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
-            let filename = field
-                .file_name()
-                .unwrap_or("upload.zip")
-                .to_string();
+            let filename = field.file_name().unwrap_or("upload.zip").to_string();
             let bytes = field
                 .bytes()
                 .await
@@ -175,7 +174,11 @@ async fn process_zip(
 
     let kudgivt_text = csv_parser::decode_shift_jis(&kudgivt_file.1);
     let kudgivt_rows = parse_kudgivt(&kudgivt_text)?;
-    tracing::info!("KUDGIVT parsed: {} rows (tenant={})", kudgivt_rows.len(), tenant_id);
+    tracing::info!(
+        "KUDGIVT parsed: {} rows (tenant={})",
+        kudgivt_rows.len(),
+        tenant_id
+    );
 
     // 4. Upsert masters and insert operations
     let mut operations_count = 0i32;
@@ -186,8 +189,7 @@ async fn process_zip(
         let vehicle_id =
             upsert_vehicle(state, tenant_id, &row.vehicle_cd, &row.vehicle_name).await?;
         // Upsert driver
-        let driver_id =
-            upsert_driver(state, tenant_id, &row.driver_cd, &row.driver_name).await?;
+        let driver_id = upsert_driver(state, tenant_id, &row.driver_cd, &row.driver_name).await?;
 
         let r2_key_prefix = format!("{}/unko/{}", tenant_id, row.unko_no);
 
@@ -250,11 +252,16 @@ async fn process_zip(
         operations_count += 1;
     }
 
-    tracing::info!("DB upsert done: {} operations (tenant={})", operations_count, tenant_id);
+    tracing::info!(
+        "DB upsert done: {} operations (tenant={})",
+        operations_count,
+        tenant_id
+    );
 
     // 5. Calculate daily_work_hours using KUDGIVT events
     // フェリー時間はCSV分割時にR2のKUDGFRYから取得済み（アップロード時はまだ未保存）
-    let ferry_minutes: std::collections::HashMap<String, FerryData> = std::collections::HashMap::new();
+    let ferry_minutes: std::collections::HashMap<String, FerryData> =
+        std::collections::HashMap::new();
     calculate_daily_hours(state, tenant_id, &rows, &kudgivt_rows, &ferry_minutes, None).await?;
     tracing::info!("calculate_daily_hours done (tenant={})", tenant_id);
 
@@ -339,31 +346,36 @@ async fn upsert_driver(
 /// 休息基準（原則540分以上）を満たした場合、次の拘束開始を新規始業とする。
 /// 満たさない場合は前の始業の日に帰属し続ける。24時間が最大。
 /// Returns: unko_no → work_date のマッピング
-fn group_operations_into_work_days(rows: &[KudguriRow]) -> std::collections::HashMap<String, chrono::NaiveDate> {
+///
+/// NOTE: daiun_salary::compare にも同じロジックがあるが、binary crateとlibrary crateで
+/// KudguriRow型が異なるため、直接呼び出せない。ロジックは同一に保つこと。
+fn group_operations_into_work_days(
+    rows: &[KudguriRow],
+) -> std::collections::HashMap<String, chrono::NaiveDate> {
     use std::collections::HashMap;
 
-    const REST_THRESHOLD_MINUTES: i64 = 540; // 原則休息基準
-    const MAX_WORK_DAY_MINUTES: i64 = 1440; // 24時間
+    const REST_THRESHOLD_MINUTES: i64 = 540;
+    const MAX_WORK_DAY_MINUTES: i64 = 1440;
 
     let mut unko_work_date: HashMap<String, chrono::NaiveDate> = HashMap::new();
-
-    // ドライバーごとにグルーピング
     let mut driver_rows: HashMap<String, Vec<&KudguriRow>> = HashMap::new();
     for row in rows {
         if !row.driver_cd.is_empty() {
-            driver_rows.entry(row.driver_cd.clone()).or_default().push(row);
+            driver_rows
+                .entry(row.driver_cd.clone())
+                .or_default()
+                .push(row);
         }
     }
 
     for (_driver_cd, mut ops) in driver_rows {
-        // departure_at でソート（Noneは末尾）
         ops.sort_by(|a, b| {
             let da = a.departure_at.or(a.garage_out_at);
             let db = b.departure_at.or(b.garage_out_at);
             da.cmp(&db)
         });
 
-        let mut current_shigyo: Option<chrono::NaiveDateTime> = None; // 始業時刻
+        let mut current_shigyo: Option<chrono::NaiveDateTime> = None;
         let mut current_work_date: Option<chrono::NaiveDate> = None;
         let mut last_end: Option<chrono::NaiveDateTime> = None;
 
@@ -371,7 +383,6 @@ fn group_operations_into_work_days(rows: &[KudguriRow]) -> std::collections::Has
             let dep = match row.departure_at.or(row.garage_out_at) {
                 Some(d) => d,
                 None => {
-                    // departure_at がない場合は operation_date / reading_date で帰属
                     let wd = row.operation_date.unwrap_or(row.reading_date);
                     unko_work_date.insert(row.unko_no.clone(), wd);
                     continue;
@@ -379,23 +390,14 @@ fn group_operations_into_work_days(rows: &[KudguriRow]) -> std::collections::Has
             };
             let ret = row.return_at.or(row.garage_in_at).unwrap_or(dep);
 
-            let mut new_day = false;
-
-            if let (Some(shigyo), Some(prev_end)) = (current_shigyo, last_end) {
+            let new_day = if let (Some(shigyo), Some(prev_end)) = (current_shigyo, last_end) {
                 let gap_minutes = (dep - prev_end).num_minutes();
                 let since_shigyo_minutes = (dep - shigyo).num_minutes();
-
-                if gap_minutes >= REST_THRESHOLD_MINUTES {
-                    // 休息基準を満たした → 新規始業
-                    new_day = true;
-                } else if since_shigyo_minutes >= MAX_WORK_DAY_MINUTES {
-                    // 24時間超過 → 強制日締め
-                    new_day = true;
-                }
+                gap_minutes >= REST_THRESHOLD_MINUTES
+                    || since_shigyo_minutes >= MAX_WORK_DAY_MINUTES
             } else {
-                // 最初の運行
-                new_day = true;
-            }
+                true
+            };
 
             if new_day {
                 current_shigyo = Some(dep);
@@ -403,8 +405,6 @@ fn group_operations_into_work_days(rows: &[KudguriRow]) -> std::collections::Has
             }
 
             unko_work_date.insert(row.unko_no.clone(), current_work_date.unwrap());
-
-            // last_end を更新（より遅い終了時刻を保持）
             last_end = Some(match last_end {
                 Some(prev) if ret > prev => ret,
                 Some(prev) => prev,
@@ -454,10 +454,24 @@ async fn load_ferry_minutes(
                 let cols: Vec<&str> = line.split(',').collect();
                 if cols.len() > 11 {
                     if let (Some(start), Some(end)) = (
-                        chrono::NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S").ok()
-                            .or_else(|| chrono::NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok()),
-                        chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S").ok()
-                            .or_else(|| chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+                        chrono::NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S")
+                            .ok()
+                            .or_else(|| {
+                                chrono::NaiveDateTime::parse_from_str(
+                                    cols[10].trim(),
+                                    "%Y/%m/%d %k:%M:%S",
+                                )
+                                .ok()
+                            }),
+                        chrono::NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S")
+                            .ok()
+                            .or_else(|| {
+                                chrono::NaiveDateTime::parse_from_str(
+                                    cols[11].trim(),
+                                    "%Y/%m/%d %k:%M:%S",
+                                )
+                                .ok()
+                            }),
                     ) {
                         let secs = (end - start).num_seconds();
                         let mins = ((secs + 30) / 60) as i32;
@@ -470,12 +484,21 @@ async fn load_ferry_minutes(
                 }
             }
             if total_ferry > 0 {
-                ferry_map.insert(unko_no, FerryData { total_minutes: total_ferry, start_times });
+                ferry_map.insert(
+                    unko_no,
+                    FerryData {
+                        total_minutes: total_ferry,
+                        start_times,
+                    },
+                );
             }
         }
     }
 
-    tracing::info!("Ferry minutes loaded: {} operations with ferry", ferry_map.len());
+    tracing::info!(
+        "Ferry minutes loaded: {} operations with ferry",
+        ferry_map.len()
+    );
     ferry_map
 }
 
@@ -509,9 +532,12 @@ async fn calculate_daily_hours(
     for row in kudgivt_rows {
         if classifications.get(&row.event_cd) == Some(&EventClass::RestSplit) {
             let dur = row.duration_minutes.unwrap_or(0);
-            if dur <= 0 { continue; }
+            if dur <= 0 {
+                continue;
+            }
             // unko_no からワークデイを取得（始業ベース帰属）
-            let work_date = unko_work_date.get(&row.unko_no)
+            let work_date = unko_work_date
+                .get(&row.unko_no)
                 .copied()
                 .unwrap_or(row.start_at.date());
             *rest_event_map
@@ -556,81 +582,225 @@ async fn calculate_daily_hours(
     }
 
     // キー: (driver_cd, work_date, start_time) — 同日複数運行を始業時刻で区別
-    let mut day_map: HashMap<(String, chrono::NaiveDate, chrono::NaiveTime), DayAgg> = HashMap::new();
-
-    // unko_no → 出発日マップ（日跨ぎ運行を出発日に帰属させるため）
-    let mut unko_departure_date: HashMap<String, chrono::NaiveDate> = HashMap::new();
-    for row in rows {
-        if let Some(dep) = row.departure_at {
-            unko_departure_date.insert(row.unko_no.clone(), dep.date());
-        }
-    }
+    let mut day_map: HashMap<(String, chrono::NaiveDate, chrono::NaiveTime), DayAgg> =
+        HashMap::new();
 
     // unko_no → WorkSegments マッピング（イベント帰属判定用）
     // (seg.start, seg.end, work_date, start_time)
-    let mut unko_segments: HashMap<String, Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime, chrono::NaiveDate, chrono::NaiveTime)>> = HashMap::new();
+    let mut unko_segments: HashMap<
+        String,
+        Vec<(
+            chrono::NaiveDateTime,
+            chrono::NaiveDateTime,
+            chrono::NaiveDate,
+            chrono::NaiveTime,
+        )>,
+    > = HashMap::new();
 
+    // 複数運行結合の24h境界: unko_no → boundary_24h（イベント分割に使用）
+    let mut multi_op_boundaries: HashMap<String, chrono::NaiveDateTime> = HashMap::new();
+
+    // driver_cd → driver_id キャッシュ
+    let mut driver_id_cache: HashMap<String, Option<Uuid>> = HashMap::new();
+
+    // ヘルパー: WorkSegmentを任意のNaiveDateTime境界で分割する
+    fn split_work_segments_at_boundary(
+        segments: Vec<work_segments::WorkSegment>,
+        boundary: chrono::NaiveDateTime,
+    ) -> Vec<work_segments::WorkSegment> {
+        let mut result = Vec::new();
+        for seg in segments {
+            if seg.start < boundary && seg.end > boundary {
+                let total_mins = (seg.end - seg.start).num_minutes().max(1) as f64;
+                let before_mins = (boundary - seg.start).num_minutes() as f64;
+                let ratio = before_mins / total_mins;
+                let d1 = (seg.drive_minutes as f64 * ratio).round() as i32;
+                let c1 = (seg.cargo_minutes as f64 * ratio).round() as i32;
+                let l1 = (seg.labor_minutes as f64 * ratio).round() as i32;
+                result.push(work_segments::WorkSegment {
+                    start: seg.start,
+                    end: boundary,
+                    labor_minutes: l1,
+                    drive_minutes: d1,
+                    cargo_minutes: c1,
+                });
+                result.push(work_segments::WorkSegment {
+                    start: boundary,
+                    end: seg.end,
+                    labor_minutes: seg.labor_minutes - l1,
+                    drive_minutes: seg.drive_minutes - d1,
+                    cargo_minutes: seg.cargo_minutes - c1,
+                });
+            } else {
+                result.push(seg);
+            }
+        }
+        result
+    }
+
+    /// 秒を切り捨てて分精度に揃える
+    fn trunc_min_helper(dt: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+        daiun_salary::compare::trunc_min(dt)
+    }
+
+    // 運行をworkdayグループにまとめる（同一driver_cd + work_dateの運行を結合）
+    let mut workday_groups: std::collections::BTreeMap<
+        (String, chrono::NaiveDate),
+        Vec<&KudguriRow>,
+    > = std::collections::BTreeMap::new();
     for row in rows {
-        let driver_id = if !row.driver_cd.is_empty() {
-            let rec = sqlx::query_as::<_, (Uuid,)>(
-                "SELECT id FROM drivers WHERE tenant_id = $1 AND driver_cd = $2",
-            )
-            .bind(tenant_id)
-            .bind(&row.driver_cd)
-            .fetch_optional(&state.pool)
-            .await?;
-            rec.map(|r| r.0)
+        let wd = unko_work_date
+            .get(&row.unko_no)
+            .copied()
+            .unwrap_or(row.operation_date.unwrap_or(row.reading_date));
+        workday_groups
+            .entry((row.driver_cd.clone(), wd))
+            .or_default()
+            .push(row);
+    }
+
+    for ((_group_driver_cd, _group_work_date), ops) in &workday_groups {
+        // driver_id を取得（キャッシュ）
+        let driver_cd = &ops[0].driver_cd;
+        let driver_id = if !driver_cd.is_empty() {
+            if let Some(cached) = driver_id_cache.get(driver_cd) {
+                *cached
+            } else {
+                let rec = sqlx::query_as::<_, (Uuid,)>(
+                    "SELECT id FROM drivers WHERE tenant_id = $1 AND driver_cd = $2",
+                )
+                .bind(tenant_id)
+                .bind(driver_cd)
+                .fetch_optional(&state.pool)
+                .await?;
+                let id = rec.map(|r| r.0);
+                driver_id_cache.insert(driver_cd.clone(), id);
+                id
+            }
         } else {
             None
         };
 
-        let total_distance = row.total_distance.unwrap_or(0.0);
+        // 有効な出発・帰庫を持つ運行を抽出
+        let valid_ops: Vec<&&KudguriRow> = ops
+            .iter()
+            .filter(|r| matches!((r.departure_at, r.return_at), (Some(d), Some(r)) if r > d))
+            .collect();
 
-        match (row.departure_at, row.return_at) {
-            (Some(dep), Some(ret)) if ret > dep => {
-                // KUDGIVTイベントで休息分割
+        // 出発・帰庫がない運行はフォールバック処理
+        for row in ops {
+            if matches!((row.departure_at, row.return_at), (Some(d), Some(r)) if r > d) {
+                continue; // valid_opsで処理
+            }
+            let work_date = row.operation_date.unwrap_or(row.reading_date);
+            let total_drive_mins = row.drive_time_general.unwrap_or(0)
+                + row.drive_time_highway.unwrap_or(0)
+                + row.drive_time_bypass.unwrap_or(0);
+            let total_distance = row.total_distance.unwrap_or(0.0);
+            let default_time = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+            let entry = day_map
+                .entry((row.driver_cd.clone(), work_date, default_time))
+                .or_insert(DayAgg {
+                    driver_id,
+                    total_work_minutes: 0,
+                    total_labor_minutes: 0,
+                    late_night_minutes: 0,
+                    drive_minutes: 0,
+                    cargo_minutes: 0,
+                    total_distance: 0.0,
+                    operation_count: 0,
+                    unko_nos: Vec::new(),
+                    segments: Vec::new(),
+                    rest_event_minutes: 0,
+                    overlap_drive_minutes: 0,
+                    overlap_cargo_minutes: 0,
+                    overlap_break_minutes: 0,
+                    overlap_restraint_minutes: 0,
+                    ot_late_night_minutes: 0,
+                });
+            entry.total_work_minutes += total_drive_mins;
+            entry.total_labor_minutes += total_drive_mins;
+            entry.total_distance += total_distance;
+            entry.operation_count += 1;
+            entry.unko_nos.push(row.unko_no.clone());
+            if entry.driver_id.is_none() {
+                entry.driver_id = driver_id;
+            }
+        }
+
+        if valid_ops.is_empty() {
+            continue;
+        }
+
+        // 複数運行が異なる出発日にまたがる場合のみ結合
+        let spans_different_days = if valid_ops.len() > 1 {
+            let dates: std::collections::HashSet<chrono::NaiveDate> = valid_ops
+                .iter()
+                .filter_map(|r| r.departure_at.map(|d| d.date()))
+                .collect();
+            dates.len() > 1
+        } else {
+            false
+        };
+
+        if !spans_different_days {
+            // ---- 単独運行 or 同一日の複数運行: 各運行を個別に処理 ----
+            for row in &valid_ops {
+                let dep = row.departure_at.unwrap();
+                let ret = row.return_at.unwrap();
+                let total_distance = row.total_distance.unwrap_or(0.0);
                 let events = kudgivt_by_unko.get(&row.unko_no);
                 let event_slice: Vec<&KudgivtRow> = events
                     .map(|e| e.iter().copied().collect())
                     .unwrap_or_default();
 
-                let segments = work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
+                let segments =
+                    work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
                 let segments = work_segments::split_segments_at_24h(segments);
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 
-                // この運行の302イベントからworkday境界を決定（始業ポイント）
-                let rest_events_for_unko: Vec<(chrono::NaiveDateTime, i32)> = event_slice.iter()
+                let rest_events_for_unko: Vec<(chrono::NaiveDateTime, i32)> = event_slice
+                    .iter()
                     .filter(|e| classifications.get(&e.event_cd) == Some(&EventClass::RestSplit))
-                    .filter_map(|e| e.duration_minutes.filter(|&d| d > 0).map(|d| (e.start_at, d)))
+                    .filter_map(|e| {
+                        e.duration_minutes
+                            .filter(|&d| d > 0)
+                            .map(|d| (e.start_at, d))
+                    })
                     .collect();
                 let workdays = work_segments::determine_workdays(&rest_events_for_unko, dep, ret);
 
-                // セグメント→始業時刻マッピング: 各セグメントが属するworkdayのstartをstart_timeとする
-                // これにより同unko_no内で休息基準未満の分割は同一start_timeに集約される
                 let find_start_time = |ts: chrono::NaiveDateTime| -> chrono::NaiveTime {
-                    workdays.iter()
+                    workdays
+                        .iter()
                         .find(|wd| ts >= wd.start && ts < wd.end)
                         .or_else(|| workdays.iter().rev().find(|wd| ts >= wd.start))
                         .map(|wd| wd.start.time())
                         .unwrap_or(dep.time())
                 };
-
-                // workday内に完全収まるセグメントはworkday.dateを使用（日跨ぎ対応）
-                let find_workday_date = |start: chrono::NaiveDateTime, end: chrono::NaiveDateTime| -> chrono::NaiveDate {
-                    workdays.iter()
+                let find_workday_date = |start: chrono::NaiveDateTime,
+                                         end: chrono::NaiveDateTime|
+                 -> chrono::NaiveDate {
+                    workdays
+                        .iter()
                         .find(|wd| start >= wd.start && end <= wd.end)
                         .map(|wd| wd.date)
                         .unwrap_or(start.date())
                 };
 
-                // セグメント情報を保存（イベント帰属判定用）
-                // (seg.start, seg.end, work_date, start_time)
-                let seg_entries: Vec<_> = segments.iter()
-                    .map(|seg| (seg.start, seg.end, find_workday_date(seg.start, seg.end), find_start_time(seg.start)))
+                let seg_entries: Vec<_> = segments
+                    .iter()
+                    .map(|seg| {
+                        (
+                            seg.start,
+                            seg.end,
+                            find_workday_date(seg.start, seg.end),
+                            find_start_time(seg.start),
+                        )
+                    })
                     .collect();
                 unko_segments.insert(row.unko_no.clone(), seg_entries);
 
-                // 総拘束時間（走行距離按分用）
                 let total_work_mins: i32 = daily_segments.iter().map(|s| s.work_minutes).sum();
 
                 for ds in &daily_segments {
@@ -641,13 +811,13 @@ async fn calculate_daily_hours(
                     };
                     let day_distance = total_distance * ratio;
 
-                    // work_date: workday内に完全収まる場合はworkday.date、
-                    //            跨る場合はparent segmentの開始日（compare.rsと同じロジック）
-                    let work_date = workdays.iter()
+                    let work_date = workdays
+                        .iter()
                         .find(|wd| ds.start >= wd.start && ds.end <= wd.end)
                         .map(|wd| wd.date)
                         .unwrap_or_else(|| {
-                            let parent_seg = segments.iter()
+                            let parent_seg = segments
+                                .iter()
                                 .find(|seg| ds.start >= seg.start && ds.start < seg.end);
                             parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date)
                         });
@@ -706,42 +876,145 @@ async fn calculate_daily_hours(
                     });
                 }
             }
-            _ => {
-                // 出社・退社がない場合は運行日（or 読取日）に集約
-                let work_date = row.operation_date.unwrap_or(row.reading_date);
-                let total_drive_mins = row.drive_time_general.unwrap_or(0)
-                    + row.drive_time_highway.unwrap_or(0)
-                    + row.drive_time_bypass.unwrap_or(0);
+        } else {
+            // ---- 複数運行の結合処理（運行間workday結合） ----
+            let merged_dep = valid_ops
+                .iter()
+                .filter_map(|r| r.departure_at)
+                .min()
+                .unwrap();
+            let merged_ret = valid_ops.iter().filter_map(|r| r.return_at).max().unwrap();
 
-                let default_time = chrono::NaiveTime::from_hms_opt(0,0,0).unwrap();
-                let entry = day_map
-                    .entry((row.driver_cd.clone(), work_date, default_time))
-                    .or_insert(DayAgg {
-                        driver_id,
-                        total_work_minutes: 0,
-                        total_labor_minutes: 0,
-                        late_night_minutes: 0,
-                        drive_minutes: 0,
-                        cargo_minutes: 0,
-                        total_distance: 0.0,
-                        operation_count: 0,
-                        unko_nos: Vec::new(),
-                        segments: Vec::new(),
-                        rest_event_minutes: 0,
-                        overlap_drive_minutes: 0,
-                        overlap_cargo_minutes: 0,
-                        overlap_break_minutes: 0,
-                        overlap_restraint_minutes: 0,
-                        ot_late_night_minutes: 0,
+            let merged_dep_trunc = trunc_min_helper(merged_dep);
+            let boundary_24h = merged_dep_trunc + chrono::Duration::hours(24);
+            let mut virtual_workdays: Vec<work_segments::Workday> = vec![work_segments::Workday {
+                date: merged_dep.date(),
+                start: merged_dep,
+                end: boundary_24h.min(merged_ret),
+            }];
+            if merged_ret > boundary_24h {
+                virtual_workdays.push(work_segments::Workday {
+                    date: boundary_24h.date(),
+                    start: boundary_24h,
+                    end: merged_ret,
+                });
+            }
+
+            // 全運行に24h境界を登録（イベント分割用）
+            for row in &valid_ops {
+                multi_op_boundaries.insert(row.unko_no.clone(), boundary_24h);
+            }
+
+            let find_vwd_start_time = |ts: chrono::NaiveDateTime| -> chrono::NaiveTime {
+                virtual_workdays
+                    .iter()
+                    .find(|wd| ts >= wd.start && ts < wd.end)
+                    .or_else(|| virtual_workdays.iter().rev().find(|wd| ts >= wd.start))
+                    .map(|wd| wd.start.time())
+                    .unwrap_or(merged_dep.time())
+            };
+            let find_vwd_date = |ts: chrono::NaiveDateTime| -> chrono::NaiveDate {
+                virtual_workdays
+                    .iter()
+                    .find(|wd| ts >= wd.start && ts < wd.end)
+                    .or_else(|| virtual_workdays.iter().rev().find(|wd| ts >= wd.start))
+                    .map(|wd| wd.date)
+                    .unwrap_or(merged_dep.date())
+            };
+
+            // 各運行のセグメントを個別に処理し、仮想workdayに帰属させる
+            for row in &valid_ops {
+                let dep = row.departure_at.unwrap();
+                let ret = row.return_at.unwrap();
+                let total_distance = row.total_distance.unwrap_or(0.0);
+                let events = kudgivt_by_unko.get(&row.unko_no);
+                let event_slice: Vec<&KudgivtRow> = events
+                    .map(|e| e.iter().copied().collect())
+                    .unwrap_or_default();
+
+                let segments =
+                    work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
+                let segments = work_segments::split_segments_at_24h(segments);
+                let segments = split_work_segments_at_boundary(segments, boundary_24h);
+                let daily_segments = work_segments::split_segments_by_day(&segments);
+
+                let seg_entries: Vec<_> = segments
+                    .iter()
+                    .map(|seg| {
+                        (
+                            seg.start,
+                            seg.end,
+                            find_vwd_date(seg.start),
+                            find_vwd_start_time(seg.start),
+                        )
+                    })
+                    .collect();
+                unko_segments.insert(row.unko_no.clone(), seg_entries);
+
+                let total_work_mins: i32 = daily_segments.iter().map(|s| s.work_minutes).sum();
+
+                for ds in &daily_segments {
+                    let ratio = if total_work_mins > 0 {
+                        ds.work_minutes as f64 / total_work_mins as f64
+                    } else {
+                        0.0
+                    };
+                    let day_distance = total_distance * ratio;
+
+                    let work_date = find_vwd_date(ds.start);
+                    let start_time = find_vwd_start_time(ds.start);
+                    let entry = day_map
+                        .entry((driver_cd.clone(), work_date, start_time))
+                        .or_insert(DayAgg {
+                            driver_id,
+                            total_work_minutes: 0,
+                            total_labor_minutes: 0,
+                            late_night_minutes: 0,
+                            drive_minutes: 0,
+                            cargo_minutes: 0,
+                            total_distance: 0.0,
+                            operation_count: 0,
+                            unko_nos: Vec::new(),
+                            segments: Vec::new(),
+                            rest_event_minutes: 0,
+                            overlap_drive_minutes: 0,
+                            overlap_cargo_minutes: 0,
+                            overlap_break_minutes: 0,
+                            overlap_restraint_minutes: 0,
+                            ot_late_night_minutes: 0,
+                        });
+
+                    entry.total_work_minutes += ds.work_minutes;
+                    entry.total_labor_minutes += ds.labor_minutes;
+                    entry.late_night_minutes += ds.late_night_minutes;
+                    entry.drive_minutes += ds.drive_minutes;
+                    entry.cargo_minutes += ds.cargo_minutes;
+                    entry.total_distance += day_distance;
+                    if !entry.unko_nos.contains(&row.unko_no) {
+                        entry.unko_nos.push(row.unko_no.clone());
+                        entry.operation_count += 1;
+                    }
+                    if entry.driver_id.is_none() {
+                        entry.driver_id = driver_id;
+                    }
+
+                    let seg_idx = entry
+                        .segments
+                        .iter()
+                        .filter(|s| s.unko_no == row.unko_no)
+                        .count() as i32;
+
+                    entry.segments.push(SegmentRecord {
+                        unko_no: row.unko_no.clone(),
+                        segment_index: seg_idx,
+                        start_at: ds.start,
+                        end_at: ds.end,
+                        work_minutes: ds.work_minutes,
+                        labor_minutes: ds.labor_minutes,
+                        late_night_minutes: ds.late_night_minutes,
+                        drive_minutes: ds.drive_minutes,
+                        cargo_minutes: ds.cargo_minutes,
                     });
-
-                entry.total_work_minutes += total_drive_mins;
-                entry.total_labor_minutes += total_drive_mins;
-                entry.total_distance += total_distance;
-                entry.operation_count += 1;
-                entry.unko_nos.push(row.unko_no.clone());
-                if entry.driver_id.is_none() {
-                    entry.driver_id = driver_id;
                 }
             }
         }
@@ -772,58 +1045,100 @@ async fn calculate_daily_hours(
 
         for (driver_cd, unko_nos) in &driver_unko_map {
             // 秒単位で合算し、最後に分変換（区間時間の切り上げ端数を排除）
-            let mut day_drive_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> = HashMap::new();
-            let mut day_cargo_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> = HashMap::new();
-            let mut day_break_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> = HashMap::new();
-            let mut day_late_night: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> = HashMap::new();
+            let mut day_drive_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> =
+                HashMap::new();
+            let mut day_cargo_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> =
+                HashMap::new();
+            let mut day_break_secs: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i64> =
+                HashMap::new();
+            let mut day_late_night: HashMap<(chrono::NaiveDate, chrono::NaiveTime), i32> =
+                HashMap::new();
 
             for unko_no in unko_nos {
                 if let Some(events) = kudgivt_by_unko.get(unko_no) {
+                    let boundary_opt = multi_op_boundaries.get(unko_no);
+
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
-                        if dur <= 0 { continue; }
-                        let dur_secs = dur as i64 * 60;
-                        // イベントの帰属日: セグメントのタイムスタンプ範囲で判定
-                        // 休息ギャップ中のイベントは直後のセグメントに帰属させる
-                        let (event_date, event_start_time) = unko_segments.get(unko_no)
-                            .and_then(|segs| {
-                                // まずセグメント範囲内を探す
-                                segs.iter()
-                                    .find(|(start, end, _, _)| evt.start_at >= *start && evt.start_at < *end)
-                                    .or_else(|| {
-                                        // 休息ギャップ: 直後のセグメント（evt < seg.start の最初）
-                                        segs.iter().find(|(start, _, _, _)| evt.start_at < *start)
-                                    })
-                                    .or_else(|| {
-                                        // 全セグメントより後: 最後のセグメント
-                                        segs.last()
-                                    })
-                                    .map(|(_, _, wd, st)| (*wd, *st))
-                            })
-                            .unwrap_or((evt.start_at.date(), chrono::NaiveTime::from_hms_opt(0,0,0).unwrap()));
-                        let cls = classifications.get(&evt.event_cd);
-                        match cls {
-                            Some(EventClass::Drive) => {
-                                *day_drive_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
-                            }
-                            Some(EventClass::Cargo) => {
-                                *day_cargo_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
-                            }
-                            Some(EventClass::Break) => {
-                                *day_break_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
-                            }
-                            _ => {}
+                        if dur <= 0 {
+                            continue;
                         }
-                        // 深夜時間: Drive/Cargo イベントの実時間のみから計算
-                        match cls {
-                            Some(EventClass::Drive) | Some(EventClass::Cargo) => {
-                                let evt_end = evt.start_at + chrono::Duration::minutes(dur as i64);
-                                let night = crate::csv_parser::work_segments::calc_late_night_mins(evt.start_at, evt_end);
-                                if night > 0 {
-                                    *day_late_night.entry((event_date, event_start_time)).or_insert(0) += night;
-                                }
+
+                        // 分精度に揃えてから計算（web地球号互換）
+                        let evt_start_trunc = trunc_min_helper(evt.start_at);
+                        let evt_end = evt_start_trunc + chrono::Duration::minutes(dur as i64);
+
+                        // イベントが24h境界をまたぐ場合、前半/後半に分割
+                        let mut parts: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime, i64)> =
+                            Vec::new();
+                        if let Some(&boundary) = boundary_opt {
+                            if evt_start_trunc < boundary && evt_end > boundary {
+                                let before_secs = (boundary - evt_start_trunc).num_seconds();
+                                let after_secs = (evt_end - boundary).num_seconds();
+                                parts.push((evt_start_trunc, boundary, before_secs));
+                                parts.push((boundary, evt_end, after_secs));
+                            } else {
+                                parts.push((evt_start_trunc, evt_end, dur as i64 * 60));
                             }
-                            _ => {}
+                        } else {
+                            parts.push((evt_start_trunc, evt_end, dur as i64 * 60));
+                        }
+
+                        for (part_start, part_end, part_secs) in &parts {
+                            let (event_date, event_start_time) = unko_segments
+                                .get(unko_no)
+                                .and_then(|segs| {
+                                    segs.iter()
+                                        .find(|(start, end, _, _)| {
+                                            *part_start >= *start && *part_start < *end
+                                        })
+                                        .or_else(|| {
+                                            segs.iter()
+                                                .find(|(start, _, _, _)| *part_start < *start)
+                                        })
+                                        .or_else(|| segs.last())
+                                        .map(|(_, _, wd, st)| (*wd, *st))
+                                })
+                                .unwrap_or((
+                                    part_start.date(),
+                                    chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                                ));
+
+                            let cls = classifications.get(&evt.event_cd);
+                            match cls {
+                                Some(EventClass::Drive) => {
+                                    *day_drive_secs
+                                        .entry((event_date, event_start_time))
+                                        .or_insert(0) += part_secs;
+                                }
+                                Some(EventClass::Cargo) => {
+                                    *day_cargo_secs
+                                        .entry((event_date, event_start_time))
+                                        .or_insert(0) += part_secs;
+                                }
+                                Some(EventClass::Break) => {
+                                    *day_break_secs
+                                        .entry((event_date, event_start_time))
+                                        .or_insert(0) += part_secs;
+                                }
+                                _ => {}
+                            }
+                            // 深夜時間: Drive/Cargo イベントの実時間のみから計算
+                            match cls {
+                                Some(EventClass::Drive) | Some(EventClass::Cargo) => {
+                                    let night =
+                                        crate::csv_parser::work_segments::calc_late_night_mins(
+                                            *part_start,
+                                            *part_end,
+                                        );
+                                    if night > 0 {
+                                        *day_late_night
+                                            .entry((event_date, event_start_time))
+                                            .or_insert(0) += night;
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -842,7 +1157,11 @@ async fn calculate_daily_hours(
             }
             // total_work_minutes(拘束時間小計) = (drive_secs + cargo_secs + break_secs) / 60
             // 秒合計してから分変換で端数を排除（フェリーは後段で控除）
-            for ((date, st), _) in day_drive_secs.iter().chain(day_cargo_secs.iter()).chain(day_break_secs.iter()) {
+            for ((date, st), _) in day_drive_secs
+                .iter()
+                .chain(day_cargo_secs.iter())
+                .chain(day_break_secs.iter())
+            {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
                     let d = day_drive_secs.get(&(*date, *st)).copied().unwrap_or(0);
                     let c = day_cargo_secs.get(&(*date, *st)).copied().unwrap_or(0);
@@ -871,7 +1190,8 @@ async fn calculate_daily_hours(
                         // 深夜帯: 始業日の22:00と翌05:00
                         let night_start_22 = start.date().and_hms_opt(22, 0, 0).unwrap();
                         let night_end_05 = (start.date() + chrono::Duration::days(1))
-                            .and_hms_opt(5, 0, 0).unwrap();
+                            .and_hms_opt(5, 0, 0)
+                            .unwrap();
                         // 始業が22:00-05:00の場合、深夜帯の終了は始業当日の05:00または翌05:00
                         let effective_night_end = if start.hour() < 5 {
                             // 始業が0-5時 → 深夜帯終了は当日05:00
@@ -904,9 +1224,8 @@ async fn calculate_daily_hours(
     {
         use std::collections::BTreeMap;
 
-        // 秒を切り捨てて分精度に揃える（Excel互換）
         fn trunc_min(dt: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
-            dt.with_second(0).unwrap_or(dt)
+            daiun_salary::compare::trunc_min(dt)
         }
 
         // ドライバーCD → 日付順の (始業, 終業, unko_nos)
@@ -916,17 +1235,29 @@ async fn calculate_daily_hours(
             unko_nos: Vec<String>,
         }
 
-        let mut driver_days: HashMap<String, BTreeMap<(chrono::NaiveDate, chrono::NaiveTime), DayInfo>> = HashMap::new();
+        let mut driver_days: HashMap<
+            String,
+            BTreeMap<(chrono::NaiveDate, chrono::NaiveTime), DayInfo>,
+        > = HashMap::new();
         for ((driver_cd, date, st), agg) in &day_map {
-            if agg.segments.is_empty() { continue; }
+            if agg.segments.is_empty() {
+                continue;
+            }
             let start = trunc_min(agg.segments.iter().map(|s| s.start_at).min().unwrap());
             let end = trunc_min(agg.segments.iter().map(|s| s.end_at).max().unwrap());
-            driver_days.entry(driver_cd.clone()).or_default()
-                .insert((*date, *st), DayInfo { start, end, unko_nos: agg.unko_nos.clone() });
+            driver_days.entry(driver_cd.clone()).or_default().insert(
+                (*date, *st),
+                DayInfo {
+                    start,
+                    end,
+                    unko_nos: agg.unko_nos.clone(),
+                },
+            );
         }
 
         for (driver_cd, dates_map) in &driver_days {
-            let dates: Vec<(chrono::NaiveDate, chrono::NaiveTime)> = dates_map.keys().copied().collect();
+            let dates: Vec<(chrono::NaiveDate, chrono::NaiveTime)> =
+                dates_map.keys().copied().collect();
             let mut effective_start: Option<chrono::NaiveDateTime> = None;
             let mut prev_end: Option<chrono::NaiveDateTime> = None;
             // 前日から繰り越す重複分の控除（リセットなし時にメイン統合するため）
@@ -949,7 +1280,9 @@ async fn calculate_daily_hours(
                 }
 
                 // 前日からの控除を適用（リセットなし時、前日のoverlap分を当日メインから減算）
-                if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) = next_day_deduction.take() {
+                if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) =
+                    next_day_deduction.take()
+                {
                     if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                         agg.drive_minutes = (agg.drive_minutes - ded_drive).max(0);
                         agg.cargo_minutes = (agg.cargo_minutes - ded_cargo).max(0);
@@ -975,33 +1308,41 @@ async fn calculate_daily_hours(
                             for evt in events {
                                 let cls = classifications.get(&evt.event_cd);
                                 let dur = evt.duration_minutes.unwrap_or(0);
-                                if dur <= 0 { continue; }
+                                if dur <= 0 {
+                                    continue;
+                                }
 
                                 // イベント開始も分精度に揃える（Excel互換）
                                 let evt_start = trunc_min(evt.start_at);
 
                                 // イベントが窓内かチェック
-                                if evt_start >= window_end { continue; }
+                                if evt_start >= window_end {
+                                    continue;
+                                }
                                 let evt_end = evt_start + chrono::Duration::minutes(dur as i64);
 
                                 // 当日の終業より前のイベントはスキップ（当日に属する）
-                                if evt_end <= info.end { continue; }
-                                if evt_start < info.end { continue; }
+                                if evt_end <= info.end {
+                                    continue;
+                                }
+                                if evt_start < info.end {
+                                    continue;
+                                }
 
                                 // 窓内に収まる分だけカウント
                                 // イベント起点はセグメント開始(next_info.start)以降に制限
                                 let overlap_start = evt_start.max(next_info.start);
                                 let effective_end = evt_end.min(window_end);
-                                if effective_end <= overlap_start { continue; }
+                                if effective_end <= overlap_start {
+                                    continue;
+                                }
                                 let mins = (effective_end - overlap_start).num_minutes() as i32;
-                                if mins <= 0 { continue; }
+                                if mins <= 0 {
+                                    continue;
+                                }
 
                                 // イベント全体が窓内ならそのまま、部分的なら按分
-                                let actual_dur = if mins >= dur {
-                                    dur
-                                } else {
-                                    mins
-                                };
+                                let actual_dur = if mins >= dur { dur } else { mins };
 
                                 match cls {
                                     Some(EventClass::Drive) => ol_drive += actual_dur,
@@ -1018,7 +1359,9 @@ async fn calculate_daily_hours(
                         let restraint_end = day_map
                             .get(&(driver_cd.clone(), next_date, next_st))
                             .map(|next_agg| {
-                                next_agg.segments.iter()
+                                next_agg
+                                    .segments
+                                    .iter()
                                     .filter(|s| trunc_min(s.start_at) < window_end)
                                     .map(|s| trunc_min(s.end_at).min(window_end))
                                     .max()
@@ -1051,7 +1394,8 @@ async fn calculate_daily_hours(
                             agg.ot_late_night_minutes = ol_late_night;
                         }
                         // 翌日のメインから控除する分を記録（深夜も控除）
-                        next_day_deduction = Some((ol_drive, ol_cargo, ol_restraint, ol_late_night));
+                        next_day_deduction =
+                            Some((ol_drive, ol_cargo, ol_restraint, ol_late_night));
                     } else {
                         // 通常: 重複として別表示
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
@@ -1120,8 +1464,11 @@ async fn calculate_daily_hours(
                 // 各フェリー開始時刻に最も近い301イベントを個別マッチ
                 if let Some(events) = kudgivt_by_unko.get(unko) {
                     for ferry_start in &fd.start_times {
-                        let matched_301 = events.iter()
-                            .filter(|e| classifications.get(&e.event_cd) == Some(&EventClass::Break))
+                        let matched_301 = events
+                            .iter()
+                            .filter(|e| {
+                                classifications.get(&e.event_cd) == Some(&EventClass::Break)
+                            })
                             .filter(|e| e.duration_minutes.unwrap_or(0) > 0)
                             .min_by_key(|e| (e.start_at - *ferry_start).num_seconds().abs());
                         if let Some(evt) = matched_301 {
@@ -1134,7 +1481,8 @@ async fn calculate_daily_hours(
         if ferry_deduction > 0 {
             agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
             // drive = drive_from_201 - (ferry_KUDGFRY合計 - ferry_301合計)
-            agg.drive_minutes = (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
+            agg.drive_minutes =
+                (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
         }
     }
 
@@ -1176,7 +1524,7 @@ async fn calculate_daily_hours(
         .bind(agg.total_work_minutes)
         .bind(agg.total_labor_minutes)
         .bind(rest_minutes)
-        .bind(agg.late_night_minutes)
+        .bind((agg.late_night_minutes - agg.ot_late_night_minutes).max(0)) // 法定内深夜 = total深夜 - 時間外深夜
         .bind(agg.drive_minutes)
         .bind(agg.cargo_minutes)
         .bind(agg.total_distance)
@@ -1263,27 +1611,30 @@ async fn load_kudgivt_from_zips(
     let mut seen_zips = std::collections::HashSet::new();
 
     for zip_key in &zip_keys {
-        if seen_zips.contains(zip_key) { continue; }
+        if seen_zips.contains(zip_key) {
+            continue;
+        }
         seen_zips.insert(zip_key.clone());
 
         match state.storage.download(zip_key).await {
-            Ok(zip_bytes) => {
-                match csv_parser::extract_zip(&zip_bytes) {
-                    Ok(files) => {
-                        if let Some((_, bytes)) = files.iter().find(|(name, _)| name.to_uppercase().contains("KUDGIVT")) {
-                            let text = csv_parser::decode_shift_jis(bytes);
-                            match parse_kudgivt(&text) {
-                                Ok(rows) => {
-                                    tracing::info!("KUDGIVT from ZIP {}: {} rows", zip_key, rows.len());
-                                    all_kudgivt.extend(rows);
-                                }
-                                Err(e) => tracing::warn!("KUDGIVT parse error in {}: {e}", zip_key),
+            Ok(zip_bytes) => match csv_parser::extract_zip(&zip_bytes) {
+                Ok(files) => {
+                    if let Some((_, bytes)) = files
+                        .iter()
+                        .find(|(name, _)| name.to_uppercase().contains("KUDGIVT"))
+                    {
+                        let text = csv_parser::decode_shift_jis(bytes);
+                        match parse_kudgivt(&text) {
+                            Ok(rows) => {
+                                tracing::info!("KUDGIVT from ZIP {}: {} rows", zip_key, rows.len());
+                                all_kudgivt.extend(rows);
                             }
+                            Err(e) => tracing::warn!("KUDGIVT parse error in {}: {e}", zip_key),
                         }
                     }
-                    Err(e) => tracing::warn!("ZIP extract error {}: {e}", zip_key),
                 }
-            }
+                Err(e) => tracing::warn!("ZIP extract error {}: {e}", zip_key),
+            },
             Err(e) => tracing::warn!("ZIP download error {}: {e}", zip_key),
         }
     }
@@ -1292,10 +1643,13 @@ async fn load_kudgivt_from_zips(
     // 複数ZIPに同じKUDGIVTデータが含まれる場合の対策
     let before = all_kudgivt.len();
     let mut seen = std::collections::HashSet::new();
-    all_kudgivt.retain(|row| {
-        seen.insert((row.unko_no.clone(), row.event_cd.clone(), row.start_at))
-    });
-    tracing::info!("Total KUDGIVT from ZIPs: {} rows (deduped from {})", all_kudgivt.len(), before);
+    all_kudgivt
+        .retain(|row| seen.insert((row.unko_no.clone(), row.event_cd.clone(), row.start_at)));
+    tracing::info!(
+        "Total KUDGIVT from ZIPs: {} rows (deduped from {})",
+        all_kudgivt.len(),
+        before
+    );
     Ok(all_kudgivt)
 }
 
@@ -1390,10 +1744,7 @@ async fn internal_upload_zip(
                 );
             }
             "file" => {
-                let filename = field
-                    .file_name()
-                    .unwrap_or("upload.zip")
-                    .to_string();
+                let filename = field.file_name().unwrap_or("upload.zip").to_string();
                 let bytes = field
                     .bytes()
                     .await
@@ -1404,8 +1755,8 @@ async fn internal_upload_zip(
         }
     }
 
-    let tenant_id_str = tenant_id_str
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing tenant_id field".into()))?;
+    let tenant_id_str =
+        tenant_id_str.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing tenant_id field".into()))?;
     let tenant_id = Uuid::parse_str(&tenant_id_str)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid tenant_id: {e}")))?;
     let (filename, zip_bytes) =
@@ -1487,10 +1838,7 @@ async fn internal_store_zip(
                 );
             }
             "file" => {
-                let filename = field
-                    .file_name()
-                    .unwrap_or("upload.zip")
-                    .to_string();
+                let filename = field.file_name().unwrap_or("upload.zip").to_string();
                 let bytes = field
                     .bytes()
                     .await
@@ -1501,8 +1849,8 @@ async fn internal_store_zip(
         }
     }
 
-    let tenant_id_str = tenant_id_str
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing tenant_id field".into()))?;
+    let tenant_id_str =
+        tenant_id_str.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing tenant_id field".into()))?;
     let tenant_id = Uuid::parse_str(&tenant_id_str)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid tenant_id: {e}")))?;
     let (filename, zip_bytes) =
@@ -1532,7 +1880,11 @@ async fn internal_store_zip(
     .await
     .map_err(internal_err)?;
 
-    tracing::info!("ZIP stored for retry: upload_id={}, key={}", upload_id, zip_key);
+    tracing::info!(
+        "ZIP stored for retry: upload_id={}, key={}",
+        upload_id,
+        zip_key
+    );
 
     Ok(Json(UploadResponse {
         upload_id,
@@ -1566,10 +1918,7 @@ async fn enqueue_csv_split(state: &AppState, upload_id: Uuid) -> Result<(), anyh
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("No access_token in metadata response"))?;
 
-    let task_url = format!(
-        "{}/internal/split-csv/{}",
-        config.self_url, upload_id
-    );
+    let task_url = format!("{}/internal/split-csv/{}", config.self_url, upload_id);
 
     let task_body = serde_json::json!({
         "task": {
@@ -1616,7 +1965,10 @@ async fn split_csv_from_r2(state: &AppState, upload_id: Uuid) -> Result<(), anyh
 
     let (tenant_id, r2_zip_key) = record;
 
-    let zip_bytes = state.storage.download(&r2_zip_key).await
+    let zip_bytes = state
+        .storage
+        .download(&r2_zip_key)
+        .await
         .map_err(|e| anyhow::anyhow!("R2 download failed: {e}"))?;
 
     let files = csv_parser::extract_zip(&zip_bytes)?;
@@ -1662,12 +2014,15 @@ async fn split_csv_from_r2(state: &AppState, upload_id: Uuid) -> Result<(), anyh
     let batch_size = 20;
     let mut csv_count = 0usize;
     for chunk in upload_items.chunks(batch_size) {
-        let futures: Vec<_> = chunk.iter().map(|(key, content, _)| {
-            let storage = state.storage.clone();
-            let k = key.clone();
-            let c = content.clone();
-            async move { storage.upload(&k, &c, "text/csv").await }
-        }).collect();
+        let futures: Vec<_> = chunk
+            .iter()
+            .map(|(key, content, _)| {
+                let storage = state.storage.clone();
+                let k = key.clone();
+                let c = content.clone();
+                async move { storage.upload(&k, &c, "text/csv").await }
+            })
+            .collect();
         let results = futures::future::join_all(futures).await;
         csv_count += results.len();
     }
@@ -1675,7 +2030,9 @@ async fn split_csv_from_r2(state: &AppState, upload_id: Uuid) -> Result<(), anyh
     // has_kudgivt フラグを更新
     if !kudgivt_unko_nos.is_empty() {
         for chunk in kudgivt_unko_nos.chunks(100) {
-            let placeholders: Vec<String> = chunk.iter().enumerate()
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .enumerate()
                 .map(|(i, _)| format!("${}", i + 2))
                 .collect();
             let sql = format!(
@@ -1693,7 +2050,9 @@ async fn split_csv_from_r2(state: &AppState, upload_id: Uuid) -> Result<(), anyh
 
     tracing::info!(
         "CSV split done: {} files uploaded (upload_id={}, tenant={})",
-        csv_count, upload_id, tenant_id
+        csv_count,
+        upload_id,
+        tenant_id
     );
     Ok(())
 }
@@ -1709,7 +2068,9 @@ async fn internal_split_csv(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "status": "ok", "upload_id": upload_id })))
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "upload_id": upload_id }),
+    ))
 }
 
 /// R2 に保存済みの ZIP をダウンロード
@@ -1724,22 +2085,32 @@ async fn internal_download(
     .fetch_optional(&state.pool)
     .await
     .map_err(internal_err)?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("upload {} not found", upload_id)))?;
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("upload {} not found", upload_id),
+        )
+    })?;
 
     let (r2_zip_key, filename) = record;
 
-    let zip_bytes = state
-        .storage
-        .download(&r2_zip_key)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("R2 download failed: {e}")))?;
+    let zip_bytes = state.storage.download(&r2_zip_key).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("R2 download failed: {e}"),
+        )
+    })?;
 
     // ASCII-safe filename fallback
     let safe_name = filename
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
         .collect::<String>();
-    let safe_name = if safe_name.is_empty() { "download.zip".to_string() } else { safe_name };
+    let safe_name = if safe_name.is_empty() {
+        "download.zip".to_string()
+    } else {
+        safe_name
+    };
 
     Ok(Response::builder()
         .header("Content-Type", "application/zip")
@@ -1764,18 +2135,29 @@ async fn internal_rerun(
     .fetch_optional(&state.pool)
     .await
     .map_err(internal_err)?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("upload {} not found", upload_id)))?;
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("upload {} not found", upload_id),
+        )
+    })?;
 
     let (tenant_id, r2_zip_key, filename) = record;
 
     // R2 から ZIP をダウンロード
-    let zip_bytes = state
-        .storage
-        .download(&r2_zip_key)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("R2 download failed: {e}")))?;
+    let zip_bytes = state.storage.download(&r2_zip_key).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("R2 download failed: {e}"),
+        )
+    })?;
 
-    tracing::info!("Rerun: upload_id={}, tenant={}, file={}", upload_id, tenant_id, filename);
+    tracing::info!(
+        "Rerun: upload_id={}, tenant={}, file={}",
+        upload_id,
+        tenant_id,
+        filename
+    );
 
     match process_zip(&state, tenant_id, upload_id, &filename, &zip_bytes).await {
         Ok(count) => {
@@ -1865,6 +2247,8 @@ async fn internal_recalculate_all(
             drive_time_bypass: Option<i32>,
         }
 
+        // 月末の日跨ぎ運行を捕捉するため、翌月1日までの運行も取得
+        let fetch_end = month_end + chrono::Duration::days(1);
         let op_rows = match sqlx::query_as::<_, OpRow>(
             r#"SELECT DISTINCT o.unko_no, o.reading_date, o.operation_date,
                       o.departure_at, o.return_at,
@@ -1880,7 +2264,7 @@ async fn internal_recalculate_all(
         )
         .bind(tenant_id)
         .bind(month_start)
-        .bind(month_end)
+        .bind(fetch_end)
         .fetch_all(&state.pool)
         .await
         {
@@ -1892,35 +2276,39 @@ async fn internal_recalculate_all(
         };
 
         // OpRow → KudguriRow に変換
-        let ops: Vec<KudguriRow> = op_rows.iter().map(|r| KudguriRow {
-            unko_no: r.unko_no.clone(),
-            reading_date: r.reading_date,
-            operation_date: r.operation_date,
-            office_cd: String::new(),
-            office_name: String::new(),
-            vehicle_cd: String::new(),
-            vehicle_name: String::new(),
-            driver_cd: r.driver_cd.clone().unwrap_or_default(),
-            driver_name: String::new(),
-            crew_role: 0,
-            departure_at: r.departure_at.map(|dt| dt.naive_utc()),
-            return_at: r.return_at.map(|dt| dt.naive_utc()),
-            garage_out_at: None,
-            garage_in_at: None,
-            meter_start: None,
-            meter_end: None,
-            total_distance: r.total_distance,
-            drive_time_general: r.drive_time_general,
-            drive_time_highway: r.drive_time_highway,
-            drive_time_bypass: r.drive_time_bypass,
-            safety_score: None,
-            economy_score: None,
-            total_score: None,
-            raw_data: serde_json::Value::Null,
-        }).collect();
+        let ops: Vec<KudguriRow> = op_rows
+            .iter()
+            .map(|r| KudguriRow {
+                unko_no: r.unko_no.clone(),
+                reading_date: r.reading_date,
+                operation_date: r.operation_date,
+                office_cd: String::new(),
+                office_name: String::new(),
+                vehicle_cd: String::new(),
+                vehicle_name: String::new(),
+                driver_cd: r.driver_cd.clone().unwrap_or_default(),
+                driver_name: String::new(),
+                crew_role: 0,
+                departure_at: r.departure_at.map(|dt| dt.naive_utc()),
+                return_at: r.return_at.map(|dt| dt.naive_utc()),
+                garage_out_at: None,
+                garage_in_at: None,
+                meter_start: None,
+                meter_end: None,
+                total_distance: r.total_distance,
+                drive_time_general: r.drive_time_general,
+                drive_time_highway: r.drive_time_highway,
+                drive_time_bypass: r.drive_time_bypass,
+                safety_score: None,
+                economy_score: None,
+                total_score: None,
+                raw_data: serde_json::Value::Null,
+            })
+            .collect();
 
         let total = ops.len();
-        send(serde_json::json!({"event":"progress","current":0,"total":total,"step":"start"})).await;
+        send(serde_json::json!({"event":"progress","current":0,"total":total,"step":"start"}))
+            .await;
 
         // 2. R2から各運行のKUDGIVT.csvを取得
         let mut all_kudgivt: Vec<KudgivtRow> = Vec::new();
@@ -1932,7 +2320,8 @@ async fn internal_recalculate_all(
                 "current": batch_end,
                 "total": total,
                 "step": "download"
-            })).await;
+            }))
+            .await;
 
             let futures: Vec<_> = ops[batch_start..batch_end]
                 .iter()
@@ -1970,23 +2359,35 @@ async fn internal_recalculate_all(
             "current": total,
             "total": total,
             "step": "calculate"
-        })).await;
+        }))
+        .await;
 
         // 2.5. KUDGFRYからフェリー時間を取得
         let ferry_minutes = load_ferry_minutes(&state, tenant_id, &ops).await;
 
         // 3. 再計算
-        match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, &ferry_minutes, Some(tx.clone())).await {
+        match calculate_daily_hours(
+            &state,
+            tenant_id,
+            &ops,
+            &all_kudgivt,
+            &ferry_minutes,
+            Some(tx.clone()),
+        )
+        .await
+        {
             Ok(()) => {
                 send(serde_json::json!({
                     "event": "done",
                     "total": total,
                     "success": total,
                     "failed": 0
-                })).await;
+                }))
+                .await;
             }
             Err(e) => {
-                send(serde_json::json!({"event":"error","message":format!("計算エラー: {e}")})).await;
+                send(serde_json::json!({"event":"error","message":format!("計算エラー: {e}")}))
+                    .await;
             }
         }
     });
@@ -2007,7 +2408,17 @@ async fn internal_recalculate_all(
 async fn list_pending_uploads(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         r#"SELECT id, tenant_id, filename, status, error_message, created_at
            FROM upload_history
            WHERE status IN ('pending_retry', 'failed')
@@ -2090,7 +2501,8 @@ async fn recalculate_driver(
         {
             Ok(d) => d,
             Err(e) => {
-                send(serde_json::json!({"event":"error","message":format!("driver error: {e}")})).await;
+                send(serde_json::json!({"event":"error","message":format!("driver error: {e}")}))
+                    .await;
                 return;
             }
         };
@@ -2114,6 +2526,8 @@ async fn recalculate_driver(
             drive_time_bypass: Option<i32>,
         }
 
+        // 月末の日跨ぎ運行を捕捉するため、翌月1日までの運行も取得
+        let fetch_end = month_end + chrono::Duration::days(1);
         let op_rows = match sqlx::query_as::<_, OpRow>(
             r#"SELECT DISTINCT o.unko_no, o.reading_date, o.operation_date,
                       o.departure_at, o.return_at,
@@ -2128,7 +2542,7 @@ async fn recalculate_driver(
         .bind(tenant_id)
         .bind(driver_id)
         .bind(month_start)
-        .bind(month_end)
+        .bind(fetch_end)
         .fetch_all(&state.pool)
         .await
         {
@@ -2139,32 +2553,35 @@ async fn recalculate_driver(
             }
         };
 
-        let ops: Vec<KudguriRow> = op_rows.iter().map(|r| KudguriRow {
-            unko_no: r.unko_no.clone(),
-            reading_date: r.reading_date,
-            operation_date: r.operation_date,
-            office_cd: String::new(),
-            office_name: String::new(),
-            vehicle_cd: String::new(),
-            vehicle_name: String::new(),
-            driver_cd: driver_cd.clone(),
-            driver_name: String::new(),
-            crew_role: 0,
-            departure_at: r.departure_at.map(|dt| dt.naive_utc()),
-            return_at: r.return_at.map(|dt| dt.naive_utc()),
-            garage_out_at: None,
-            garage_in_at: None,
-            meter_start: None,
-            meter_end: None,
-            total_distance: r.total_distance,
-            drive_time_general: r.drive_time_general,
-            drive_time_highway: r.drive_time_highway,
-            drive_time_bypass: r.drive_time_bypass,
-            safety_score: None,
-            economy_score: None,
-            total_score: None,
-            raw_data: serde_json::Value::Null,
-        }).collect();
+        let ops: Vec<KudguriRow> = op_rows
+            .iter()
+            .map(|r| KudguriRow {
+                unko_no: r.unko_no.clone(),
+                reading_date: r.reading_date,
+                operation_date: r.operation_date,
+                office_cd: String::new(),
+                office_name: String::new(),
+                vehicle_cd: String::new(),
+                vehicle_name: String::new(),
+                driver_cd: driver_cd.clone(),
+                driver_name: String::new(),
+                crew_role: 0,
+                departure_at: r.departure_at.map(|dt| dt.naive_utc()),
+                return_at: r.return_at.map(|dt| dt.naive_utc()),
+                garage_out_at: None,
+                garage_in_at: None,
+                meter_start: None,
+                meter_end: None,
+                total_distance: r.total_distance,
+                drive_time_general: r.drive_time_general,
+                drive_time_highway: r.drive_time_highway,
+                drive_time_bypass: r.drive_time_bypass,
+                safety_score: None,
+                economy_score: None,
+                total_score: None,
+                raw_data: serde_json::Value::Null,
+            })
+            .collect();
 
         let total = ops.len();
         send(serde_json::json!({"event":"progress","current":0,"total":total,"step":"start","driver_cd":&driver_cd})).await;
@@ -2175,9 +2592,12 @@ async fn recalculate_driver(
             "current": 0,
             "total": total,
             "step": "download"
-        })).await;
+        }))
+        .await;
 
-        let all_kudgivt = match load_kudgivt_from_zips(&state, tenant_id, month_start, month_end).await {
+        let all_kudgivt = match load_kudgivt_from_zips(&state, tenant_id, month_start, month_end)
+            .await
+        {
             Ok(rows) => rows,
             Err(e) => {
                 send(serde_json::json!({"event":"error","message":format!("KUDGIVT取得エラー: {e}")})).await;
@@ -2190,22 +2610,34 @@ async fn recalculate_driver(
             "current": total,
             "total": total,
             "step": "calculate"
-        })).await;
+        }))
+        .await;
 
         // 2.5. KUDGFRYからフェリー時間を取得
         let ferry_minutes = load_ferry_minutes(&state, tenant_id, &ops).await;
 
         // 3. 再計算
-        match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, &ferry_minutes, Some(tx.clone())).await {
+        match calculate_daily_hours(
+            &state,
+            tenant_id,
+            &ops,
+            &all_kudgivt,
+            &ferry_minutes,
+            Some(tx.clone()),
+        )
+        .await
+        {
             Ok(()) => {
                 send(serde_json::json!({
                     "event": "done",
                     "total": total,
                     "driver_cd": &driver_cd
-                })).await;
+                }))
+                .await;
             }
             Err(e) => {
-                send(serde_json::json!({"event":"error","message":format!("計算エラー: {e}")})).await;
+                send(serde_json::json!({"event":"error","message":format!("計算エラー: {e}")}))
+                    .await;
             }
         }
     });
@@ -2227,7 +2659,17 @@ async fn list_uploads(
     State(state): State<AppState>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+            String,
+        ),
+    >(
         r#"SELECT id, filename, status, error_message, created_at, r2_zip_key
            FROM upload_history
            WHERE tenant_id = $1
@@ -2268,7 +2710,9 @@ async fn split_csv_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "status": "ok", "upload_id": upload_id })))
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "upload_id": upload_id }),
+    ))
 }
 
 /// 全completedアップロードのCSV分割（SSE進捗）
@@ -2312,14 +2756,18 @@ async fn split_csv_all_handler(
 
         // ファイル名で重複排除
         let mut seen_filenames = std::collections::HashSet::new();
-        let uploads: Vec<_> = uploads.into_iter().filter(|(_, f)| seen_filenames.insert(f.clone())).collect();
+        let uploads: Vec<_> = uploads
+            .into_iter()
+            .filter(|(_, f)| seen_filenames.insert(f.clone()))
+            .collect();
 
         let total = uploads.len();
         if total == 0 {
             send(serde_json::json!({"event":"done","total":0,"success":0,"failed":0})).await;
             return;
         }
-        send(serde_json::json!({"event":"progress","current":0,"total":total,"step":"start"})).await;
+        send(serde_json::json!({"event":"progress","current":0,"total":total,"step":"start"}))
+            .await;
 
         // 5並列でZIPを処理
         let success = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2328,31 +2776,38 @@ async fn split_csv_all_handler(
 
         let zip_batch = 5;
         for chunk in uploads.chunks(zip_batch) {
-            let futures: Vec<_> = chunk.iter().map(|(upload_id, _filename)| {
-                let st = state.clone();
-                let uid = *upload_id;
-                let s = success.clone();
-                let f = failed.clone();
-                async move {
-                    match split_csv_from_r2(&st, uid).await {
-                        Ok(()) => { s.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                        Err(e) => {
-                            tracing::warn!("split failed for {}: {e}", uid);
-                            f.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(upload_id, _filename)| {
+                    let st = state.clone();
+                    let uid = *upload_id;
+                    let s = success.clone();
+                    let f = failed.clone();
+                    async move {
+                        match split_csv_from_r2(&st, uid).await {
+                            Ok(()) => {
+                                s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                tracing::warn!("split failed for {}: {e}", uid);
+                                f.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
-                }
-            }).collect();
+                })
+                .collect();
 
             futures::future::join_all(futures).await;
 
-            let current = done_count.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed) + chunk.len();
+            let current = done_count.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed)
+                + chunk.len();
             send(serde_json::json!({
                 "event":"progress",
                 "current": current,
                 "total": total,
                 "step": "split",
-            })).await;
+            }))
+            .await;
         }
 
         let success = success.load(std::sync::atomic::Ordering::Relaxed);
@@ -2363,7 +2818,8 @@ async fn split_csv_all_handler(
             "total": total,
             "success": success,
             "failed": failed,
-        })).await;
+        }))
+        .await;
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)

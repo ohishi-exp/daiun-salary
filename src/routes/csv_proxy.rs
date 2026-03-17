@@ -10,10 +10,7 @@ use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route(
-        "/operations/{unko_no}/csv/{csv_type}",
-        get(get_csv_as_json),
-    )
+    Router::new().route("/operations/{unko_no}/csv/{csv_type}", get(get_csv_as_json))
 }
 
 #[derive(Debug, Serialize)]
@@ -39,14 +36,10 @@ async fn get_csv_as_json(
     let key = format!("{}/unko/{}/{}", auth_user.tenant_id, unko_no, filename);
     tracing::info!("CSV download: key={}", key);
 
-    let bytes = state
-        .storage
-        .download(&key)
-        .await
-        .map_err(|e| {
-            tracing::error!("CSV download failed: key={}, error={}", key, e);
-            StatusCode::NOT_FOUND
-        })?;
+    let bytes = state.storage.download(&key).await.map_err(|e| {
+        tracing::error!("CSV download failed: key={}, error={}", key, e);
+        StatusCode::NOT_FOUND
+    })?;
 
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = text.lines();

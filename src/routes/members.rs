@@ -5,9 +5,7 @@ use axum::{
     Extension, Json, Router,
 };
 
-use crate::db::models::{
-    InviteMemberRequest, TenantMemberListItem, UpdateMemberRoleRequest,
-};
+use crate::db::models::{InviteMemberRequest, TenantMemberListItem, UpdateMemberRoleRequest};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
@@ -63,9 +61,7 @@ async fn invite_member(
     .fetch_one(&state.pool)
     .await
     .map_err(|e| {
-        if e.to_string().contains("duplicate key")
-            || e.to_string().contains("unique constraint")
-        {
+        if e.to_string().contains("duplicate key") || e.to_string().contains("unique constraint") {
             (StatusCode::CONFLICT, "member already exists".to_string())
         } else {
             tracing::error!("Failed to invite member: {e}");
@@ -104,21 +100,20 @@ async fn update_member_role(
         ));
     }
 
-    let result = sqlx::query(
-        "UPDATE tenant_members SET role = $1 WHERE tenant_id = $2 AND email = $3",
-    )
-    .bind(&req.role)
-    .bind(auth_user.tenant_id)
-    .bind(&email)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to update member role: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to update role".to_string(),
-        )
-    })?;
+    let result =
+        sqlx::query("UPDATE tenant_members SET role = $1 WHERE tenant_id = $2 AND email = $3")
+            .bind(&req.role)
+            .bind(auth_user.tenant_id)
+            .bind(&email)
+            .execute(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to update member role: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to update role".to_string(),
+                )
+            })?;
 
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "member not found".to_string()));
@@ -160,20 +155,19 @@ async fn remove_member(
     })?;
 
     // 削除対象が admin かチェック
-    let target_role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM tenant_members WHERE tenant_id = $1 AND email = $2",
-    )
-    .bind(auth_user.tenant_id)
-    .bind(&email)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to get member role: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error".to_string(),
-        )
-    })?;
+    let target_role: Option<String> =
+        sqlx::query_scalar("SELECT role FROM tenant_members WHERE tenant_id = $1 AND email = $2")
+            .bind(auth_user.tenant_id)
+            .bind(&email)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to get member role: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
+            })?;
 
     match target_role {
         None => return Err((StatusCode::NOT_FOUND, "member not found".to_string())),

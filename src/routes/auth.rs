@@ -78,12 +78,11 @@ async fn google_code_login(
         })?;
 
     // Find or create user
-    let existing_user =
-        sqlx::query_as::<_, User>("SELECT * FROM users WHERE google_sub = $1")
-            .bind(&google_claims.sub)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let existing_user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE google_sub = $1")
+        .bind(&google_claims.sub)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let user = match existing_user {
         Some(user) => user,
@@ -148,8 +147,8 @@ async fn google_code_login(
         }
     };
 
-    let access_token = create_access_token(&user, &jwt_secret)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let access_token =
+        create_access_token(&user, &jwt_secret).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let (raw_refresh, refresh_hash) = create_refresh_token();
     let expires_at = refresh_token_expires_at();
@@ -210,8 +209,8 @@ async fn refresh_token(
     .ok_or(StatusCode::UNAUTHORIZED)?;
 
     // user.tenant_id は最後に切り替えたテナント
-    let access_token = create_access_token(&user, &jwt_secret)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let access_token =
+        create_access_token(&user, &jwt_secret).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(RefreshResponse {
         access_token,
@@ -302,8 +301,9 @@ async fn switch_tenant(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let access_token = create_access_token_for_tenant(&user, body.tenant_id, &tenant.member_role, &jwt_secret)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let access_token =
+        create_access_token_for_tenant(&user, body.tenant_id, &tenant.member_role, &jwt_secret)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(SwitchTenantResponse {
         access_token,

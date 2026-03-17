@@ -4,18 +4,18 @@ use std::collections::HashMap;
 use super::kudgivt::KudgivtRow;
 
 /// 改善基準告示の休息基準（分）
-const REST_THRESHOLD_PRINCIPAL: i32 = 540;  // 原則: 連続540分以上
-const REST_SPLIT_MIN: i32 = 180;            // 分割特例: 1回180分以上
-const REST_SPLIT_2_TOTAL: i32 = 600;        // 2分割: 合計600分以上
-const REST_SPLIT_3_TOTAL: i32 = 720;        // 3分割: 合計720分以上
-const MAX_WORK_HOURS: i64 = 24 * 60;        // 24時間ルール（分）
+const REST_THRESHOLD_PRINCIPAL: i32 = 540; // 原則: 連続540分以上
+const REST_SPLIT_MIN: i32 = 180; // 分割特例: 1回180分以上
+const REST_SPLIT_2_TOTAL: i32 = 600; // 2分割: 合計600分以上
+const REST_SPLIT_3_TOTAL: i32 = 720; // 3分割: 合計720分以上
+const MAX_WORK_HOURS: i64 = 24 * 60; // 24時間ルール（分）
 
 /// 1つの勤務日（始業〜終業）
 #[derive(Debug, Clone)]
 pub struct Workday {
-    pub start: NaiveDateTime,  // 始業
-    pub end: NaiveDateTime,    // 終業
-    pub date: NaiveDate,       // 帰属日 = start.date()
+    pub start: NaiveDateTime, // 始業
+    pub end: NaiveDateTime,   // 終業
+    pub date: NaiveDate,      // 帰属日 = start.date()
 }
 
 /// ドライバーの全302イベントから勤務日（始業〜終業）を決定する
@@ -37,7 +37,12 @@ pub fn determine_workdays(
     let mut workdays = Vec::new();
     let mut current_start = first_start;
     let mut split_rests: Vec<i32> = Vec::new(); // 分割特例用: 180分以上の休息を蓄積
-    tracing::debug!("determine_workdays: first_start={}, last_end={}, rest_events={}", first_start, last_end, rest_events.len());
+    tracing::debug!(
+        "determine_workdays: first_start={}, last_end={}, rest_events={}",
+        first_start,
+        last_end,
+        rest_events.len()
+    );
 
     for &(rest_start, rest_duration) in rest_events {
         let rest_end = rest_start + chrono::Duration::minutes(rest_duration as i64);
@@ -93,11 +98,23 @@ pub fn determine_workdays(
     }
 
     // 最後の勤務日（24hルールで複数日に分割される可能性あり）
-    tracing::debug!("determine_workdays: after loop, current_start={}, last_end={}, workdays_so_far={}", current_start, last_end, workdays.len());
+    tracing::debug!(
+        "determine_workdays: after loop, current_start={}, last_end={}, workdays_so_far={}",
+        current_start,
+        last_end,
+        workdays.len()
+    );
     for (i, wd) in workdays.iter().enumerate() {
         if wd.date >= chrono::NaiveDate::from_ymd_opt(2026, 2, 17).unwrap()
-            && wd.date <= chrono::NaiveDate::from_ymd_opt(2026, 2, 20).unwrap() {
-            tracing::debug!("  workday[{}]: date={}, start={}, end={}", i, wd.date, wd.start, wd.end);
+            && wd.date <= chrono::NaiveDate::from_ymd_opt(2026, 2, 20).unwrap()
+        {
+            tracing::debug!(
+                "  workday[{}]: date={}, start={}, end={}",
+                i,
+                wd.date,
+                wd.start,
+                wd.end
+            );
         }
     }
     while current_start < last_end {
@@ -161,7 +178,8 @@ pub fn calc_late_night_mins(day_start: NaiveDateTime, day_end: NaiveDateTime) ->
     // 同一日 or ちょうど翌日0:00 → 単一日ロジック
     if day_end.date() == day_start.date()
         || (day_end.date() == day_start.date().succ_opt().unwrap()
-            && day_end.hour() == 0 && day_end.minute() == 0)
+            && day_end.hour() == 0
+            && day_end.minute() == 0)
     {
         return calc_late_night_single_day(day_start, day_end);
     }
@@ -169,8 +187,7 @@ pub fn calc_late_night_mins(day_start: NaiveDateTime, day_end: NaiveDateTime) ->
     let mut total = 0i32;
     let mut cur = day_start;
     while cur.date() < day_end.date() {
-        let midnight = cur.date().succ_opt().unwrap()
-            .and_hms_opt(0, 0, 0).unwrap();
+        let midnight = cur.date().succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
         total += calc_late_night_single_day(cur, midnight);
         cur = midnight;
     }
@@ -182,13 +199,14 @@ pub fn calc_late_night_mins(day_start: NaiveDateTime, day_end: NaiveDateTime) ->
 fn calc_late_night_single_day(day_start: NaiveDateTime, day_end: NaiveDateTime) -> i32 {
     let mut total = 0i32;
     let start_h = day_start.hour() * 60 + day_start.minute();
-    let end_h = if day_end.date() > day_start.date() && day_end.hour() == 0 && day_end.minute() == 0 {
+    let end_h = if day_end.date() > day_start.date() && day_end.hour() == 0 && day_end.minute() == 0
+    {
         1440u32
     } else {
         day_end.hour() * 60 + day_end.minute()
     };
     // 0:00〜5:00 (0〜300分)
-    let early_start = start_h.max(0);
+    let early_start = start_h;
     let early_end = end_h.min(300);
     if early_end > early_start {
         total += (early_end - early_start) as i32;
@@ -241,13 +259,13 @@ pub fn split_by_rest(
     // 実際の終了時刻 = イベントの最終終了時刻（なければreturn_at）
     let actual_end = events
         .iter()
-        .filter_map(|e| {
+        .map(|e| {
             let dur = e.duration_minutes.unwrap_or(0);
             if dur > 0 {
-                Some(e.start_at + chrono::Duration::minutes(dur as i64))
+                e.start_at + chrono::Duration::minutes(dur as i64)
             } else {
                 // duration=0 のイベント（運行開始/終了等）は start_at を使う
-                Some(e.start_at)
+                e.start_at
             }
         })
         .max()
@@ -262,7 +280,8 @@ pub fn split_by_rest(
         let rest_end = rest_start + chrono::Duration::minutes(duration as i64);
 
         if rest_start > current_start {
-            let (drive, cargo) = sum_events_in_range(&labor_events, classifications, current_start, rest_start);
+            let (drive, cargo) =
+                sum_events_in_range(&labor_events, classifications, current_start, rest_start);
             segments.push(WorkSegment {
                 start: current_start,
                 end: rest_start,
@@ -277,7 +296,8 @@ pub fn split_by_rest(
 
     // 最後の区間
     if current_start < actual_end {
-        let (drive, cargo) = sum_events_in_range(&labor_events, classifications, current_start, actual_end);
+        let (drive, cargo) =
+            sum_events_in_range(&labor_events, classifications, current_start, actual_end);
         segments.push(WorkSegment {
             start: current_start,
             end: actual_end,
@@ -333,7 +353,10 @@ fn sum_events_in_range(
 ) -> (i32, i32) {
     let mut drive = 0i32;
     let mut cargo = 0i32;
-    for e in events.iter().filter(|e| e.start_at >= range_start && e.start_at < range_end) {
+    for e in events
+        .iter()
+        .filter(|e| e.start_at >= range_start && e.start_at < range_end)
+    {
         let dur = e.duration_minutes.unwrap_or(0);
         match classifications.get(&e.event_cd) {
             Some(EventClass::Drive) => drive += dur,
@@ -421,7 +444,12 @@ mod tests {
         m
     }
 
-    fn make_event(unko_no: &str, start_at: NaiveDateTime, event_cd: &str, duration: Option<i32>) -> KudgivtRow {
+    fn make_event(
+        unko_no: &str,
+        start_at: NaiveDateTime,
+        event_cd: &str,
+        duration: Option<i32>,
+    ) -> KudgivtRow {
         KudgivtRow {
             unko_no: unko_no.to_string(),
             reading_date: NaiveDate::from_ymd_opt(2026, 2, 27).unwrap(),
@@ -449,9 +477,7 @@ mod tests {
     fn test_no_rest_events_single_segment() {
         let dep = dt(2026, 2, 24, 10, 0);
         let ret = dt(2026, 2, 24, 18, 0);
-        let events = vec![
-            make_event("001", dt(2026, 2, 24, 10, 0), "110", Some(300)),
-        ];
+        let events = vec![make_event("001", dt(2026, 2, 24, 10, 0), "110", Some(300))];
         let refs: Vec<&KudgivtRow> = events.iter().collect();
         let cls = make_classifications();
 
@@ -467,7 +493,7 @@ mod tests {
         let dep = dt(2026, 2, 24, 10, 0);
         let ret = dt(2026, 2, 25, 18, 0);
         let events = vec![
-            make_event("001", dt(2026, 2, 24, 10, 0), "110", Some(240)),  // 運転 4h
+            make_event("001", dt(2026, 2, 24, 10, 0), "110", Some(240)), // 運転 4h
             make_event("001", dt(2026, 2, 24, 14, 0), "302", Some(600)), // 休息 10h
             make_event("001", dt(2026, 2, 25, 0, 0), "110", Some(480)),  // 運転 8h
         ];
@@ -492,13 +518,13 @@ mod tests {
         let dep = dt(2026, 2, 24, 10, 13);
         let ret = dt(2026, 2, 27, 16, 0);
         let events = vec![
-            make_event("001", dt(2026, 2, 24, 10, 25), "110", Some(324)),   // 運転
-            make_event("001", dt(2026, 2, 24, 14, 40), "302", Some(1123)),  // 休息 ~18.7h
-            make_event("001", dt(2026, 2, 25, 9, 30), "110", Some(200)),    // 運転
-            make_event("001", dt(2026, 2, 25, 21, 31), "302", Some(780)),   // 休息 13h
-            make_event("001", dt(2026, 2, 26, 10, 30), "110", Some(300)),   // 運転
-            make_event("001", dt(2026, 2, 26, 21, 25), "302", Some(572)),   // 休息 ~9.5h
-            make_event("001", dt(2026, 2, 27, 7, 0), "110", Some(400)),     // 運転
+            make_event("001", dt(2026, 2, 24, 10, 25), "110", Some(324)), // 運転
+            make_event("001", dt(2026, 2, 24, 14, 40), "302", Some(1123)), // 休息 ~18.7h
+            make_event("001", dt(2026, 2, 25, 9, 30), "110", Some(200)),  // 運転
+            make_event("001", dt(2026, 2, 25, 21, 31), "302", Some(780)), // 休息 13h
+            make_event("001", dt(2026, 2, 26, 10, 30), "110", Some(300)), // 運転
+            make_event("001", dt(2026, 2, 26, 21, 25), "302", Some(572)), // 休息 ~9.5h
+            make_event("001", dt(2026, 2, 27, 7, 0), "110", Some(400)),   // 運転
         ];
         let refs: Vec<&KudgivtRow> = events.iter().collect();
         let cls = make_classifications();
@@ -558,21 +584,21 @@ mod tests {
     #[test]
     fn test_calc_late_night_mins() {
         // 22:00〜翌05:00 の全深夜帯
-        assert_eq!(calc_late_night_mins(
-            dt(2026, 1, 1, 22, 0),
-            dt(2026, 1, 1, 23, 30),
-        ), 90);
+        assert_eq!(
+            calc_late_night_mins(dt(2026, 1, 1, 22, 0), dt(2026, 1, 1, 23, 30),),
+            90
+        );
 
         // 0:00〜5:00
-        assert_eq!(calc_late_night_mins(
-            dt(2026, 1, 1, 0, 0),
-            dt(2026, 1, 1, 5, 0),
-        ), 300);
+        assert_eq!(
+            calc_late_night_mins(dt(2026, 1, 1, 0, 0), dt(2026, 1, 1, 5, 0),),
+            300
+        );
 
         // 昼間のみ
-        assert_eq!(calc_late_night_mins(
-            dt(2026, 1, 1, 8, 0),
-            dt(2026, 1, 1, 17, 0),
-        ), 0);
+        assert_eq!(
+            calc_late_night_mins(dt(2026, 1, 1, 8, 0), dt(2026, 1, 1, 17, 0),),
+            0
+        );
     }
 }

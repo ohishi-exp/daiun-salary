@@ -3,8 +3,8 @@ use std::convert::Infallible;
 use axum::{
     extract::{Query, State},
     response::sse::{Event, KeepAlive, Sse},
-    Extension, Json, Router,
     routing::{get, post},
+    Extension, Json, Router,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use futures::stream::Stream;
@@ -92,7 +92,9 @@ async fn get_id_token(client: &Client, audience: &str) -> Result<String, String>
         return Err(format!("Metadata server returned {}", res.status()));
     }
 
-    res.text().await.map_err(|e| format!("Failed to read ID token: {e}"))
+    res.text()
+        .await
+        .map_err(|e| format!("Failed to read ID token: {e}"))
 }
 
 /// SSE ストリームプロキシ: dtako-scraper の SSE レスポンスを中継 + DB 保存
@@ -177,10 +179,15 @@ async fn trigger_scrape(
 
                                     // DB に result イベントを保存
                                     if let Ok(evt) = serde_json::from_str::<SseEvent>(data) {
-                                        tracing::info!("SSE event #{}: {:?}", event_count, evt.event);
+                                        tracing::info!(
+                                            "SSE event #{}: {:?}",
+                                            event_count,
+                                            evt.event
+                                        );
                                         if evt.event.as_deref() == Some("result") {
                                             if let Some(ref comp_id) = evt.comp_id {
-                                                let status = evt.status.as_deref().unwrap_or("error");
+                                                let status =
+                                                    evt.status.as_deref().unwrap_or("error");
                                                 let message = evt.message.as_deref();
                                                 let _ = sqlx::query(
                                                     r#"INSERT INTO scrape_history (tenant_id, target_date, comp_id, status, message)
@@ -197,7 +204,11 @@ async fn trigger_scrape(
                                         }
                                     }
 
-                                    if tx.send(Ok(Event::default().data(data.to_string()))).await.is_err() {
+                                    if tx
+                                        .send(Ok(Event::default().data(data.to_string())))
+                                        .await
+                                        .is_err()
+                                    {
                                         tracing::warn!("SSE proxy: client disconnected");
                                         return;
                                     }

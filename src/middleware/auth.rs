@@ -1,10 +1,4 @@
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-    Extension,
-};
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response, Extension};
 use uuid::Uuid;
 
 use crate::auth::jwt::{verify_access_token, JwtSecret};

@@ -149,10 +149,8 @@ pub fn parse_kudgivt(csv_text: &str) -> Result<Vec<KudgivtRow>, anyhow::Error> {
             end_at: get_opt_field(&fields, col_idx.end_at).and_then(parse_datetime),
             event_cd: get_field(&fields, col_idx.event_cd).to_string(),
             event_name: get_field(&fields, col_idx.event_name).to_string(),
-            duration_minutes: get_opt_field(&fields, col_idx.duration_minutes)
-                .and_then(parse_i32),
-            section_distance: get_opt_field(&fields, col_idx.section_distance)
-                .and_then(parse_f64),
+            duration_minutes: get_opt_field(&fields, col_idx.duration_minutes).and_then(parse_i32),
+            section_distance: get_opt_field(&fields, col_idx.section_distance).and_then(parse_f64),
             raw_data: serde_json::Value::Object(raw_map),
         });
     }

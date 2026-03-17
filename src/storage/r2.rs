@@ -23,14 +23,8 @@ impl R2Backend {
             endpoint: format!("https://{}.r2.cloudflarestorage.com", account_id),
         };
 
-        let credentials = Credentials::new(
-            Some(&access_key),
-            Some(&secret_key),
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| StorageError::Config(format!("R2 credentials: {e}")))?;
+        let credentials = Credentials::new(Some(&access_key), Some(&secret_key), None, None, None)
+            .map_err(|e| StorageError::Config(format!("R2 credentials: {e}")))?;
 
         let bucket = Bucket::new(&bucket_name, region, credentials)
             .map_err(|e| StorageError::Config(format!("R2 bucket: {e}")))?;

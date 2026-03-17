@@ -51,8 +51,8 @@ async fn calendar_dates(
     Query(q): Query<CalendarQuery>,
 ) -> Result<Json<CalendarResponse>, StatusCode> {
     let month = q.month as u32;
-    let date_from = chrono::NaiveDate::from_ymd_opt(q.year, month, 1)
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let date_from =
+        chrono::NaiveDate::from_ymd_opt(q.year, month, 1).ok_or(StatusCode::BAD_REQUEST)?;
     let date_to = if month == 12 {
         chrono::NaiveDate::from_ymd_opt(q.year + 1, 1, 1)
     } else {
@@ -98,18 +98,24 @@ async fn calendar_dates(
     use std::collections::HashMap;
     let mut scrape_map: HashMap<chrono::NaiveDate, Vec<ScrapeStatus>> = HashMap::new();
     for (date, comp_id, status) in scrape_rows {
-        scrape_map.entry(date).or_default().push(ScrapeStatus { comp_id, status });
+        scrape_map
+            .entry(date)
+            .or_default()
+            .push(ScrapeStatus { comp_id, status });
     }
 
     // operations + scrape_history を統合
     let mut date_map: HashMap<chrono::NaiveDate, CalendarDateEntry> = HashMap::new();
     for (date, count) in &rows {
         let scrapes = scrape_map.remove(date).unwrap_or_default();
-        date_map.insert(*date, CalendarDateEntry {
-            date: *date,
-            count: *count,
-            scrapes,
-        });
+        date_map.insert(
+            *date,
+            CalendarDateEntry {
+                date: *date,
+                count: *count,
+                scrapes,
+            },
+        );
     }
     for (date, scrapes) in scrape_map {
         date_map.entry(date).or_insert(CalendarDateEntry {
@@ -218,13 +224,12 @@ async fn delete_operation(
     Extension(auth_user): Extension<AuthUser>,
     Path(unko_no): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let result =
-        sqlx::query("DELETE FROM operations WHERE tenant_id = $1 AND unko_no = $2")
-            .bind(auth_user.tenant_id)
-            .bind(&unko_no)
-            .execute(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = sqlx::query("DELETE FROM operations WHERE tenant_id = $1 AND unko_no = $2")
+        .bind(auth_user.tenant_id)
+        .bind(&unko_no)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);

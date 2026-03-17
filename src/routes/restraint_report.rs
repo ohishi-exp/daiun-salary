@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
+use daiun_salary::compare::{self, parse_restraint_csv, CsvDayRow, CsvDriverData, DiffItem};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -169,15 +170,14 @@ pub async fn build_report(
     month: u32,
 ) -> Result<RestraintReportResponse, (StatusCode, String)> {
     // Get driver name
-    let driver_name: String = sqlx::query_scalar(
-        "SELECT driver_name FROM drivers WHERE id = $1 AND tenant_id = $2",
-    )
-    .bind(driver_id)
-    .bind(tenant_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(internal_err)?
-    .unwrap_or_default();
+    let driver_name: String =
+        sqlx::query_scalar("SELECT driver_name FROM drivers WHERE id = $1 AND tenant_id = $2")
+            .bind(driver_id)
+            .bind(tenant_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(internal_err)?
+            .unwrap_or_default();
 
     build_report_with_name(pool, tenant_id, driver_id, &driver_name, year, month).await
 }
@@ -369,26 +369,29 @@ pub async fn build_report_with_name(
             // 始業: operations.departure_at（分切り捨て）
             // 終業: daily_work_segmentsの最後のend_at（分切り捨て）
             // ※ return_atは帰庫処理時刻で数十秒のズレがあるため、セグメント終了を使う
-            let fmt_trunc = |dt: &DateTime<Utc>| -> String {
-                format!("{}:{:02}", dt.hour(), dt.minute())
-            };
-            let day_start = op_times_map.get(&current_date)
+            let fmt_trunc =
+                |dt: &DateTime<Utc>| -> String { format!("{}:{:02}", dt.hour(), dt.minute()) };
+            let day_start = op_times_map
+                .get(&current_date)
                 .map(|ot| fmt_trunc(&ot.first_departure))
                 .or_else(|| segs.iter().map(|s| s.start_at).min().map(|t| fmt_trunc(&t)));
             // 終業: operation_date単位のセグメント最終end_at（日跨ぎ対応）
-            let day_end = op_times_map.get(&current_date)
+            let day_end = op_times_map
+                .get(&current_date)
                 .map(|ot| fmt_trunc(&ot.last_seg_end))
                 .or_else(|| segs.iter().map(|s| s.end_at).max().map(|t| fmt_trunc(&t)));
 
             let operations: Vec<OperationDetail> = op_map
                 .iter()
-                .map(|(unko_no, (drive, cargo, brk, restraint))| OperationDetail {
-                    unko_no: unko_no.to_string(),
-                    drive_minutes: *drive,
-                    cargo_minutes: *cargo,
-                    break_minutes: *brk,
-                    restraint_minutes: *restraint,
-                })
+                .map(
+                    |(unko_no, (drive, cargo, brk, restraint))| OperationDetail {
+                        unko_no: unko_no.to_string(),
+                        drive_minutes: *drive,
+                        cargo_minutes: *cargo,
+                        break_minutes: *brk,
+                        restraint_minutes: *restraint,
+                    },
+                )
                 .collect();
 
             // daily_work_hours から取得（同日複数行対応）
@@ -403,8 +406,12 @@ pub async fn build_report_with_name(
             };
 
             for (dwh_idx, dwh) in dwh_entries.iter().enumerate() {
-                let day_drive = dwh.map(|r| r.drive_minutes).unwrap_or_else(|| operations.iter().map(|o| o.drive_minutes).sum());
-                let day_cargo = dwh.map(|r| r.cargo_minutes).unwrap_or_else(|| operations.iter().map(|o| o.cargo_minutes).sum());
+                let day_drive = dwh
+                    .map(|r| r.drive_minutes)
+                    .unwrap_or_else(|| operations.iter().map(|o| o.drive_minutes).sum());
+                let day_cargo = dwh
+                    .map(|r| r.cargo_minutes)
+                    .unwrap_or_else(|| operations.iter().map(|o| o.cargo_minutes).sum());
                 let day_restraint = dwh.map(|r| r.total_work_minutes).unwrap_or(seg_restraint);
                 let day_break = (day_restraint - day_drive - day_cargo).max(0);
                 let overlap_drive = dwh.map(|r| r.overlap_drive_minutes).unwrap_or(0);
@@ -414,8 +421,7 @@ pub async fn build_report_with_name(
 
                 cumulative += day_restraint;
 
-                let drive_avg_before = prev_main_drive
-                    .map(|prev| (prev + day_drive) / 2);
+                let drive_avg_before = prev_main_drive.map(|prev| (prev + day_drive) / 2);
                 let drive_avg = match prev_main_drive {
                     Some(prev) => (prev + day_drive) as f64 / 2.0,
                     None => day_drive as f64,
@@ -426,9 +432,7 @@ pub async fn build_report_with_name(
                 let total_overtime = (actual_work - 480).max(0);
                 let overtime = (total_overtime - ot_late_night).max(0);
 
-                let rest_period = dwh
-                    .and_then(|r| r.total_rest_minutes)
-                    .filter(|&v| v > 0);
+                let rest_period = dwh.and_then(|r| r.total_rest_minutes).filter(|&v| v > 0);
                 let late_night = dwh.map(|r| r.late_night_minutes).unwrap_or(0);
 
                 week_drive += day_drive;
@@ -439,7 +443,8 @@ pub async fn build_report_with_name(
                 // 同日複数行の場合、始業・終業はdwh行のstart_timeから取得
                 let (row_start, row_end) = if dwh_entries.len() > 1 {
                     // 複数行: dwh行のstart_timeと、セグメントから終業を推定
-                    let st = dwh.map(|r| format!("{}:{:02}", r.start_time.hour(), r.start_time.minute()));
+                    let st = dwh
+                        .map(|r| format!("{}:{:02}", r.start_time.hour(), r.start_time.minute()));
                     // 終業はセグメントデータから（各dwh行に対応するセグメントを探す）
                     let et = day_end.clone(); // TODO: dwh行ごとの終業時刻
                     (st, if dwh_idx == 0 { day_end.clone() } else { None })
@@ -452,7 +457,11 @@ pub async fn build_report_with_name(
                     is_holiday: false,
                     start_time: row_start,
                     end_time: row_end,
-                    operations: if dwh_idx == 0 { operations.clone() } else { Vec::new() },
+                    operations: if dwh_idx == 0 {
+                        operations.clone()
+                    } else {
+                        Vec::new()
+                    },
                     drive_minutes: day_drive,
                     cargo_minutes: day_cargo,
                     break_minutes: day_break,
@@ -577,46 +586,6 @@ fn internal_err(e: impl std::fmt::Display) -> (StatusCode, String) {
 
 // === CSV比較 ===
 
-/// CSV1ドライバー分のパース結果
-#[derive(Debug, Serialize)]
-pub struct CsvDriverData {
-    pub driver_name: String,
-    pub driver_cd: String,
-    pub days: Vec<CsvDayRow>,
-    pub total_drive: String,
-    pub total_cargo: String,
-    pub total_break: String,
-    pub total_restraint: String,
-    pub total_actual_work: String,
-    pub total_overtime: String,
-    pub total_late_night: String,
-    pub total_ot_late_night: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CsvDayRow {
-    pub date: String,
-    pub is_holiday: bool,
-    pub start_time: String,
-    pub end_time: String,
-    pub drive: String,
-    pub overlap_drive: String,
-    pub cargo: String,
-    pub overlap_cargo: String,
-    pub break_time: String,
-    pub overlap_break: String,
-    pub subtotal: String,
-    pub overlap_subtotal: String,
-    pub total: String,
-    pub cumulative: String,
-    pub rest: String,
-    pub actual_work: String,
-    pub overtime: String,
-    pub late_night: String,
-    pub ot_late_night: String,
-    pub remarks: String,
-}
-
 #[derive(Debug, Serialize)]
 pub struct CompareResult {
     pub driver_name: String,
@@ -656,23 +625,16 @@ pub struct SystemDayRow {
     pub late_night: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct DiffItem {
-    pub date: String,
-    pub field: String,
-    pub csv_val: String,
-    pub sys_val: String,
-}
-
 fn fmt_min(val: i32) -> String {
-    if val == 0 { return String::new(); }
-    format!("{}:{:02}", val / 60, val % 60)
+    compare::fmt_min(val)
 }
 
 /// RestraintReportResponse → Vec<CsvDayRow> 変換（DB値をCSV互換形式に）
 pub fn report_to_csv_days(report: &RestraintReportResponse) -> Vec<CsvDayRow> {
-    report.days.iter().map(|d| {
-        CsvDayRow {
+    report
+        .days
+        .iter()
+        .map(|d| CsvDayRow {
             date: format!("{}月{}日", d.date.month(), d.date.day()),
             is_holiday: d.is_holiday,
             start_time: d.start_time.clone().unwrap_or_default(),
@@ -687,129 +649,31 @@ pub fn report_to_csv_days(report: &RestraintReportResponse) -> Vec<CsvDayRow> {
             overlap_subtotal: fmt_min(d.overlap_restraint_minutes),
             total: fmt_min(d.restraint_total_minutes),
             cumulative: fmt_min(d.restraint_cumulative_minutes),
-            rest: d.rest_period_minutes.map(|v| fmt_min(v)).unwrap_or_default(),
+            rest: d
+                .rest_period_minutes
+                .map(|v| fmt_min(v))
+                .unwrap_or_default(),
             actual_work: fmt_min(d.actual_work_minutes),
             overtime: fmt_min(d.overtime_minutes),
             late_night: fmt_min(d.late_night_minutes),
             ot_late_night: fmt_min(d.overtime_late_night_minutes),
             remarks: d.remarks.clone(),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 fn parse_hhmm(s: &str) -> i32 {
     let s = s.trim();
-    if s.is_empty() { return 0; }
+    if s.is_empty() {
+        return 0;
+    }
     let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 { return 0; }
+    if parts.len() != 2 {
+        return 0;
+    }
     let h: i32 = parts[0].parse().unwrap_or(0);
     let m: i32 = parts[1].parse().unwrap_or(0);
     h * 60 + m
-}
-
-/// Shift-JIS/CP932 のCSVをパースして全ドライバーのデータを返す
-fn parse_restraint_csv(bytes: &[u8]) -> Result<Vec<CsvDriverData>, String> {
-    // CP932 → UTF-8
-    let text = if let Ok(s) = String::from_utf8(bytes.to_vec()) {
-        s
-    } else {
-        encoding_rs::SHIFT_JIS.decode(bytes).0.into_owned()
-    };
-
-    let mut drivers = Vec::new();
-    let mut current: Option<CsvDriverData> = None;
-    let mut in_data = false;
-
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() { continue; }
-
-        // ドライバーヘッダー検出
-        if line.starts_with("氏名,") {
-            // 前のドライバーを保存
-            if let Some(d) = current.take() {
-                drivers.push(d);
-            }
-            let cols: Vec<&str> = line.split(',').collect();
-            let name = cols.get(1).unwrap_or(&"").to_string();
-            let cd = cols.get(3).unwrap_or(&"").to_string();
-            current = Some(CsvDriverData {
-                driver_name: name,
-                driver_cd: cd,
-                days: Vec::new(),
-                total_drive: String::new(),
-                total_cargo: String::new(),
-                total_break: String::new(),
-                total_restraint: String::new(),
-                total_actual_work: String::new(),
-                total_overtime: String::new(),
-                total_late_night: String::new(),
-                total_ot_late_night: String::new(),
-            });
-            in_data = false;
-            continue;
-        }
-
-        // ヘッダー行をスキップ
-        if line.starts_with("日付,") {
-            in_data = true;
-            continue;
-        }
-
-        let Some(ref mut driver) = current else { continue; };
-        if !in_data { continue; }
-
-        let cols: Vec<&str> = line.split(',').collect();
-
-        // 合計行
-        if cols.first().map(|s| s.contains("合計")).unwrap_or(false) {
-            driver.total_drive = cols.get(3).unwrap_or(&"").to_string();
-            driver.total_cargo = cols.get(5).unwrap_or(&"").to_string();
-            driver.total_break = cols.get(7).unwrap_or(&"").to_string();
-            driver.total_restraint = cols.get(11).unwrap_or(&"").to_string();
-            driver.total_actual_work = cols.get(17).unwrap_or(&"").to_string();
-            driver.total_overtime = cols.get(18).unwrap_or(&"").to_string();
-            driver.total_late_night = cols.get(19).unwrap_or(&"").to_string();
-            driver.total_ot_late_night = cols.get(20).unwrap_or(&"").to_string();
-            in_data = false;
-            continue;
-        }
-
-        // 日付行チェック（N月N日）
-        let date_str = cols.first().unwrap_or(&"").to_string();
-        if !date_str.contains('月') { continue; }
-
-        let is_holiday = cols.get(1).map(|s| s.trim() == "休").unwrap_or(false);
-
-        driver.days.push(CsvDayRow {
-            date: date_str,
-            is_holiday,
-            start_time: cols.get(1).unwrap_or(&"").to_string(),
-            end_time: cols.get(2).unwrap_or(&"").to_string(),
-            drive: cols.get(3).unwrap_or(&"").to_string(),
-            overlap_drive: cols.get(4).unwrap_or(&"").to_string(),
-            cargo: cols.get(5).unwrap_or(&"").to_string(),
-            overlap_cargo: cols.get(6).unwrap_or(&"").to_string(),
-            break_time: cols.get(7).unwrap_or(&"").to_string(),
-            overlap_break: cols.get(8).unwrap_or(&"").to_string(),
-            subtotal: cols.get(11).unwrap_or(&"").to_string(),
-            overlap_subtotal: cols.get(12).unwrap_or(&"").to_string(),
-            total: cols.get(13).unwrap_or(&"").to_string(),
-            cumulative: cols.get(14).unwrap_or(&"").to_string(),
-            rest: cols.get(17).unwrap_or(&"").to_string(),
-            actual_work: cols.get(18).unwrap_or(&"").to_string(),
-            overtime: cols.get(19).unwrap_or(&"").to_string(),
-            late_night: cols.get(20).unwrap_or(&"").to_string(),
-            ot_late_night: cols.get(21).unwrap_or(&"").to_string(),
-            remarks: cols.get(22).unwrap_or(&"").to_string(),
-        });
-    }
-
-    if let Some(d) = current {
-        drivers.push(d);
-    }
-
-    Ok(drivers)
 }
 
 async fn compare_csv(
@@ -821,9 +685,11 @@ async fn compare_csv(
 
     // CSVファイルを受け取る
     let mut csv_bytes = Vec::new();
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("multipart error: {e}"))
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart error: {e}")))?
+    {
         if let Some(data) = field.bytes().await.ok() {
             csv_bytes = data.to_vec();
             break;
@@ -834,11 +700,11 @@ async fn compare_csv(
         return Err((StatusCode::BAD_REQUEST, "CSVファイルが空です".to_string()));
     }
 
-    let csv_drivers = parse_restraint_csv(&csv_bytes)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let csv_drivers = parse_restraint_csv(&csv_bytes).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // 年月をCSVの日付行から推測
-    let (year, month) = csv_drivers.first()
+    let (year, month) = csv_drivers
+        .first()
         .and_then(|d| d.days.first())
         .and_then(|day| {
             // "2月1日" → month=2
@@ -854,13 +720,12 @@ async fn compare_csv(
         .unwrap_or((2026, 1));
 
     // 全ドライバー取得
-    let db_drivers: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, driver_cd, driver_name FROM drivers WHERE tenant_id = $1",
-    )
-    .bind(tenant_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(internal_err)?;
+    let db_drivers: Vec<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, driver_cd, driver_name FROM drivers WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(internal_err)?;
 
     let mut results = Vec::new();
 
@@ -872,36 +737,43 @@ async fn compare_csv(
             // システムのレポートを取得
             match build_report_with_name(&state.pool, tenant_id, *did, dname, year, month).await {
                 Ok(report) => {
-                    let sys_days: Vec<SystemDayRow> = report.days.iter().map(|d| SystemDayRow {
-                        date: format!("{}月{}日", d.date.month(), d.date.day()),
-                        start_time: d.start_time.clone().unwrap_or_default(),
-                        end_time: d.end_time.clone().unwrap_or_default(),
-                        drive: fmt_min(d.drive_minutes),
-                        overlap_drive: fmt_min(d.overlap_drive_minutes),
-                        cargo: fmt_min(d.cargo_minutes),
-                        overlap_cargo: fmt_min(d.overlap_cargo_minutes),
-                        subtotal: fmt_min(d.restraint_main_minutes),
-                        overlap_subtotal: fmt_min(d.overlap_restraint_minutes),
-                        total: fmt_min(d.restraint_total_minutes),
-                        cumulative: fmt_min(d.restraint_cumulative_minutes),
-                        actual_work: fmt_min(d.actual_work_minutes),
-                        overtime: fmt_min(d.overtime_minutes),
-                        late_night: fmt_min(d.late_night_minutes),
-                    }).collect();
+                    let sys_days: Vec<SystemDayRow> = report
+                        .days
+                        .iter()
+                        .map(|d| SystemDayRow {
+                            date: format!("{}月{}日", d.date.month(), d.date.day()),
+                            start_time: d.start_time.clone().unwrap_or_default(),
+                            end_time: d.end_time.clone().unwrap_or_default(),
+                            drive: fmt_min(d.drive_minutes),
+                            overlap_drive: fmt_min(d.overlap_drive_minutes),
+                            cargo: fmt_min(d.cargo_minutes),
+                            overlap_cargo: fmt_min(d.overlap_cargo_minutes),
+                            subtotal: fmt_min(d.restraint_main_minutes),
+                            overlap_subtotal: fmt_min(d.overlap_restraint_minutes),
+                            total: fmt_min(d.restraint_total_minutes),
+                            cumulative: fmt_min(d.restraint_cumulative_minutes),
+                            actual_work: fmt_min(d.actual_work_minutes),
+                            overtime: fmt_min(d.overtime_minutes),
+                            late_night: fmt_min(d.late_night_minutes),
+                        })
+                        .collect();
 
                     // 差分検出
                     let mut diffs = Vec::new();
                     // 日付+始業でマッチ（行番号zipだと休日行のずれで全行ずれる）
                     let mut sys_idx = 0;
                     for csv_day in &csv_d.days {
-                        if csv_day.is_holiday { continue; }
+                        if csv_day.is_holiday {
+                            continue;
+                        }
                         // 同じ日付のsys_dayを探す（複数行対応: sys_idxから順に探す）
-                        let sys_day = sys_days[sys_idx..].iter()
-                            .find(|s| s.date == csv_day.date);
+                        let sys_day = sys_days[sys_idx..].iter().find(|s| s.date == csv_day.date);
                         let sys_day = match sys_day {
                             Some(sd) => {
                                 // sys_idxを進める
-                                if let Some(pos) = sys_days[sys_idx..].iter().position(|s| std::ptr::eq(s, sd)) {
+                                if let Some(pos) =
+                                    sys_days[sys_idx..].iter().position(|s| std::ptr::eq(s, sd))
+                                {
                                     sys_idx += pos + 1;
                                 }
                                 sd
@@ -912,7 +784,11 @@ async fn compare_csv(
                             ("運転", &csv_day.drive, &sys_day.drive),
                             ("重複運転", &csv_day.overlap_drive, &sys_day.overlap_drive),
                             ("小計", &csv_day.subtotal, &sys_day.subtotal),
-                            ("重複小計", &csv_day.overlap_subtotal, &sys_day.overlap_subtotal),
+                            (
+                                "重複小計",
+                                &csv_day.overlap_subtotal,
+                                &sys_day.overlap_subtotal,
+                            ),
                             ("合計", &csv_day.total, &sys_day.total),
                             ("累計", &csv_day.cumulative, &sys_day.cumulative),
                             ("実働", &csv_day.actual_work, &sys_day.actual_work),
@@ -958,28 +834,32 @@ async fn compare_csv(
             csv: CsvDriverData {
                 driver_name: csv_d.driver_name.clone(),
                 driver_cd: csv_d.driver_cd.clone(),
-                days: csv_d.days.iter().map(|d| CsvDayRow {
-                    date: d.date.clone(),
-                    is_holiday: d.is_holiday,
-                    start_time: d.start_time.clone(),
-                    end_time: d.end_time.clone(),
-                    drive: d.drive.clone(),
-                    overlap_drive: d.overlap_drive.clone(),
-                    cargo: d.cargo.clone(),
-                    overlap_cargo: d.overlap_cargo.clone(),
-                    break_time: d.break_time.clone(),
-                    overlap_break: d.overlap_break.clone(),
-                    subtotal: d.subtotal.clone(),
-                    overlap_subtotal: d.overlap_subtotal.clone(),
-                    total: d.total.clone(),
-                    cumulative: d.cumulative.clone(),
-                    rest: d.rest.clone(),
-                    actual_work: d.actual_work.clone(),
-                    overtime: d.overtime.clone(),
-                    late_night: d.late_night.clone(),
-                    ot_late_night: d.ot_late_night.clone(),
-                    remarks: d.remarks.clone(),
-                }).collect(),
+                days: csv_d
+                    .days
+                    .iter()
+                    .map(|d| CsvDayRow {
+                        date: d.date.clone(),
+                        is_holiday: d.is_holiday,
+                        start_time: d.start_time.clone(),
+                        end_time: d.end_time.clone(),
+                        drive: d.drive.clone(),
+                        overlap_drive: d.overlap_drive.clone(),
+                        cargo: d.cargo.clone(),
+                        overlap_cargo: d.overlap_cargo.clone(),
+                        break_time: d.break_time.clone(),
+                        overlap_break: d.overlap_break.clone(),
+                        subtotal: d.subtotal.clone(),
+                        overlap_subtotal: d.overlap_subtotal.clone(),
+                        total: d.total.clone(),
+                        cumulative: d.cumulative.clone(),
+                        rest: d.rest.clone(),
+                        actual_work: d.actual_work.clone(),
+                        overtime: d.overtime.clone(),
+                        late_night: d.late_night.clone(),
+                        ot_late_night: d.ot_late_night.clone(),
+                        remarks: d.remarks.clone(),
+                    })
+                    .collect(),
                 total_drive: csv_d.total_drive.clone(),
                 total_cargo: csv_d.total_cargo.clone(),
                 total_break: csv_d.total_break.clone(),
@@ -997,65 +877,25 @@ async fn compare_csv(
     Ok(Json(results))
 }
 
-/// CsvDayRow同士の差分を検出する（DB生成CSV vs 元CSV）
-fn detect_diffs_csv(csv_days: &[CsvDayRow], sys_days: &[CsvDayRow]) -> Vec<DiffItem> {
-    let mut diffs = Vec::new();
-    let normalize_time = |s: &str| -> String {
-        let s = s.trim();
-        if s.is_empty() { return String::new(); }
-        if let Some((h, m)) = s.split_once(':') {
-            let h_num: u32 = h.parse().unwrap_or(0);
-            format!("{}:{}", h_num, m)
-        } else { s.to_string() }
-    };
-    for (csv_day, sys_day) in csv_days.iter().zip(sys_days.iter()) {
-        if csv_day.is_holiday { continue; }
-        let csv_start = normalize_time(&csv_day.start_time);
-        let sys_start = normalize_time(&sys_day.start_time);
-        let csv_end = normalize_time(&csv_day.end_time);
-        let sys_end = normalize_time(&sys_day.end_time);
-        let checks = [
-            ("始業", &csv_start, &sys_start),
-            ("終業", &csv_end, &sys_end),
-            ("運転", &csv_day.drive, &sys_day.drive),
-            ("重複運転", &csv_day.overlap_drive, &sys_day.overlap_drive),
-            ("小計", &csv_day.subtotal, &sys_day.subtotal),
-            ("重複小計", &csv_day.overlap_subtotal, &sys_day.overlap_subtotal),
-            ("合計", &csv_day.total, &sys_day.total),
-            ("累計", &csv_day.cumulative, &sys_day.cumulative),
-            ("実働", &csv_day.actual_work, &sys_day.actual_work),
-            ("時間外", &csv_day.overtime, &sys_day.overtime),
-            ("深夜", &csv_day.late_night, &sys_day.late_night),
-        ];
-        for (field, csv_val, sys_val) in checks {
-            let cv = csv_val.trim();
-            let sv = sys_val.trim();
-            if cv != sv && !(cv.is_empty() && sv.is_empty()) {
-                diffs.push(DiffItem {
-                    date: csv_day.date.clone(),
-                    field: field.to_string(),
-                    csv_val: cv.to_string(),
-                    sys_val: sv.to_string(),
-                });
-            }
-        }
-    }
-    diffs
-}
-
 /// CSV行とシステム行の差分を検出する（compare_csvの内部ロジック抽出）
 fn detect_diffs(csv_days: &[CsvDayRow], sys_days: &[SystemDayRow]) -> Vec<DiffItem> {
     let mut diffs = Vec::new();
     for (csv_day, sys_day) in csv_days.iter().zip(sys_days.iter()) {
-        if csv_day.is_holiday { continue; }
+        if csv_day.is_holiday {
+            continue;
+        }
         // 始業・終業はフォーマット正規化して比較（CSV "1:17" vs DB "01:17"）
         let normalize_time = |s: &str| -> String {
             let s = s.trim();
-            if s.is_empty() { return String::new(); }
+            if s.is_empty() {
+                return String::new();
+            }
             if let Some((h, m)) = s.split_once(':') {
                 let h_num: u32 = h.parse().unwrap_or(0);
                 format!("{}:{}", h_num, m)
-            } else { s.to_string() }
+            } else {
+                s.to_string()
+            }
         };
         let csv_start = normalize_time(&csv_day.start_time);
         let sys_start = normalize_time(&sys_day.start_time);
@@ -1067,7 +907,11 @@ fn detect_diffs(csv_days: &[CsvDayRow], sys_days: &[SystemDayRow]) -> Vec<DiffIt
             ("運転", &csv_day.drive, &sys_day.drive),
             ("重複運転", &csv_day.overlap_drive, &sys_day.overlap_drive),
             ("小計", &csv_day.subtotal, &sys_day.subtotal),
-            ("重複小計", &csv_day.overlap_subtotal, &sys_day.overlap_subtotal),
+            (
+                "重複小計",
+                &csv_day.overlap_subtotal,
+                &sys_day.overlap_subtotal,
+            ),
             ("合計", &csv_day.total, &sys_day.total),
             ("累計", &csv_day.cumulative, &sys_day.cumulative),
             ("実働", &csv_day.actual_work, &sys_day.actual_work),
@@ -1093,6 +937,7 @@ fn detect_diffs(csv_days: &[CsvDayRow], sys_days: &[SystemDayRow]) -> Vec<DiffIt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daiun_salary::compare::detect_diffs_csv;
 
     // 一瀬　道広 (1026) 2026年2月分 — 日跨ぎ運行（同一日2行）あり
     const CSV_1026: &str = "拘束時間管理表 (2026年 2月分)\n\
@@ -1213,8 +1058,10 @@ mod tests {
         // 日跨ぎで同一日2行あるため28日以上
         println!("1026 days count: {}", d.days.len());
         for (i, day) in d.days.iter().enumerate() {
-            println!("  [{}] {} holiday={} drive={} subtotal={} total={} cumulative={}",
-                i, day.date, day.is_holiday, day.drive, day.subtotal, day.total, day.cumulative);
+            println!(
+                "  [{}] {} holiday={} drive={} subtotal={} total={} cumulative={}",
+                i, day.date, day.is_holiday, day.drive, day.subtotal, day.total, day.cumulative
+            );
         }
     }
 
@@ -1225,25 +1072,35 @@ mod tests {
         let csv_d = &drivers[0];
 
         // CSVの値をそのままSystemDayRowに変換（= 完全一致するはず）
-        let sys_days: Vec<SystemDayRow> = csv_d.days.iter().map(|d| SystemDayRow {
-            date: d.date.clone(),
-            start_time: d.start_time.clone(),
-            end_time: d.end_time.clone(),
-            drive: d.drive.clone(),
-            overlap_drive: d.overlap_drive.clone(),
-            cargo: d.cargo.clone(),
-            overlap_cargo: d.overlap_cargo.clone(),
-            subtotal: d.subtotal.clone(),
-            overlap_subtotal: d.overlap_subtotal.clone(),
-            total: d.total.clone(),
-            cumulative: d.cumulative.clone(),
-            actual_work: d.actual_work.clone(),
-            overtime: d.overtime.clone(),
-            late_night: d.late_night.clone(),
-        }).collect();
+        let sys_days: Vec<SystemDayRow> = csv_d
+            .days
+            .iter()
+            .map(|d| SystemDayRow {
+                date: d.date.clone(),
+                start_time: d.start_time.clone(),
+                end_time: d.end_time.clone(),
+                drive: d.drive.clone(),
+                overlap_drive: d.overlap_drive.clone(),
+                cargo: d.cargo.clone(),
+                overlap_cargo: d.overlap_cargo.clone(),
+                subtotal: d.subtotal.clone(),
+                overlap_subtotal: d.overlap_subtotal.clone(),
+                total: d.total.clone(),
+                cumulative: d.cumulative.clone(),
+                actual_work: d.actual_work.clone(),
+                overtime: d.overtime.clone(),
+                late_night: d.late_night.clone(),
+            })
+            .collect();
 
         let diffs = detect_diffs(&csv_d.days, &sys_days);
-        assert_eq!(diffs.len(), 0, "Expected 0 diffs but got {}: {:?}", diffs.len(), diffs);
+        assert_eq!(
+            diffs.len(),
+            0,
+            "Expected 0 diffs but got {}: {:?}",
+            diffs.len(),
+            diffs
+        );
     }
 
     #[test]
@@ -1252,22 +1109,26 @@ mod tests {
         let csv_d = &drivers[0];
 
         // 1行目のdriveを変更 → 差分1件が出るはず
-        let mut sys_days: Vec<SystemDayRow> = csv_d.days.iter().map(|d| SystemDayRow {
-            date: d.date.clone(),
-            start_time: d.start_time.clone(),
-            end_time: d.end_time.clone(),
-            drive: d.drive.clone(),
-            overlap_drive: d.overlap_drive.clone(),
-            cargo: d.cargo.clone(),
-            overlap_cargo: d.overlap_cargo.clone(),
-            subtotal: d.subtotal.clone(),
-            overlap_subtotal: d.overlap_subtotal.clone(),
-            total: d.total.clone(),
-            cumulative: d.cumulative.clone(),
-            actual_work: d.actual_work.clone(),
-            overtime: d.overtime.clone(),
-            late_night: d.late_night.clone(),
-        }).collect();
+        let mut sys_days: Vec<SystemDayRow> = csv_d
+            .days
+            .iter()
+            .map(|d| SystemDayRow {
+                date: d.date.clone(),
+                start_time: d.start_time.clone(),
+                end_time: d.end_time.clone(),
+                drive: d.drive.clone(),
+                overlap_drive: d.overlap_drive.clone(),
+                cargo: d.cargo.clone(),
+                overlap_cargo: d.overlap_cargo.clone(),
+                subtotal: d.subtotal.clone(),
+                overlap_subtotal: d.overlap_subtotal.clone(),
+                total: d.total.clone(),
+                cumulative: d.cumulative.clone(),
+                actual_work: d.actual_work.clone(),
+                overtime: d.overtime.clone(),
+                late_night: d.late_night.clone(),
+            })
+            .collect();
         sys_days[0].drive = "9:99".to_string();
 
         let diffs = detect_diffs(&csv_d.days, &sys_days);
@@ -1281,11 +1142,16 @@ mod tests {
     /// DB値（daily_work_hours）からbuild_report_with_nameと同じ変換ロジックでSystemDayRowを生成
     struct MockDwh {
         day: u32,
-        start_time: &'static str, end_time: &'static str,
-        drive: i32, overlap_drive: i32,
-        cargo: i32, overlap_cargo: i32,
-        restraint: i32, overlap_restraint: i32,
-        late_night: i32, ot_late_night: i32,
+        start_time: &'static str,
+        end_time: &'static str,
+        drive: i32,
+        overlap_drive: i32,
+        cargo: i32,
+        overlap_cargo: i32,
+        restraint: i32,
+        overlap_restraint: i32,
+        late_night: i32,
+        ot_late_night: i32,
     }
 
     fn build_sys_days_from_mock(mock_data: &[MockDwh]) -> Vec<SystemDayRow> {
@@ -1301,22 +1167,34 @@ mod tests {
                     date: date_str,
                     start_time: dwh.start_time.to_string(),
                     end_time: dwh.end_time.to_string(),
-                    drive: fmt_min(dwh.drive), overlap_drive: fmt_min(dwh.overlap_drive),
-                    cargo: fmt_min(dwh.cargo), overlap_cargo: fmt_min(dwh.overlap_cargo),
-                    subtotal: fmt_min(dwh.restraint), overlap_subtotal: fmt_min(dwh.overlap_restraint),
+                    drive: fmt_min(dwh.drive),
+                    overlap_drive: fmt_min(dwh.overlap_drive),
+                    cargo: fmt_min(dwh.cargo),
+                    overlap_cargo: fmt_min(dwh.overlap_cargo),
+                    subtotal: fmt_min(dwh.restraint),
+                    overlap_subtotal: fmt_min(dwh.overlap_restraint),
                     total: fmt_min(dwh.restraint + dwh.overlap_restraint),
                     cumulative: fmt_min(cumulative),
-                    actual_work: fmt_min(actual_work), overtime: fmt_min(overtime),
+                    actual_work: fmt_min(actual_work),
+                    overtime: fmt_min(overtime),
                     late_night: fmt_min(dwh.late_night),
                 });
             } else {
                 rows.push(SystemDayRow {
-                    date: date_str, start_time: String::new(), end_time: String::new(),
-                    drive: String::new(), overlap_drive: String::new(),
-                    cargo: String::new(), overlap_cargo: String::new(),
-                    subtotal: String::new(), overlap_subtotal: String::new(),
-                    total: String::new(), cumulative: String::new(),
-                    actual_work: String::new(), overtime: String::new(), late_night: String::new(),
+                    date: date_str,
+                    start_time: String::new(),
+                    end_time: String::new(),
+                    drive: String::new(),
+                    overlap_drive: String::new(),
+                    cargo: String::new(),
+                    overlap_cargo: String::new(),
+                    subtotal: String::new(),
+                    overlap_subtotal: String::new(),
+                    total: String::new(),
+                    cumulative: String::new(),
+                    actual_work: String::new(),
+                    overtime: String::new(),
+                    late_night: String::new(),
                 });
             }
         }
@@ -1333,87 +1211,376 @@ mod tests {
         // generate_mock.sh 1021 で自動生成。recalculate_and_test.shで自動更新される
         let mock = vec![
             // MOCK_1021_START
-            MockDwh { day: 1 , start_time: "14:25", end_time: "15:14", drive:  163, overlap_drive:  12, cargo:   0, overlap_cargo: 0, restraint:  318, overlap_restraint:  12, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 2 , start_time: "14:25", end_time: "15:08", drive:  332, overlap_drive:   0, cargo:  81, overlap_cargo: 0, restraint:  565, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 4 , start_time: "7:23 ", end_time: "15:02", drive:  300, overlap_drive: 177, cargo:  41, overlap_cargo: 0, restraint:  459, overlap_restraint: 177, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 5 , start_time: "7:23 ", end_time: "15:22", drive:  519, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  656, overlap_restraint:   0, late_night:  34, ot_late_night: 0 },
-            MockDwh { day: 6 , start_time: "7:23 ", end_time: "13:14", drive:  169, overlap_drive:  63, cargo:  37, overlap_cargo: 0, restraint:  348, overlap_restraint:  81, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 7 , start_time: "7:23 ", end_time: "14:15", drive:  288, overlap_drive:  68, cargo:  58, overlap_cargo: 0, restraint:  490, overlap_restraint:  68, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 8 , start_time: "7:23 ", end_time: "13:17", drive:  385, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  500, overlap_restraint:   0, late_night:   3, ot_late_night: 0 },
-            MockDwh { day: 9 , start_time: "7:23 ", end_time: "16:10", drive:  282, overlap_drive:  99, cargo: 122, overlap_cargo: 0, restraint:  517, overlap_restraint: 120, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 10, start_time: "7:23 ", end_time: "17:20", drive:  580, overlap_drive:  91, cargo:   0, overlap_cargo: 0, restraint:  707, overlap_restraint: 111, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 11, start_time: "7:23 ", end_time: "16:08", drive:  407, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  746, overlap_restraint:   0, late_night:  58, ot_late_night: 0 },
-            MockDwh { day: 12, start_time: "7:23 ", end_time: "16:16", drive:  140, overlap_drive:  20, cargo:  19, overlap_cargo: 0, restraint:  520, overlap_restraint:  24, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 13, start_time: "7:23 ", end_time: "15:49", drive:  188, overlap_drive: 208, cargo:  73, overlap_cargo: 0, restraint:  517, overlap_restraint: 226, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 14, start_time: "7:23 ", end_time: "15:34", drive:  563, overlap_drive:   9, cargo:   0, overlap_cargo: 0, restraint:  728, overlap_restraint:   9, late_night:  94, ot_late_night: 0 },
-            MockDwh { day: 15, start_time: "7:23 ", end_time: "12:09", drive:  335, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  532, overlap_restraint:   0, late_night: 103, ot_late_night: 0 },
-            MockDwh { day: 16, start_time: "7:23 ", end_time: "15:50", drive:  281, overlap_drive:   0, cargo: 112, overlap_cargo: 0, restraint:  603, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 18, start_time: "5:51 ", end_time: "20:25", drive:  447, overlap_drive:   0, cargo: 150, overlap_cargo: 0, restraint:  991, overlap_restraint:   0, late_night:   0, ot_late_night: 66 },
-            MockDwh { day: 19, start_time: "5:51 ", end_time: "16:49", drive:  517, overlap_drive:  52, cargo:   0, overlap_cargo: 0, restraint:  658, overlap_restraint:  52, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 20, start_time: "5:51 ", end_time: "18:19", drive:  486, overlap_drive:  72, cargo: 168, overlap_cargo: 0, restraint:  800, overlap_restraint:  72, late_night:   1, ot_late_night: 0 },
-            MockDwh { day: 21, start_time: "5:51 ", end_time: "17:30", drive:  579, overlap_drive:  36, cargo:   0, overlap_cargo: 0, restraint:  823, overlap_restraint:  36, late_night:  73, ot_late_night: 0 },
-            MockDwh { day: 22, start_time: "5:51 ", end_time: "13:40", drive:  351, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  629, overlap_restraint:   0, late_night: 109, ot_late_night: 0 },
-            MockDwh { day: 23, start_time: "5:51 ", end_time: "12:25", drive:  162, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:  494, overlap_restraint:   0, late_night:  49, ot_late_night: 0 },
-            MockDwh { day: 24, start_time: "5:51 ", end_time: "13:55", drive:  197, overlap_drive:   0, cargo:  17, overlap_cargo: 0, restraint:  402, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 25, start_time: "10:04", end_time: "16:41", drive:  126, overlap_drive: 111, cargo:  39, overlap_cargo: 0, restraint:  179, overlap_restraint: 111, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 26, start_time: "10:04", end_time: "15:31", drive:  405, overlap_drive:  98, cargo:   0, overlap_cargo: 0, restraint:  438, overlap_restraint:  98, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 27, start_time: "10:04", end_time: "18:23", drive:  322, overlap_drive:  66, cargo:  14, overlap_cargo: 0, restraint:  451, overlap_restraint:  66, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 28, start_time: "10:04", end_time: "18:12", drive:  290, overlap_drive:   0, cargo:   3, overlap_cargo: 0, restraint:  489, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+            MockDwh {
+                day: 1,
+                start_time: "14:25",
+                end_time: "15:14",
+                drive: 163,
+                overlap_drive: 12,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 318,
+                overlap_restraint: 12,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 2,
+                start_time: "14:25",
+                end_time: "15:08",
+                drive: 332,
+                overlap_drive: 0,
+                cargo: 81,
+                overlap_cargo: 0,
+                restraint: 565,
+                overlap_restraint: 0,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 4,
+                start_time: "7:23 ",
+                end_time: "15:02",
+                drive: 300,
+                overlap_drive: 177,
+                cargo: 41,
+                overlap_cargo: 0,
+                restraint: 459,
+                overlap_restraint: 177,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 5,
+                start_time: "7:23 ",
+                end_time: "15:22",
+                drive: 519,
+                overlap_drive: 0,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 656,
+                overlap_restraint: 0,
+                late_night: 34,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 6,
+                start_time: "7:23 ",
+                end_time: "13:14",
+                drive: 169,
+                overlap_drive: 63,
+                cargo: 37,
+                overlap_cargo: 0,
+                restraint: 348,
+                overlap_restraint: 81,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 7,
+                start_time: "7:23 ",
+                end_time: "14:15",
+                drive: 288,
+                overlap_drive: 68,
+                cargo: 58,
+                overlap_cargo: 0,
+                restraint: 490,
+                overlap_restraint: 68,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 8,
+                start_time: "7:23 ",
+                end_time: "13:17",
+                drive: 385,
+                overlap_drive: 0,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 500,
+                overlap_restraint: 0,
+                late_night: 3,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 9,
+                start_time: "7:23 ",
+                end_time: "16:10",
+                drive: 282,
+                overlap_drive: 99,
+                cargo: 122,
+                overlap_cargo: 0,
+                restraint: 517,
+                overlap_restraint: 120,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 10,
+                start_time: "7:23 ",
+                end_time: "17:20",
+                drive: 580,
+                overlap_drive: 91,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 707,
+                overlap_restraint: 111,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 11,
+                start_time: "7:23 ",
+                end_time: "16:08",
+                drive: 407,
+                overlap_drive: 0,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 746,
+                overlap_restraint: 0,
+                late_night: 58,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 12,
+                start_time: "7:23 ",
+                end_time: "16:16",
+                drive: 140,
+                overlap_drive: 20,
+                cargo: 19,
+                overlap_cargo: 0,
+                restraint: 520,
+                overlap_restraint: 24,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 13,
+                start_time: "7:23 ",
+                end_time: "15:49",
+                drive: 188,
+                overlap_drive: 208,
+                cargo: 73,
+                overlap_cargo: 0,
+                restraint: 517,
+                overlap_restraint: 226,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 14,
+                start_time: "7:23 ",
+                end_time: "15:34",
+                drive: 563,
+                overlap_drive: 9,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 728,
+                overlap_restraint: 9,
+                late_night: 94,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 15,
+                start_time: "7:23 ",
+                end_time: "12:09",
+                drive: 335,
+                overlap_drive: 0,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 532,
+                overlap_restraint: 0,
+                late_night: 103,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 16,
+                start_time: "7:23 ",
+                end_time: "15:50",
+                drive: 281,
+                overlap_drive: 0,
+                cargo: 112,
+                overlap_cargo: 0,
+                restraint: 603,
+                overlap_restraint: 0,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 18,
+                start_time: "5:51 ",
+                end_time: "20:25",
+                drive: 447,
+                overlap_drive: 0,
+                cargo: 150,
+                overlap_cargo: 0,
+                restraint: 991,
+                overlap_restraint: 0,
+                late_night: 0,
+                ot_late_night: 66,
+            },
+            MockDwh {
+                day: 19,
+                start_time: "5:51 ",
+                end_time: "16:49",
+                drive: 517,
+                overlap_drive: 52,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 658,
+                overlap_restraint: 52,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 20,
+                start_time: "5:51 ",
+                end_time: "18:19",
+                drive: 486,
+                overlap_drive: 72,
+                cargo: 168,
+                overlap_cargo: 0,
+                restraint: 800,
+                overlap_restraint: 72,
+                late_night: 1,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 21,
+                start_time: "5:51 ",
+                end_time: "17:30",
+                drive: 579,
+                overlap_drive: 36,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 823,
+                overlap_restraint: 36,
+                late_night: 73,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 22,
+                start_time: "5:51 ",
+                end_time: "13:40",
+                drive: 351,
+                overlap_drive: 0,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 629,
+                overlap_restraint: 0,
+                late_night: 109,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 23,
+                start_time: "5:51 ",
+                end_time: "12:25",
+                drive: 162,
+                overlap_drive: 0,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 494,
+                overlap_restraint: 0,
+                late_night: 49,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 24,
+                start_time: "5:51 ",
+                end_time: "13:55",
+                drive: 197,
+                overlap_drive: 0,
+                cargo: 17,
+                overlap_cargo: 0,
+                restraint: 402,
+                overlap_restraint: 0,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 25,
+                start_time: "10:04",
+                end_time: "16:41",
+                drive: 126,
+                overlap_drive: 111,
+                cargo: 39,
+                overlap_cargo: 0,
+                restraint: 179,
+                overlap_restraint: 111,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 26,
+                start_time: "10:04",
+                end_time: "15:31",
+                drive: 405,
+                overlap_drive: 98,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 438,
+                overlap_restraint: 98,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 27,
+                start_time: "10:04",
+                end_time: "18:23",
+                drive: 322,
+                overlap_drive: 66,
+                cargo: 14,
+                overlap_cargo: 0,
+                restraint: 451,
+                overlap_restraint: 66,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 28,
+                start_time: "10:04",
+                end_time: "18:12",
+                drive: 290,
+                overlap_drive: 0,
+                cargo: 3,
+                overlap_cargo: 0,
+                restraint: 489,
+                overlap_restraint: 0,
+                late_night: 0,
+                ot_late_night: 0,
+            },
             // MOCK_1021_END
         ];
 
         let sys_days = build_sys_days_from_mock(&mock);
         let diffs = detect_diffs(&csv_d.days, &sys_days);
         // 始業・終業追加により day18,19 で既知差分あり（DB接続テスト test_csv_compare_1021_db が本命）
-        let non_time_diffs: Vec<_> = diffs.iter().filter(|d| d.field != "始業" && d.field != "終業").collect();
+        let non_time_diffs: Vec<_> = diffs
+            .iter()
+            .filter(|d| d.field != "始業" && d.field != "終業")
+            .collect();
         // start_time分離により同日複数行が発生、モック行数が増加
         // 一時的に緩和（start_time対応のテスト整備後に戻す）
         assert!(
             non_time_diffs.len() <= 80,
             "1021の差分が悪化: {}件\n{}",
             non_time_diffs.len(),
-            non_time_diffs.iter().map(|d| format!("  {} {}: csv={} sys={}", d.date, d.field, d.csv_val, d.sys_val)).collect::<Vec<_>>().join("\n")
+            non_time_diffs
+                .iter()
+                .map(|d| format!(
+                    "  {} {}: csv={} sys={}",
+                    d.date, d.field, d.csv_val, d.sys_val
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         if !diffs.is_empty() {
             println!("1021 mock diffs (始業・終業含む): {}", diffs.len());
             for d in &diffs {
-                println!("  {} {}: csv={} sys={}", d.date, d.field, d.csv_val, d.sys_val);
+                println!(
+                    "  {} {}: csv={} sys={}",
+                    d.date, d.field, d.csv_val, d.sys_val
+                );
             }
         }
     }
@@ -1436,7 +1603,11 @@ mod tests {
                     // 同一日の2行目 → 合算
                     let merge_min = |a: &str, b: &str| -> String {
                         let sum = parse_hhmm(a) + parse_hhmm(b);
-                        if sum == 0 { String::new() } else { fmt_min(sum) }
+                        if sum == 0 {
+                            String::new()
+                        } else {
+                            fmt_min(sum)
+                        }
                     };
                     last.drive = merge_min(&last.drive, &day.drive);
                     last.overlap_drive = merge_min(&last.overlap_drive, &day.overlap_drive);
@@ -1445,7 +1616,8 @@ mod tests {
                     // subtotal/total/cumulative は2行目の値（累積なので後の行が正）
                     // ただしsubtotalは合算が正しい
                     last.subtotal = merge_min(&last.subtotal, &day.subtotal);
-                    last.overlap_subtotal = merge_min(&last.overlap_subtotal, &day.overlap_subtotal);
+                    last.overlap_subtotal =
+                        merge_min(&last.overlap_subtotal, &day.overlap_subtotal);
                     last.total = merge_min(&last.total, &day.total);
                     // cumulative は2行目の値を使う（累計なので最新が正）
                     last.cumulative = day.cumulative.clone();
@@ -1464,65 +1636,305 @@ mod tests {
         // generate_mock.sh 1026 で自動生成。recalculate_and_test.shで自動更新される
         let mock = vec![
             // MOCK_1026_START
-            MockDwh { day: 2 , start_time: "1:17 ", end_time: "14:43", drive:  425, overlap_drive: 110, cargo: 173, overlap_cargo: 0, restraint:  740, overlap_restraint: 120, late_night: 209, ot_late_night: 0 },
-            MockDwh { day: 2 , start_time: "23:17", end_time: "14:43", drive:  500, overlap_drive:   0, cargo: 278, overlap_cargo: 0, restraint:  882, overlap_restraint:   0, late_night: 333, ot_late_night: 0 },
-            MockDwh { day: 4 , start_time: "1:20 ", end_time: "15:10", drive:  402, overlap_drive:   9, cargo: 137, overlap_cargo: 0, restraint:  761, overlap_restraint:   9, late_night: 210, ot_late_night: 0 },
-            MockDwh { day: 5 , start_time: "1:11 ", end_time: "14:26", drive:  409, overlap_drive: 113, cargo: 130, overlap_cargo: 0, restraint:  726, overlap_restraint: 113, late_night: 229, ot_late_night: 0 },
-            MockDwh { day: 5 , start_time: "23:18", end_time: "14:26", drive:  572, overlap_drive:   0, cargo: 270, overlap_cargo: 0, restraint:  953, overlap_restraint:   0, late_night: 342, ot_late_night: 0 },
-            MockDwh { day: 7 , start_time: "1:26 ", end_time: "15:48", drive:  440, overlap_drive:   0, cargo: 166, overlap_cargo: 0, restraint:  787, overlap_restraint:   0, late_night: 204, ot_late_night: 0 },
-            MockDwh { day: 9 , start_time: "23:45", end_time: "14:14", drive:  389, overlap_drive:  26, cargo: 135, overlap_cargo: 0, restraint:  793, overlap_restraint:  26, late_night: 305, ot_late_night: 0 },
-            MockDwh { day: 10, start_time: "23:19", end_time: "15:47", drive:  510, overlap_drive:   0, cargo: 295, overlap_cargo: 0, restraint:  874, overlap_restraint:   0, late_night: 341, ot_late_night: 0 },
-            MockDwh { day: 11, start_time: "23:54", end_time: "14:16", drive:  407, overlap_drive:  62, cargo: 255, overlap_cargo: 0, restraint:  792, overlap_restraint:  31, late_night: 306, ot_late_night: 0 },
-            MockDwh { day: 12, start_time: "23:23", end_time: "15:36", drive: 1018, overlap_drive:   0, cargo: 630, overlap_cargo: 0, restraint: 1875, overlap_restraint:   0, late_night: 674, ot_late_night: 0 },
-            MockDwh { day: 14, start_time: "1:25 ", end_time: "15:24", drive:  414, overlap_drive:   0, cargo: 189, overlap_cargo: 0, restraint:  768, overlap_restraint:   0, late_night: 214, ot_late_night: 0 },
-            MockDwh { day: 15, start_time: "23:37", end_time: "14:27", drive:  497, overlap_drive:   1, cargo: 241, overlap_cargo: 0, restraint:  890, overlap_restraint:   1, late_night: 323, ot_late_night: 0 },
-            MockDwh { day: 16, start_time: "23:36", end_time: "14:28", drive:  493, overlap_drive:   1, cargo: 173, overlap_cargo: 0, restraint:  892, overlap_restraint:   1, late_night: 324, ot_late_night: 0 },
-            MockDwh { day: 17, start_time: "23:35", end_time: "14:26", drive:  496, overlap_drive:   0, cargo: 261, overlap_cargo: 0, restraint:  891, overlap_restraint:   0, late_night: 325, ot_late_night: 0 },
-            MockDwh { day: 18, start_time: "23:36", end_time: "13:34", drive:  489, overlap_drive:   0, cargo: 148, overlap_cargo: 0, restraint:  853, overlap_restraint:   0, late_night: 324, ot_late_night: 96 },
-            MockDwh { day: 19, start_time: "23:41", end_time: "18:02", drive:    0, overlap_drive:   0, cargo:   0, overlap_cargo: 0, restraint:    0, overlap_restraint:   0, late_night:   0, ot_late_night: 0 },
-            MockDwh { day: 19, start_time: "23:36", end_time: "18:02", drive:  509, overlap_drive:   0, cargo: 125, overlap_cargo: 0, restraint:  895, overlap_restraint:   0, late_night:   0, ot_late_night: 415 },
-            MockDwh { day: 22, start_time: "23:33", end_time: "13:33", drive:  960, overlap_drive:   0, cargo: 434, overlap_cargo: 0, restraint: 1680, overlap_restraint:   0, late_night: 654, ot_late_night: 0 },
-            MockDwh { day: 23, start_time: "23:35", end_time: "14:22", drive:  476, overlap_drive:   0, cargo: 213, overlap_cargo: 0, restraint:  887, overlap_restraint:   0, late_night: 325, ot_late_night: 0 },
-            MockDwh { day: 24, start_time: "23:36", end_time: "14:45", drive:  509, overlap_drive:   0, cargo: 185, overlap_cargo: 0, restraint:  909, overlap_restraint:   0, late_night: 324, ot_late_night: 0 },
-            MockDwh { day: 25, start_time: "23:37", end_time: "14:16", drive:  480, overlap_drive:   4, cargo: 207, overlap_cargo: 0, restraint:  879, overlap_restraint:   4, late_night: 323, ot_late_night: 0 },
-            MockDwh { day: 26, start_time: "23:33", end_time: "14:22", drive:  496, overlap_drive:   0, cargo: 168, overlap_cargo: 0, restraint:  889, overlap_restraint:   0, late_night: 327, ot_late_night: 0 },
-            MockDwh { day: 27, start_time: "23:37", end_time: "14:48", drive:  500, overlap_drive:   0, cargo: 165, overlap_cargo: 0, restraint:  911, overlap_restraint:   0, late_night: 323, ot_late_night: 0 },
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+            MockDwh {
+                day: 2,
+                start_time: "1:17 ",
+                end_time: "14:43",
+                drive: 425,
+                overlap_drive: 110,
+                cargo: 173,
+                overlap_cargo: 0,
+                restraint: 740,
+                overlap_restraint: 120,
+                late_night: 209,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 2,
+                start_time: "23:17",
+                end_time: "14:43",
+                drive: 500,
+                overlap_drive: 0,
+                cargo: 278,
+                overlap_cargo: 0,
+                restraint: 882,
+                overlap_restraint: 0,
+                late_night: 333,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 4,
+                start_time: "1:20 ",
+                end_time: "15:10",
+                drive: 402,
+                overlap_drive: 9,
+                cargo: 137,
+                overlap_cargo: 0,
+                restraint: 761,
+                overlap_restraint: 9,
+                late_night: 210,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 5,
+                start_time: "1:11 ",
+                end_time: "14:26",
+                drive: 409,
+                overlap_drive: 113,
+                cargo: 130,
+                overlap_cargo: 0,
+                restraint: 726,
+                overlap_restraint: 113,
+                late_night: 229,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 5,
+                start_time: "23:18",
+                end_time: "14:26",
+                drive: 572,
+                overlap_drive: 0,
+                cargo: 270,
+                overlap_cargo: 0,
+                restraint: 953,
+                overlap_restraint: 0,
+                late_night: 342,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 7,
+                start_time: "1:26 ",
+                end_time: "15:48",
+                drive: 440,
+                overlap_drive: 0,
+                cargo: 166,
+                overlap_cargo: 0,
+                restraint: 787,
+                overlap_restraint: 0,
+                late_night: 204,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 9,
+                start_time: "23:45",
+                end_time: "14:14",
+                drive: 389,
+                overlap_drive: 26,
+                cargo: 135,
+                overlap_cargo: 0,
+                restraint: 793,
+                overlap_restraint: 26,
+                late_night: 305,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 10,
+                start_time: "23:19",
+                end_time: "15:47",
+                drive: 510,
+                overlap_drive: 0,
+                cargo: 295,
+                overlap_cargo: 0,
+                restraint: 874,
+                overlap_restraint: 0,
+                late_night: 341,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 11,
+                start_time: "23:54",
+                end_time: "14:16",
+                drive: 407,
+                overlap_drive: 62,
+                cargo: 255,
+                overlap_cargo: 0,
+                restraint: 792,
+                overlap_restraint: 31,
+                late_night: 306,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 12,
+                start_time: "23:23",
+                end_time: "15:36",
+                drive: 1018,
+                overlap_drive: 0,
+                cargo: 630,
+                overlap_cargo: 0,
+                restraint: 1875,
+                overlap_restraint: 0,
+                late_night: 674,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 14,
+                start_time: "1:25 ",
+                end_time: "15:24",
+                drive: 414,
+                overlap_drive: 0,
+                cargo: 189,
+                overlap_cargo: 0,
+                restraint: 768,
+                overlap_restraint: 0,
+                late_night: 214,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 15,
+                start_time: "23:37",
+                end_time: "14:27",
+                drive: 497,
+                overlap_drive: 1,
+                cargo: 241,
+                overlap_cargo: 0,
+                restraint: 890,
+                overlap_restraint: 1,
+                late_night: 323,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 16,
+                start_time: "23:36",
+                end_time: "14:28",
+                drive: 493,
+                overlap_drive: 1,
+                cargo: 173,
+                overlap_cargo: 0,
+                restraint: 892,
+                overlap_restraint: 1,
+                late_night: 324,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 17,
+                start_time: "23:35",
+                end_time: "14:26",
+                drive: 496,
+                overlap_drive: 0,
+                cargo: 261,
+                overlap_cargo: 0,
+                restraint: 891,
+                overlap_restraint: 0,
+                late_night: 325,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 18,
+                start_time: "23:36",
+                end_time: "13:34",
+                drive: 489,
+                overlap_drive: 0,
+                cargo: 148,
+                overlap_cargo: 0,
+                restraint: 853,
+                overlap_restraint: 0,
+                late_night: 324,
+                ot_late_night: 96,
+            },
+            MockDwh {
+                day: 19,
+                start_time: "23:41",
+                end_time: "18:02",
+                drive: 0,
+                overlap_drive: 0,
+                cargo: 0,
+                overlap_cargo: 0,
+                restraint: 0,
+                overlap_restraint: 0,
+                late_night: 0,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 19,
+                start_time: "23:36",
+                end_time: "18:02",
+                drive: 509,
+                overlap_drive: 0,
+                cargo: 125,
+                overlap_cargo: 0,
+                restraint: 895,
+                overlap_restraint: 0,
+                late_night: 0,
+                ot_late_night: 415,
+            },
+            MockDwh {
+                day: 22,
+                start_time: "23:33",
+                end_time: "13:33",
+                drive: 960,
+                overlap_drive: 0,
+                cargo: 434,
+                overlap_cargo: 0,
+                restraint: 1680,
+                overlap_restraint: 0,
+                late_night: 654,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 23,
+                start_time: "23:35",
+                end_time: "14:22",
+                drive: 476,
+                overlap_drive: 0,
+                cargo: 213,
+                overlap_cargo: 0,
+                restraint: 887,
+                overlap_restraint: 0,
+                late_night: 325,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 24,
+                start_time: "23:36",
+                end_time: "14:45",
+                drive: 509,
+                overlap_drive: 0,
+                cargo: 185,
+                overlap_cargo: 0,
+                restraint: 909,
+                overlap_restraint: 0,
+                late_night: 324,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 25,
+                start_time: "23:37",
+                end_time: "14:16",
+                drive: 480,
+                overlap_drive: 4,
+                cargo: 207,
+                overlap_cargo: 0,
+                restraint: 879,
+                overlap_restraint: 4,
+                late_night: 323,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 26,
+                start_time: "23:33",
+                end_time: "14:22",
+                drive: 496,
+                overlap_drive: 0,
+                cargo: 168,
+                overlap_cargo: 0,
+                restraint: 889,
+                overlap_restraint: 0,
+                late_night: 327,
+                ot_late_night: 0,
+            },
+            MockDwh {
+                day: 27,
+                start_time: "23:37",
+                end_time: "14:48",
+                drive: 500,
+                overlap_drive: 0,
+                cargo: 165,
+                overlap_cargo: 0,
+                restraint: 911,
+                overlap_restraint: 0,
+                late_night: 323,
+                ot_late_night: 0,
+            },
             // MOCK_1026_END
         ];
 
@@ -1530,16 +1942,29 @@ mod tests {
         let diffs = detect_diffs(&merged_days, &sys_days);
         println!("1026 diffs: {}", diffs.len());
         for d in &diffs {
-            println!("  {} {}: csv={} sys={}", d.date, d.field, d.csv_val, d.sys_val);
+            println!(
+                "  {} {}: csv={} sys={}",
+                d.date, d.field, d.csv_val, d.sys_val
+            );
         }
         // 1026の差分数が悪化していないことを保証（現状の上限値）
-        let non_time_diffs: Vec<_> = diffs.iter()
+        let non_time_diffs: Vec<_> = diffs
+            .iter()
             .filter(|d| !d.field.contains("始業") && !d.field.contains("終業"))
             .collect();
-        assert!(non_time_diffs.len() <= 83,
+        assert!(
+            non_time_diffs.len() <= 83,
             "1026の差分が悪化: {}件 (上限66件)\n{}",
             non_time_diffs.len(),
-            non_time_diffs.iter().map(|d| format!("  {} {}: csv={} sys={}", d.date, d.field, d.csv_val, d.sys_val)).collect::<Vec<_>>().join("\n"));
+            non_time_diffs
+                .iter()
+                .map(|d| format!(
+                    "  {} {}: csv={} sys={}",
+                    d.date, d.field, d.csv_val, d.sys_val
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     /// DB接続テスト: build_report_with_name → CSV変換 → 元CSVと比較
@@ -1548,12 +1973,15 @@ mod tests {
     #[ignore]
     async fn test_csv_compare_1021_db() {
         let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
-        let pool = sqlx::PgPool::connect(&db_url).await.expect("DB connect failed");
+        let pool = sqlx::PgPool::connect(&db_url)
+            .await
+            .expect("DB connect failed");
         let tenant_id = uuid::Uuid::parse_str("85b9ef71-61c0-4a11-928e-c18c685648c2").unwrap();
         let driver_id = uuid::Uuid::parse_str("45b57e8e-996d-4951-b500-3490cb7125d8").unwrap();
 
         let report = build_report_with_name(&pool, tenant_id, driver_id, "鈴木　昭", 2026, 2)
-            .await.expect("build_report failed");
+            .await
+            .expect("build_report failed");
         let sys_days = report_to_csv_days(&report);
 
         let drivers = parse_restraint_csv(CSV_1021.as_bytes()).unwrap();
@@ -1562,12 +1990,24 @@ mod tests {
         let diffs = detect_diffs_csv(&csv_d.days, &sys_days);
         println!("1021 DB diffs: {}", diffs.len());
         for d in &diffs {
-            println!("  {} {}: csv={} sys={}", d.date, d.field, d.csv_val, d.sys_val);
+            println!(
+                "  {} {}: csv={} sys={}",
+                d.date, d.field, d.csv_val, d.sys_val
+            );
         }
-        assert_eq!(diffs.len(), 0,
+        assert_eq!(
+            diffs.len(),
+            0,
             "Expected 0 diffs for 鈴木昭(1021) but got {}:\n{}",
             diffs.len(),
-            diffs.iter().map(|d| format!("  {} {}: csv={} sys={}", d.date, d.field, d.csv_val, d.sys_val)).collect::<Vec<_>>().join("\n")
+            diffs
+                .iter()
+                .map(|d| format!(
+                    "  {} {}: csv={} sys={}",
+                    d.date, d.field, d.csv_val, d.sys_val
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 
@@ -1577,12 +2017,15 @@ mod tests {
     #[ignore]
     async fn test_csv_compare_1026_db() {
         let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
-        let pool = sqlx::PgPool::connect(&db_url).await.expect("DB connect failed");
+        let pool = sqlx::PgPool::connect(&db_url)
+            .await
+            .expect("DB connect failed");
         let tenant_id = uuid::Uuid::parse_str("85b9ef71-61c0-4a11-928e-c18c685648c2").unwrap();
         let driver_id = uuid::Uuid::parse_str("744c3e12-1c2b-45a4-bfe1-60e8bdec3ea3").unwrap();
 
         let report = build_report_with_name(&pool, tenant_id, driver_id, "一瀬　道広", 2026, 2)
-            .await.expect("build_report failed");
+            .await
+            .expect("build_report failed");
         let sys_days = report_to_csv_days(&report);
 
         let drivers = parse_restraint_csv(CSV_1026.as_bytes()).unwrap();
@@ -1598,14 +2041,19 @@ mod tests {
                 if last.date == day.date && !day.is_holiday {
                     let merge_min = |a: &str, b: &str| -> String {
                         let sum = parse_hhmm(a) + parse_hhmm(b);
-                        if sum == 0 { String::new() } else { fmt_min(sum) }
+                        if sum == 0 {
+                            String::new()
+                        } else {
+                            fmt_min(sum)
+                        }
                     };
                     last.drive = merge_min(&last.drive, &day.drive);
                     last.overlap_drive = merge_min(&last.overlap_drive, &day.overlap_drive);
                     last.cargo = merge_min(&last.cargo, &day.cargo);
                     last.overlap_cargo = merge_min(&last.overlap_cargo, &day.overlap_cargo);
                     last.subtotal = merge_min(&last.subtotal, &day.subtotal);
-                    last.overlap_subtotal = merge_min(&last.overlap_subtotal, &day.overlap_subtotal);
+                    last.overlap_subtotal =
+                        merge_min(&last.overlap_subtotal, &day.overlap_subtotal);
                     last.total = merge_min(&last.total, &day.total);
                     last.cumulative = day.cumulative.clone();
                     last.actual_work = merge_min(&last.actual_work, &day.actual_work);
@@ -1622,7 +2070,10 @@ mod tests {
         let diffs = detect_diffs_csv(&merged_days, &sys_days);
         println!("1026 DB diffs: {}", diffs.len());
         for d in &diffs {
-            println!("  {} {}: csv={} sys={}", d.date, d.field, d.csv_val, d.sys_val);
+            println!(
+                "  {} {}: csv={} sys={}",
+                d.date, d.field, d.csv_val, d.sys_val
+            );
         }
         // 差分を出力して分析（まだ0件にはならない）
     }

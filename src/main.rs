@@ -50,15 +50,14 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .expect("PORT must be a number");
 
-    let google_client_id =
-        std::env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID must be set");
+    let google_client_id = std::env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID must be set");
     let google_client_secret =
         std::env::var("GOOGLE_CLIENT_SECRET").expect("GOOGLE_CLIENT_SECRET must be set");
     let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     let gateway_secret =
         std::env::var("GATEWAY_SECRET").unwrap_or_else(|_| "dev-gateway-secret".into());
-    let scraper_url = std::env::var("SCRAPER_URL")
-        .unwrap_or_else(|_| "http://localhost:8081".into());
+    let scraper_url =
+        std::env::var("SCRAPER_URL").unwrap_or_else(|_| "http://localhost:8081".into());
 
     let google_verifier = GoogleTokenVerifier::new(google_client_id, google_client_secret);
     let jwt_secret = JwtSecret(jwt_secret);

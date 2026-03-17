@@ -742,15 +742,52 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
     }
 
     // ---- フェリー控除 ----
+    // KUDGFRY→301イベントマッチング: フェリー対応301の区間時間を特定
+    // web地球号は休憩からフェリー301の区間時間を引き、運転=小計-荷役-休憩で逆算
+    let mut ferry_break_dur: HashMap<String, i32> = HashMap::new(); // unko_no → ferry 301 event duration
+    for (name, bytes) in &zip_files {
+        if !name.to_uppercase().contains("KUDGFRY") { continue; }
+        let text = csv_parser::decode_shift_jis(bytes);
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() <= 11 { continue; }
+            let unko_no = cols[0].trim().to_string();
+            if let Some(ferry_start) = NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S").ok()
+                .or_else(|| NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok())
+            {
+                // この運行の301イベントからフェリー開始時刻に最も近いものを探す
+                if let Some(events) = kudgivt_by_unko.get(&unko_no) {
+                    let matching_301 = events.iter()
+                        .filter(|e| e.event_cd == "301" && e.duration_minutes.unwrap_or(0) > 0)
+                        .min_by_key(|e| (e.start_at - ferry_start).num_seconds().abs());
+                    if let Some(evt) = matching_301 {
+                        let dur = evt.duration_minutes.unwrap_or(0);
+                        *ferry_break_dur.entry(unko_no).or_insert(0) += dur;
+                    }
+                }
+            }
+        }
+    }
+
     for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
         let mut ferry_deduction = 0i32;
+        let mut ferry_break_deduction = 0i32;
         for unko in &agg.unko_nos {
             if let Some(&fm) = ferry_minutes.get(unko) {
                 ferry_deduction += fm;
             }
+            if let Some(&fb) = ferry_break_dur.get(unko) {
+                ferry_break_deduction += fb;
+            }
         }
         if ferry_deduction > 0 {
             agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
+            // 運転 = 小計 - 荷役 - 休憩（web地球号互換）
+            // 休憩 = 301イベント合計 - フェリー301の区間時間
+            // break_from_events includes ferry 301, so subtract ferry_break_deduction
+            // drive_display = drive_from_201 - (ferry_KUDGFRY - ferry_301_event_dur)
+            // KUDGFRY四捨五入(71min)と301区間時間(70min)の差を運転から吸収
+            agg.drive_minutes = (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
         }
     }
 

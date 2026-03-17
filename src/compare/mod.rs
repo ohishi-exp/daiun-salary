@@ -384,6 +384,32 @@ fn default_classifications() -> HashMap<String, EventClass> {
     m
 }
 
+/// 実働ベースの時間外深夜計算
+/// Drive/Cargoイベントの累計が480分に達した後の深夜時間を返す
+pub fn calc_ot_late_night_from_events(events: &[(NaiveDateTime, NaiveDateTime)]) -> i32 {
+    let mut cumulative = 0i64;
+    let mut ot_night = 0i32;
+    for &(start, end) in events {
+        let dur = (end - start).num_minutes();
+        if dur <= 0 {
+            continue;
+        }
+        if cumulative >= 480 {
+            // 全て時間外
+            ot_night += calc_late_night_mins(start, end);
+        } else if cumulative + dur <= 480 {
+            // 全て所定内
+        } else {
+            // 境界を跨ぐ: 480分到達点で分割
+            let regular_dur = 480 - cumulative;
+            let boundary = start + chrono::Duration::minutes(regular_dur);
+            ot_night += calc_late_night_mins(boundary, end);
+        }
+        cumulative += dur;
+    }
+    ot_night
+}
+
 pub fn group_operations_into_work_days(rows: &[KudguriRow]) -> HashMap<String, NaiveDate> {
     const REST_THRESHOLD_MINUTES: i64 = 540;
     const MAX_WORK_DAY_MINUTES: i64 = 1440;
@@ -914,6 +940,9 @@ pub fn process_zip(
         }
     }
 
+    // ot_late_night計算用: ドライバー×日のDrive/Cargoイベント時刻リスト
+    let mut day_work_events: HashMap<(String, NaiveDate, NaiveTime), Vec<(NaiveDateTime, NaiveDateTime)>> = HashMap::new();
+
     // ---- イベント直接集計（秒単位→分変換） ----
     {
         let mut driver_unko_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -1006,6 +1035,10 @@ pub fn process_zip(
                                             .entry((event_date, event_start_time))
                                             .or_insert(0) += night;
                                     }
+                                    day_work_events
+                                        .entry((driver_cd.clone(), event_date, event_start_time))
+                                        .or_default()
+                                        .push((*part_start, *part_end));
                                 }
                                 _ => {}
                             }
@@ -1046,39 +1079,13 @@ pub fn process_zip(
                     agg.late_night_minutes = 0;
                 }
             }
-            // ot_late_night
-            for ((date, st), night) in &day_late_night {
+            // ot_late_night（実働ベース: 累計Drive/Cargo 480分到達後の深夜時間）
+            for ((date, st), _night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    let shigyo = agg.segments.iter().map(|s| s.start_at).min();
-                    let ot_night = if let Some(start) = shigyo {
-                        let overtime_start = start + chrono::Duration::minutes(480);
-                        let _night_start_22 = start.date().and_hms_opt(22, 0, 0).unwrap();
-                        let night_end_05 = (start.date() + chrono::Duration::days(1))
-                            .and_hms_opt(5, 0, 0)
-                            .unwrap();
-                        let effective_night_end = if start.hour() < 5 {
-                            start.date().and_hms_opt(5, 0, 0).unwrap()
-                        } else {
-                            night_end_05
-                        };
-                        if overtime_start >= effective_night_end {
-                            // 始業日の深夜は所定内に収まるが、
-                            // multi-op結合で翌日セグメントがある場合はその深夜を計上
-                            if agg.from_multi_op {
-                                let start_date = start.date();
-                                let non_start_night: i32 = agg
-                                    .segments
-                                    .iter()
-                                    .filter(|s| s.start_at.date() != start_date)
-                                    .map(|s| calc_late_night_mins(s.start_at, s.end_at))
-                                    .sum();
-                                non_start_night.min(*night)
-                            } else {
-                                0
-                            }
-                        } else {
-                            *night
-                        }
+                    let ot_night = if let Some(events) = day_work_events.get(&(driver_cd.clone(), *date, *st)) {
+                        let mut sorted = events.clone();
+                        sorted.sort_by_key(|&(s, _)| s);
+                        calc_ot_late_night_from_events(&sorted)
                     } else {
                         0
                     };
@@ -1154,6 +1161,8 @@ pub fn process_zip(
                     let mut ol_drive = 0i32;
                     let mut ol_cargo = 0i32;
                     let mut ol_restraint = 0i32;
+                    let mut ol_late_night_dc = 0i32; // Drive/Cargoのみの深夜時間
+                    let mut ol_work_events: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
 
                     for unko_no in &next_info.unko_nos {
                         if let Some(events) = kudgivt_by_unko.get(unko_no) {
@@ -1185,8 +1194,16 @@ pub fn process_zip(
                                 }
                                 let actual_dur = if mins >= dur { dur } else { mins };
                                 match cls {
-                                    Some(EventClass::Drive) => ol_drive += actual_dur,
-                                    Some(EventClass::Cargo) => ol_cargo += actual_dur,
+                                    Some(EventClass::Drive) => {
+                                        ol_drive += actual_dur;
+                                        ol_late_night_dc += calc_late_night_mins(overlap_start, effective_end);
+                                        ol_work_events.push((overlap_start, effective_end));
+                                    }
+                                    Some(EventClass::Cargo) => {
+                                        ol_cargo += actual_dur;
+                                        ol_late_night_dc += calc_late_night_mins(overlap_start, effective_end);
+                                        ol_work_events.push((overlap_start, effective_end));
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1224,15 +1241,27 @@ pub fn process_zip(
                     // 同日かつ長めのgap(≥180分)は重複表示（24h境界の分割）
                     let same_date_long_gap = date == next_date && next_gap >= 180;
                     if !next_resets && ol_restraint > 0 && !same_date_long_gap {
-                        let ol_late_night = calc_late_night_mins(next_info.start, window_end);
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                             agg.drive_minutes += ol_drive;
                             agg.cargo_minutes += ol_cargo;
                             agg.total_work_minutes += ol_restraint;
-                            agg.ot_late_night_minutes = ol_late_night;
+                            agg.late_night_minutes += ol_late_night_dc;
+                        }
+                        // overlapのDrive/Cargoイベントをday_work_eventsに追加してot_late_night再計算
+                        if !ol_work_events.is_empty() {
+                            let events_entry = day_work_events
+                                .entry((driver_cd.clone(), date, st))
+                                .or_default();
+                            events_entry.extend(ol_work_events);
+                            let mut sorted = events_entry.clone();
+                            sorted.sort_by_key(|&(s, _)| s);
+                            let ot_night = calc_ot_late_night_from_events(&sorted);
+                            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
+                                agg.ot_late_night_minutes = ot_night;
+                            }
                         }
                         next_day_deduction =
-                            Some((ol_drive, ol_cargo, ol_restraint, ol_late_night));
+                            Some((ol_drive, ol_cargo, ol_restraint, ol_late_night_dc));
                     } else if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                         agg.overlap_drive_minutes = ol_drive;
                         agg.overlap_cargo_minutes = ol_cargo;

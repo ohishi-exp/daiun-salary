@@ -1030,6 +1030,9 @@ async fn calculate_daily_hours(
         }
     }
 
+    // ot_late_night計算用: ドライバー×日のDrive/Cargoイベント時刻リスト
+    let mut day_work_events_global: HashMap<(String, chrono::NaiveDate, chrono::NaiveTime), Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>> = HashMap::new();
+
     // 3.55. drive/cargo をKUDGIVTイベントから日別に直接集計（カレンダー日付ベース）
     //       total_work_minutes はセグメントから秒単位で四捨五入
     {
@@ -1136,6 +1139,10 @@ async fn calculate_daily_hours(
                                             .entry((event_date, event_start_time))
                                             .or_insert(0) += night;
                                     }
+                                    day_work_events_global
+                                        .entry((driver_cd.clone(), event_date, event_start_time))
+                                        .or_default()
+                                        .push((*part_start, *part_end));
                                 }
                                 _ => {}
                             }
@@ -1181,34 +1188,13 @@ async fn calculate_daily_hours(
                     agg.late_night_minutes = 0;
                 }
             }
-            // ot_late_night = 始業+8h(所定労働)後に発生するDrive/Cargo深夜時間
-            for ((date, st), night) in &day_late_night {
+            // ot_late_night（実働ベース: 累計Drive/Cargo 480分到達後の深夜時間）
+            for ((date, st), _night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    let shigyo = agg.segments.iter().map(|s| s.start_at).min();
-                    let ot_night = if let Some(start) = shigyo {
-                        let overtime_start = start + chrono::Duration::minutes(480);
-                        // 深夜帯: 始業日の22:00と翌05:00
-                        let night_start_22 = start.date().and_hms_opt(22, 0, 0).unwrap();
-                        let night_end_05 = (start.date() + chrono::Duration::days(1))
-                            .and_hms_opt(5, 0, 0)
-                            .unwrap();
-                        // 始業が22:00-05:00の場合、深夜帯の終了は始業当日の05:00または翌05:00
-                        let effective_night_end = if start.hour() < 5 {
-                            // 始業が0-5時 → 深夜帯終了は当日05:00
-                            start.date().and_hms_opt(5, 0, 0).unwrap()
-                        } else {
-                            night_end_05
-                        };
-                        if overtime_start >= effective_night_end {
-                            // 始業+8hが深夜帯終了以降 → 深夜帯は全て所定労働内
-                            0
-                        } else if overtime_start <= night_start_22 {
-                            // 始業+8hが22:00より前 → 深夜帯は全て時間外
-                            *night
-                        } else {
-                            // 部分的: overtime_startが深夜帯内 → 近似値
-                            *night
-                        }
+                    let ot_night = if let Some(events) = day_work_events_global.get(&(driver_cd.clone(), *date, *st)) {
+                        let mut sorted = events.clone();
+                        sorted.sort_by_key(|&(s, _)| s);
+                        daiun_salary::compare::calc_ot_late_night_from_events(&sorted)
                     } else {
                         0
                     };
@@ -1302,6 +1288,8 @@ async fn calculate_daily_hours(
                     let mut ol_drive = 0i32;
                     let mut ol_cargo = 0i32;
                     let mut ol_restraint = 0i32;
+                    let mut ol_late_night_dc = 0i32;
+                    let mut ol_work_events: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> = Vec::new();
 
                     for unko_no in &next_info.unko_nos {
                         if let Some(events) = kudgivt_by_unko.get(unko_no) {
@@ -1345,8 +1333,16 @@ async fn calculate_daily_hours(
                                 let actual_dur = if mins >= dur { dur } else { mins };
 
                                 match cls {
-                                    Some(EventClass::Drive) => ol_drive += actual_dur,
-                                    Some(EventClass::Cargo) => ol_cargo += actual_dur,
+                                    Some(EventClass::Drive) => {
+                                        ol_drive += actual_dur;
+                                        ol_late_night_dc += crate::csv_parser::work_segments::calc_late_night_mins(overlap_start, effective_end);
+                                        ol_work_events.push((overlap_start, effective_end));
+                                    }
+                                    Some(EventClass::Cargo) => {
+                                        ol_cargo += actual_dur;
+                                        ol_late_night_dc += crate::csv_parser::work_segments::calc_late_night_mins(overlap_start, effective_end);
+                                        ol_work_events.push((overlap_start, effective_end));
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1380,22 +1376,29 @@ async fn calculate_daily_hours(
                     let next_resets = next_gap >= 480;
 
                     if !next_resets && ol_restraint > 0 {
-                        // 重複期間の深夜時間を計算（翌日から控除するため）
-                        let ol_late_night = {
-                            use crate::csv_parser::work_segments::calc_late_night_mins;
-                            calc_late_night_mins(next_info.start, window_end)
-                        };
                         // 当日メインに統合（overlapは0にする）
-                        // 深夜は重複列で扱うため当日メインには加算しない
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                             agg.drive_minutes += ol_drive;
                             agg.cargo_minutes += ol_cargo;
                             agg.total_work_minutes += ol_restraint;
-                            agg.ot_late_night_minutes = ol_late_night;
+                            agg.late_night_minutes += ol_late_night_dc;
+                        }
+                        // overlapのDrive/Cargoイベントでot_late_night再計算
+                        if !ol_work_events.is_empty() {
+                            let events_entry = day_work_events_global
+                                .entry((driver_cd.clone(), date, st))
+                                .or_default();
+                            events_entry.extend(ol_work_events);
+                            let mut sorted = events_entry.clone();
+                            sorted.sort_by_key(|&(s, _)| s);
+                            let ot_night = daiun_salary::compare::calc_ot_late_night_from_events(&sorted);
+                            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
+                                agg.ot_late_night_minutes = ot_night;
+                            }
                         }
                         // 翌日のメインから控除する分を記録（深夜も控除）
                         next_day_deduction =
-                            Some((ol_drive, ol_cargo, ol_restraint, ol_late_night));
+                            Some((ol_drive, ol_cargo, ol_restraint, ol_late_night_dc));
                     } else {
                         // 通常: 重複として別表示
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {

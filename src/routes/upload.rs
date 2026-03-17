@@ -1092,42 +1092,16 @@ async fn calculate_daily_hours(
     }
 
     // フェリー控除（overlap計算後、DB書き込み直前）
-    // KUDGFRY→301イベントマッチング: フェリー対応301の区間時間を特定
-    // KUDGFRY四捨五入と301区間時間の丸め差をdrive_minutesで吸収（web地球号互換）
-    let mut ferry_break_dur: HashMap<String, i32> = HashMap::new(); // unko_no → ferry 301 event duration
-    for row in rows {
-        if !ferry_minutes.contains_key(&row.unko_no) { continue; }
-        if let Some(events) = kudgivt_by_unko.get(&row.unko_no) {
-            // このunko_noのKUDGFRYエントリのフェリー開始時刻を取得
-            // (load_ferry_minutesで既にパース済みだが、ここでは301マッチング用に再取得が必要)
-            // ferry_minutesに最も近い区間時間の301イベントをフェリー301とみなす
-            let fm = ferry_minutes[&row.unko_no];
-            let ferry_301 = events.iter()
-                .filter(|e| classifications.get(&e.event_cd) == Some(&EventClass::Break))
-                .filter(|e| e.duration_minutes.unwrap_or(0) > 0)
-                .min_by_key(|e| (e.duration_minutes.unwrap_or(0) - fm).abs());
-            if let Some(evt) = ferry_301 {
-                ferry_break_dur.insert(row.unko_no.clone(), evt.duration_minutes.unwrap_or(0));
-            }
-        }
-    }
-
+    // total_work_minutes(拘束時間小計)からフェリー乗船時間を控除
     for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
         let mut ferry_deduction = 0i32;
-        let mut ferry_break_deduction = 0i32;
         for unko in &agg.unko_nos {
             if let Some(&fm) = ferry_minutes.get(unko) {
                 ferry_deduction += fm;
             }
-            if let Some(&fb) = ferry_break_dur.get(unko) {
-                ferry_break_deduction += fb;
-            }
         }
         if ferry_deduction > 0 {
             agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
-            // drive = drive_from_201 - (ferry_KUDGFRY - ferry_301_dur)
-            // KUDGFRY四捨五入と301区間時間の丸め差を運転で吸収
-            agg.drive_minutes = (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
         }
     }
 

@@ -25,39 +25,55 @@ for arg in "$@"; do
     esac
 done
 
-echo "=== Step 1/4: cargo fmt --check ==="
+STEP=1
+
+echo "=== Step $STEP: cargo fmt --check ==="
 cargo fmt --check
 echo "  OK"
+STEP=$((STEP+1))
 
 echo ""
-echo "=== Step 2/4: cargo clippy ==="
+echo "=== Step $STEP: cargo clippy ==="
 cargo clippy 2>&1 | tail -5
 echo "  OK"
+STEP=$((STEP+1))
 
 echo ""
-echo "=== Step 3/4: cargo test (restraint_report) ==="
+echo "=== Step $STEP: cargo test (restraint_report) ==="
 cargo test restraint_report 2>&1 | tail -10
 echo "  OK"
+STEP=$((STEP+1))
 
 if [ "$SKIP_COMPARE" = false ]; then
-    echo ""
-    echo "=== Step 4/5: CSV比較 (1018/1021/1026) ==="
-    cargo run --bin compare -- \
-        "test_data/csvdata-202602-1018-1021-1026.zip" \
-        "test_data/拘束時間管理表_202602-1018-1021-1026.csv" \
-        --json | tail -5
-    echo "  OK（差分なし）"
+    # CSV比較テスト定義: ZIP CSV 期待差分数 ラベル
+    declare -a COMPARE_TESTS=(
+        "test_data/csvdata-202602-1018-1021-1026.zip|test_data/拘束時間管理表_202602-1018-1021-1026.csv|0|1018/1021/1026"
+        "test_data/csvdata-202602-1029-1032-1036-1037.zip|test_data/拘束時間管理表_202602-1029-1032-1036-1037.csv|0|1029/1032/1036/1037"
+        "test_data/csvdata-202602-1039.zip|test_data/拘束時間管理表_202602-all.csv|15|1039(既知差分15件)"
+    )
 
-    echo ""
-    echo "=== Step 5/5: CSV比較 (1029/1032/1036/1037) ==="
-    cargo run --bin compare -- \
-        "test_data/csvdata-202602-1029-1032-1036-1037.zip" \
-        "test_data/拘束時間管理表_202602-1029-1032-1036-1037.csv" \
-        --json | tail -5
-    echo "  OK（差分なし）"
+    TOTAL_COMPARE=${#COMPARE_TESTS[@]}
+    for i in "${!COMPARE_TESTS[@]}"; do
+        IFS='|' read -r ZIP CSV EXPECTED_DIFFS LABEL <<< "${COMPARE_TESTS[$i]}"
+        echo ""
+        echo "=== Step $STEP: CSV比較 ($LABEL) ==="
+
+        OUTPUT=$(cargo run --bin compare -- "$ZIP" "$CSV" --json 2>&1)
+        DIFFS=$(echo "$OUTPUT" | grep -o '"total_diffs": [0-9]*' | tail -1 | grep -o '[0-9]*')
+
+        if [ "$DIFFS" = "$EXPECTED_DIFFS" ]; then
+            echo "  OK（差分${DIFFS}件 = 期待値${EXPECTED_DIFFS}件）"
+        else
+            echo "  FAIL: 差分${DIFFS}件 ≠ 期待値${EXPECTED_DIFFS}件"
+            echo "$OUTPUT" | tail -20
+            exit 1
+        fi
+        STEP=$((STEP+1))
+    done
 else
     echo ""
-    echo "=== Step 4/4: CSV比較 — スキップ ==="
+    echo "=== Step $STEP: CSV比較 — スキップ ==="
+    STEP=$((STEP+1))
 fi
 
 echo ""

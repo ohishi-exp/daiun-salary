@@ -1289,7 +1289,14 @@ async fn load_kudgivt_from_zips(
         }
     }
 
-    tracing::info!("Total KUDGIVT from ZIPs: {} rows", all_kudgivt.len());
+    // 重複排除: 同じ(unko_no, event_cd, start_at)のイベントは1つだけ保持
+    // 複数ZIPに同じKUDGIVTデータが含まれる場合の対策
+    let before = all_kudgivt.len();
+    let mut seen = std::collections::HashSet::new();
+    all_kudgivt.retain(|row| {
+        seen.insert((row.unko_no.clone(), row.event_cd.clone(), row.start_at))
+    });
+    tracing::info!("Total KUDGIVT from ZIPs: {} rows (deduped from {})", all_kudgivt.len(), before);
     Ok(all_kudgivt)
 }
 

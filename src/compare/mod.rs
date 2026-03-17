@@ -1364,10 +1364,8 @@ pub fn process_zip(
                         agg_a_mut.cargo_minutes += b_clone.cargo_minutes;
                         agg_a_mut.total_work_minutes += b_clone.total_work_minutes + gap_mins;
                         agg_a_mut.late_night_minutes += b_clone.late_night_minutes;
-                        agg_a_mut.overlap_drive_minutes += b_clone.overlap_drive_minutes;
-                        agg_a_mut.overlap_cargo_minutes += b_clone.overlap_cargo_minutes;
-                        agg_a_mut.overlap_break_minutes += b_clone.overlap_break_minutes;
-                        agg_a_mut.overlap_restraint_minutes += b_clone.overlap_restraint_minutes;
+                        // overlapは結合しない（運行間の重複はもう構内時間として計上済み）
+                        // ot_late_nightも個別に再計算が必要だが、ここでは合算
                         agg_a_mut.ot_late_night_minutes += b_clone.ot_late_night_minutes;
                         agg_a_mut.segments.extend(b_clone.segments);
                         for u in &b_clone.unko_nos {

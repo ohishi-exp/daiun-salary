@@ -30,3 +30,11 @@ futures = "0.3"
 tokio-stream = "0.1"
 printpdf = "0.8"
 base64 = "0.22"
+
+[[bin]]
+name = "daiun-salary"
+path = "src/main.rs"
+
+[[bin]]
+name = "compare"
+path = "src/bin/compare.rs"

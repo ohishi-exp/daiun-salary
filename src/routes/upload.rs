@@ -610,10 +610,18 @@ async fn calculate_daily_hours(
                         .unwrap_or(dep.time())
                 };
 
+                // workday内に完全収まるセグメントはworkday.dateを使用（日跨ぎ対応）
+                let find_workday_date = |start: chrono::NaiveDateTime, end: chrono::NaiveDateTime| -> chrono::NaiveDate {
+                    workdays.iter()
+                        .find(|wd| start >= wd.start && end <= wd.end)
+                        .map(|wd| wd.date)
+                        .unwrap_or(start.date())
+                };
+
                 // セグメント情報を保存（イベント帰属判定用）
                 // (seg.start, seg.end, work_date, start_time)
                 let seg_entries: Vec<_> = segments.iter()
-                    .map(|seg| (seg.start, seg.end, seg.start.date(), find_start_time(seg.start)))
+                    .map(|seg| (seg.start, seg.end, find_workday_date(seg.start, seg.end), find_start_time(seg.start)))
                     .collect();
                 unko_segments.insert(row.unko_no.clone(), seg_entries);
 
@@ -628,11 +636,16 @@ async fn calculate_daily_hours(
                     };
                     let day_distance = total_distance * ratio;
 
-                    // work_date: セグメントの開始日
-                    // start_time: workday境界の始業時刻（休息基準で判定）
-                    let parent_seg = segments.iter()
-                        .find(|seg| ds.start >= seg.start && ds.start < seg.end);
-                    let work_date = parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date);
+                    // work_date: workday内に完全収まる場合はworkday.date、
+                    //            跨る場合はparent segmentの開始日
+                    let work_date = workdays.iter()
+                        .find(|wd| ds.start >= wd.start && ds.end <= wd.end)
+                        .map(|wd| wd.date)
+                        .unwrap_or_else(|| {
+                            let parent_seg = segments.iter()
+                                .find(|seg| ds.start >= seg.start && ds.start < seg.end);
+                            parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date)
+                        });
                     let start_time = find_start_time(ds.start);
                     let entry = day_map
                         .entry((row.driver_cd.clone(), work_date, start_time))
@@ -1092,16 +1105,42 @@ async fn calculate_daily_hours(
     }
 
     // フェリー控除（overlap計算後、DB書き込み直前）
-    // total_work_minutes(拘束時間小計)からフェリー乗船時間を控除
+    // KUDGFRY→301イベントマッチング: フェリー対応301の区間時間を特定
+    // KUDGFRY四捨五入と301区間時間の丸め差をdrive_minutesで吸収（web地球号互換）
+    let mut ferry_break_dur: HashMap<String, i32> = HashMap::new(); // unko_no → ferry 301 event duration
+    for row in rows {
+        if !ferry_minutes.contains_key(&row.unko_no) { continue; }
+        if let Some(events) = kudgivt_by_unko.get(&row.unko_no) {
+            // このunko_noのKUDGFRYエントリのフェリー開始時刻を取得
+            // (load_ferry_minutesで既にパース済みだが、ここでは301マッチング用に再取得が必要)
+            // ferry_minutesに最も近い区間時間の301イベントをフェリー301とみなす
+            let fm = ferry_minutes[&row.unko_no];
+            let ferry_301 = events.iter()
+                .filter(|e| classifications.get(&e.event_cd) == Some(&EventClass::Break))
+                .filter(|e| e.duration_minutes.unwrap_or(0) > 0)
+                .min_by_key(|e| (e.duration_minutes.unwrap_or(0) - fm).abs());
+            if let Some(evt) = ferry_301 {
+                ferry_break_dur.insert(row.unko_no.clone(), evt.duration_minutes.unwrap_or(0));
+            }
+        }
+    }
+
     for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
         let mut ferry_deduction = 0i32;
+        let mut ferry_break_deduction = 0i32;
         for unko in &agg.unko_nos {
             if let Some(&fm) = ferry_minutes.get(unko) {
                 ferry_deduction += fm;
             }
+            if let Some(&fb) = ferry_break_dur.get(unko) {
+                ferry_break_deduction += fb;
+            }
         }
         if ferry_deduction > 0 {
             agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
+            // drive = drive_from_201 - (ferry_KUDGFRY - ferry_301_dur)
+            // KUDGFRY四捨五入と301区間時間の丸め差を運転で吸収
+            agg.drive_minutes = (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
         }
     }
 
@@ -1317,7 +1356,7 @@ async fn load_or_init_classifications(
 
 fn default_classification(event_cd: &str) -> (&'static str, EventClass) {
     match event_cd {
-        "110" => ("drive", EventClass::Drive),          // IG-Moving(運転)
+        "201" => ("drive", EventClass::Drive),          // 走行(運転)
         "202" => ("cargo", EventClass::Cargo),          // 積み
         "203" => ("cargo", EventClass::Cargo),          // 降し
         "302" => ("rest_split", EventClass::RestSplit), // 休息

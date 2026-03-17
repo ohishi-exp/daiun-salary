@@ -1037,7 +1037,20 @@ pub fn process_zip(
                             night_end_05
                         };
                         if overtime_start >= effective_night_end {
-                            0
+                            // 始業日の深夜は所定内に収まるが、
+                            // multi-op結合で翌日セグメントがある場合はその深夜を計上
+                            if agg.from_multi_op {
+                                let start_date = start.date();
+                                let non_start_night: i32 = agg
+                                    .segments
+                                    .iter()
+                                    .filter(|s| s.start_at.date() != start_date)
+                                    .map(|s| calc_late_night_mins(s.start_at, s.end_at))
+                                    .sum();
+                                non_start_night.min(*night)
+                            } else {
+                                0
+                            }
                         } else {
                             *night
                         }

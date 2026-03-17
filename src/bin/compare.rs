@@ -367,6 +367,10 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
         end_at: NaiveDateTime,
     }
 
+    // ドライバーごとの全workday境界を収集（始業/終業表示用）
+    // キー: (driver_cd, workday.date, workday.start.time()) → (workday.start, workday.end)
+    let mut workday_boundaries: HashMap<(String, NaiveDate, NaiveTime), (NaiveDateTime, NaiveDateTime)> = HashMap::new();
+
     // キー: (driver_cd, work_date, start_time)
     let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
 
@@ -392,6 +396,14 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                     .collect();
                 let workdays = work_segments::determine_workdays(&rest_events_for_unko, dep, ret);
 
+                // workday境界を収集
+                for wd in &workdays {
+                    workday_boundaries.insert(
+                        (row.driver_cd.clone(), wd.date, wd.start.time()),
+                        (wd.start, wd.end),
+                    );
+                }
+
                 let find_start_time = |ts: NaiveDateTime| -> NaiveTime {
                     workdays.iter()
                         .find(|wd| ts >= wd.start && ts < wd.end)
@@ -400,16 +412,30 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                         .unwrap_or(dep.time())
                 };
 
-                // セグメント情報保存
+                // セグメント情報保存（workday日付を使用）
+                let find_workday_date = |start: NaiveDateTime, end: NaiveDateTime| -> NaiveDate {
+                    // セグメントが完全にworkday内に収まる場合、そのworkdayの日付を使用
+                    workdays.iter()
+                        .find(|wd| start >= wd.start && end <= wd.end)
+                        .map(|wd| wd.date)
+                        .unwrap_or(start.date())
+                };
                 let seg_entries: Vec<_> = segments.iter()
-                    .map(|seg| (seg.start, seg.end, seg.start.date(), find_start_time(seg.start)))
+                    .map(|seg| (seg.start, seg.end, find_workday_date(seg.start, seg.end), find_start_time(seg.start)))
                     .collect();
                 unko_segments.insert(row.unko_no.clone(), seg_entries);
 
                 for ds in &daily_segments {
-                    let parent_seg = segments.iter()
-                        .find(|seg| ds.start >= seg.start && ds.start < seg.end);
-                    let work_date = parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date);
+                    // workday内に完全に収まるか確認
+                    let work_date = workdays.iter()
+                        .find(|wd| ds.start >= wd.start && ds.end <= wd.end)
+                        .map(|wd| wd.date)
+                        .unwrap_or_else(|| {
+                            // 複数workdayに跨る場合はparent segmentの日付
+                            let parent_seg = segments.iter()
+                                .find(|seg| ds.start >= seg.start && ds.start < seg.end);
+                            parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date)
+                        });
                     let start_time = find_start_time(ds.start);
                     let entry = day_map
                         .entry((row.driver_cd.clone(), work_date, start_time))
@@ -802,13 +828,30 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                     let total_ot = (actual_work - 480).max(0);
                     let overtime = (total_ot - ot_ln).max(0);
 
-                    // 始業・終業
-                    let start_time = agg.segments.iter().map(|s| s.start_at).min()
-                        .map(|dt| format!("{}:{:02}", dt.hour(), dt.minute()))
+                    // 始業・終業（分切り捨て、web地球号互換）
+                    let fmt_trunc_time = |dt: NaiveDateTime| -> String {
+                        format!("{}:{:02}", dt.hour(), dt.minute())
+                    };
+                    let wb = workday_boundaries.get(&(driver_cd.clone(), current_date, *_st));
+                    // 始業: workday境界があればそちら、なければセグメントmin
+                    let start_time = wb
+                        .map(|(wd_start, _)| fmt_trunc_time(*wd_start))
+                        .or_else(|| agg.segments.iter().map(|s| s.start_at).min().map(|dt| fmt_trunc_time(dt)))
                         .unwrap_or_default();
-                    let end_time = agg.segments.iter().map(|s| s.end_at).max()
-                        .map(|dt| format!("{}:{:02}", dt.hour(), dt.minute()))
-                        .unwrap_or_default();
+                    // 終業: セグメントの最大end_atを優先（実イベント時刻）。
+                    // 日跨ぎでセグメントが当日分しかない場合はworkday終了時刻を使用。
+                    let seg_max_end = agg.segments.iter().map(|s| s.end_at).max();
+                    let end_time = match (wb, seg_max_end) {
+                        (Some((wd_start, wd_end)), Some(seg_end))
+                            if wd_start.date() != wd_end.date() && seg_end.date() == wd_start.date() =>
+                        {
+                            // 日跨ぎだがセグメントが当日で終了 → workday.endを使用
+                            fmt_trunc_time(*wd_end)
+                        }
+                        (_, Some(seg_end)) => fmt_trunc_time(seg_end),
+                        (Some((_, wd_end)), None) => fmt_trunc_time(*wd_end),
+                        _ => String::new(),
+                    };
 
                     total_drive += day_drive;
                     total_restraint += day_restraint;

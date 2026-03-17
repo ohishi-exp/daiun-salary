@@ -1455,9 +1455,36 @@ pub fn process_zip(
         }
     }
 
+    // フェリー期間をKUDGFRYから取得（Drive重複判定用）
+    let mut ferry_period_map: HashMap<String, Vec<(NaiveDateTime, NaiveDateTime)>> = HashMap::new();
+    for (name, bytes) in &zip_files {
+        if !name.to_uppercase().contains("KUDGFRY") {
+            continue;
+        }
+        let text = csv_parser::decode_shift_jis(bytes);
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() <= 11 {
+                continue;
+            }
+            let unko_no = cols[0].trim().to_string();
+            if let (Some(s), Some(e)) = (
+                NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S")
+                    .ok()
+                    .or_else(|| NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+                NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S")
+                    .ok()
+                    .or_else(|| NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+            ) {
+                ferry_period_map.entry(unko_no).or_default().push((s, e));
+            }
+        }
+    }
+
     for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
-        let mut ferry_deduction = 0i32;
-        let mut ferry_break_deduction = 0i32;
+        let mut ferry_deduction = 0i32; // KUDGFRY時間（四捨五入）
+        let mut ferry_break_deduction = 0i32; // 対応301イベントのduration
+        let mut ferry_drive_overlap = 0i32; // Drive/Cargoとフェリー期間の実重複
         for unko in &agg.unko_nos {
             if let Some(&fm) = ferry_minutes.get(unko) {
                 ferry_deduction += fm;
@@ -1465,11 +1492,38 @@ pub fn process_zip(
             if let Some(&fb) = ferry_break_dur.get(unko) {
                 ferry_break_deduction += fb;
             }
+            if let Some(periods) = ferry_period_map.get(unko) {
+                if let Some(events) = kudgivt_by_unko.get(unko) {
+                    for &(fs, fe) in periods {
+                        for evt in events {
+                            match classifications.get(&evt.event_cd) {
+                                Some(EventClass::Drive) | Some(EventClass::Cargo) => {}
+                                _ => continue,
+                            }
+                            let dur = evt.duration_minutes.unwrap_or(0);
+                            if dur <= 0 { continue; }
+                            // フェリー重複判定は秒精度（trunc_minしない）
+                            let es = evt.start_at;
+                            let ee = es + chrono::Duration::minutes(dur as i64);
+                            let os = es.max(fs);
+                            let oe = ee.min(fe);
+                            if oe > os {
+                                let secs = (oe - os).num_seconds();
+                                ferry_drive_overlap += ((secs + 30) / 60) as i32;
+                            }
+                        }
+                    }
+                }
+            }
         }
         if ferry_deduction > 0 {
-            agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
-            agg.drive_minutes =
-                (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
+            // drive控除 = 丸め差(ferry-break)と実重複の小さい方
+            let rounding_diff = (ferry_deduction - ferry_break_deduction).max(0);
+            let drive_ded = rounding_diff.min(ferry_drive_overlap);
+            // total_work控除 = break + drive控除分
+            let total_ded = ferry_break_deduction + drive_ded;
+            agg.total_work_minutes = (agg.total_work_minutes - total_ded).max(0);
+            agg.drive_minutes = (agg.drive_minutes - drive_ded).max(0);
         }
     }
 

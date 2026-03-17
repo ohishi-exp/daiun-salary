@@ -1040,43 +1040,19 @@ pub fn post_process_day_map(
     }
 }
 
-pub fn process_zip(
-    zip_bytes: &[u8],
-    target_year: i32,
-    target_month: u32,
-) -> Result<Vec<CsvDriverData>, String> {
-    let zip_files =
-        csv_parser::extract_zip(zip_bytes).map_err(|e| format!("ZIP展開エラー: {e}"))?;
+pub struct BuildDayMapResult {
+    pub day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg>,
+    pub workday_boundaries: HashMap<(String, NaiveDate, NaiveTime), (NaiveDateTime, NaiveDateTime)>,
+    pub day_work_events:
+        HashMap<(String, NaiveDate, NaiveTime), Vec<(NaiveDateTime, NaiveDateTime)>>,
+}
 
-    let kudguri_bytes = zip_files
-        .iter()
-        .find(|(n, _)| n.to_uppercase().contains("KUDGURI"))
-        .ok_or("KUDGURI.csv が見つかりません")?;
-    let kudgivt_bytes = zip_files
-        .iter()
-        .find(|(n, _)| n.to_uppercase().contains("KUDGIVT"))
-        .ok_or("KUDGIVT.csv が見つかりません")?;
-
-    let kudguri_text = csv_parser::decode_shift_jis(&kudguri_bytes.1);
-    let kudgivt_text = csv_parser::decode_shift_jis(&kudgivt_bytes.1);
-
-    let kudguri_rows = csv_parser::kudguri::parse_kudguri(&kudguri_text)
-        .map_err(|e| format!("KUDGURIパースエラー: {e}"))?;
-    let kudgivt_rows = csv_parser::kudgivt::parse_kudgivt(&kudgivt_text)
-        .map_err(|e| format!("KUDGIVTパースエラー: {e}"))?;
-
-    let classifications = default_classifications();
-    let unko_work_date = group_operations_into_work_days(&kudguri_rows);
-
-    let mut kudgivt_by_unko: HashMap<String, Vec<&KudgivtRow>> = HashMap::new();
-    for row in &kudgivt_rows {
-        kudgivt_by_unko
-            .entry(row.unko_no.clone())
-            .or_default()
-            .push(row);
-    }
-
-    // DayAgg, SegRec はモジュールレベルで定義（pub）
+pub fn build_day_map(
+    kudguri_rows: &[KudguriRow],
+    kudgivt_by_unko: &HashMap<String, Vec<&KudgivtRow>>,
+    classifications: &HashMap<String, EventClass>,
+) -> BuildDayMapResult {
+    let unko_work_date = group_operations_into_work_days(kudguri_rows);
 
     let mut workday_boundaries: HashMap<
         (String, NaiveDate, NaiveTime),
@@ -1090,7 +1066,7 @@ pub fn process_zip(
     let mut multi_op_boundaries: HashMap<String, NaiveDateTime> = HashMap::new();
 
     let mut workday_groups: BTreeMap<(String, NaiveDate), Vec<&KudguriRow>> = BTreeMap::new();
-    for row in &kudguri_rows {
+    for row in kudguri_rows {
         let wd = unko_work_date
             .get(&row.unko_no)
             .copied()
@@ -1572,6 +1548,53 @@ pub fn process_zip(
             }
         }
     }
+
+    BuildDayMapResult {
+        day_map,
+        workday_boundaries,
+        day_work_events,
+    }
+}
+
+pub fn process_zip(
+    zip_bytes: &[u8],
+    target_year: i32,
+    target_month: u32,
+) -> Result<Vec<CsvDriverData>, String> {
+    let zip_files =
+        csv_parser::extract_zip(zip_bytes).map_err(|e| format!("ZIP展開エラー: {e}"))?;
+
+    let kudguri_bytes = zip_files
+        .iter()
+        .find(|(n, _)| n.to_uppercase().contains("KUDGURI"))
+        .ok_or("KUDGURI.csv が見つかりません")?;
+    let kudgivt_bytes = zip_files
+        .iter()
+        .find(|(n, _)| n.to_uppercase().contains("KUDGIVT"))
+        .ok_or("KUDGIVT.csv が見つかりません")?;
+
+    let kudguri_text = csv_parser::decode_shift_jis(&kudguri_bytes.1);
+    let kudgivt_text = csv_parser::decode_shift_jis(&kudgivt_bytes.1);
+
+    let kudguri_rows = csv_parser::kudguri::parse_kudguri(&kudguri_text)
+        .map_err(|e| format!("KUDGURIパースエラー: {e}"))?;
+    let kudgivt_rows = csv_parser::kudgivt::parse_kudgivt(&kudgivt_text)
+        .map_err(|e| format!("KUDGIVTパースエラー: {e}"))?;
+
+    let classifications = default_classifications();
+
+    let mut kudgivt_by_unko: HashMap<String, Vec<&KudgivtRow>> = HashMap::new();
+    for row in &kudgivt_rows {
+        kudgivt_by_unko
+            .entry(row.unko_no.clone())
+            .or_default()
+            .push(row);
+    }
+
+    let result = build_day_map(&kudguri_rows, &kudgivt_by_unko, &classifications);
+    let mut day_map = result.day_map;
+    let mut workday_boundaries = result.workday_boundaries;
+    let mut day_work_events = result.day_work_events;
 
     let ferry_info = FerryInfo::from_zip_files(&zip_files, &kudgivt_by_unko);
     post_process_day_map(

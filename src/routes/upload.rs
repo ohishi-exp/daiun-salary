@@ -342,79 +342,7 @@ async fn upsert_driver(
     Ok(Some(rec.0))
 }
 
-/// 運行を「ワークデイ」にグルーピングする。
-/// 休息基準（原則540分以上）を満たした場合、次の拘束開始を新規始業とする。
-/// 満たさない場合は前の始業の日に帰属し続ける。24時間が最大。
-/// Returns: unko_no → work_date のマッピング
-///
-/// NOTE: daiun_salary::compare にも同じロジックがあるが、binary crateとlibrary crateで
-/// KudguriRow型が異なるため、直接呼び出せない。ロジックは同一に保つこと。
-fn group_operations_into_work_days(
-    rows: &[KudguriRow],
-) -> std::collections::HashMap<String, chrono::NaiveDate> {
-    use std::collections::HashMap;
-
-    const REST_THRESHOLD_MINUTES: i64 = 540;
-    const MAX_WORK_DAY_MINUTES: i64 = 1440;
-
-    let mut unko_work_date: HashMap<String, chrono::NaiveDate> = HashMap::new();
-    let mut driver_rows: HashMap<String, Vec<&KudguriRow>> = HashMap::new();
-    for row in rows {
-        if !row.driver_cd.is_empty() {
-            driver_rows
-                .entry(row.driver_cd.clone())
-                .or_default()
-                .push(row);
-        }
-    }
-
-    for (_driver_cd, mut ops) in driver_rows {
-        ops.sort_by(|a, b| {
-            let da = a.departure_at.or(a.garage_out_at);
-            let db = b.departure_at.or(b.garage_out_at);
-            da.cmp(&db)
-        });
-
-        let mut current_shigyo: Option<chrono::NaiveDateTime> = None;
-        let mut current_work_date: Option<chrono::NaiveDate> = None;
-        let mut last_end: Option<chrono::NaiveDateTime> = None;
-
-        for row in &ops {
-            let dep = match row.departure_at.or(row.garage_out_at) {
-                Some(d) => d,
-                None => {
-                    let wd = row.operation_date.unwrap_or(row.reading_date);
-                    unko_work_date.insert(row.unko_no.clone(), wd);
-                    continue;
-                }
-            };
-            let ret = row.return_at.or(row.garage_in_at).unwrap_or(dep);
-
-            let new_day = if let (Some(shigyo), Some(prev_end)) = (current_shigyo, last_end) {
-                let gap_minutes = (dep - prev_end).num_minutes();
-                let since_shigyo_minutes = (dep - shigyo).num_minutes();
-                gap_minutes >= REST_THRESHOLD_MINUTES
-                    || since_shigyo_minutes >= MAX_WORK_DAY_MINUTES
-            } else {
-                true
-            };
-
-            if new_day {
-                current_shigyo = Some(dep);
-                current_work_date = Some(dep.date());
-            }
-
-            unko_work_date.insert(row.unko_no.clone(), current_work_date.unwrap());
-            last_end = Some(match last_end {
-                Some(prev) if ret > prev => ret,
-                Some(prev) => prev,
-                None => ret,
-            });
-        }
-    }
-
-    unko_work_date
-}
+// group_operations_into_work_days は daiun_salary::compare::group_operations_into_work_days を使用
 
 /// フェリーデータ（合計分 + 各エントリの開始時刻）
 struct FerryData {
@@ -518,7 +446,7 @@ async fn calculate_daily_hours(
     use std::collections::HashMap;
 
     // 0. 始業ベースのワークデイグルーピング（unko_no → work_date）
-    let unko_work_date = group_operations_into_work_days(rows);
+    let unko_work_date = daiun_salary::compare::group_operations_into_work_days(rows);
 
     // 1. Load or initialize event classifications
     let classifications = load_or_init_classifications(state, tenant_id, kudgivt_rows).await?;

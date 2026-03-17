@@ -1238,6 +1238,9 @@ pub fn process_zip(
                 };
                 if reset {
                     effective_start = Some(info.start);
+                    // resetされた場合、前のmergeで設定された24h境界を削除
+                    // （独立した始業として元のworkday境界を使用）
+                    workday_boundaries.remove(&(driver_cd.clone(), date, st));
                 } else {
                     effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
                 }
@@ -1378,6 +1381,23 @@ pub fn process_zip(
                         }
                         next_day_deduction =
                             Some((ol_drive, ol_cargo, ol_restraint, ol_late_night_dc));
+                        // 24h境界表示: merge時にworkday_boundariesを更新
+                        let eff_start = effective_start.unwrap();
+                        // 現在エントリ: start=effective_start, end=window_end(24h境界)
+                        workday_boundaries.insert(
+                            (driver_cd.clone(), date, st),
+                            (eff_start, window_end),
+                        );
+                        // 次エントリ: start=window_end(24h境界), end=実際のsegment終了
+                        // (chain最終日はendが実際の時刻で表示される)
+                        let next_seg_end = day_map
+                            .get(&(driver_cd.clone(), next_date, next_st))
+                            .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
+                            .unwrap_or(window_end + chrono::Duration::hours(24));
+                        workday_boundaries.insert(
+                            (driver_cd.clone(), next_date, next_st),
+                            (window_end, next_seg_end),
+                        );
                     } else if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                         agg.overlap_drive_minutes = ol_drive;
                         agg.overlap_cargo_minutes = ol_cargo;

@@ -610,18 +610,10 @@ async fn calculate_daily_hours(
                         .unwrap_or(dep.time())
                 };
 
-                // workday内に完全収まるセグメントはworkday.dateを使用（日跨ぎ対応）
-                let find_workday_date = |start: chrono::NaiveDateTime, end: chrono::NaiveDateTime| -> chrono::NaiveDate {
-                    workdays.iter()
-                        .find(|wd| start >= wd.start && end <= wd.end)
-                        .map(|wd| wd.date)
-                        .unwrap_or(start.date())
-                };
-
                 // セグメント情報を保存（イベント帰属判定用）
                 // (seg.start, seg.end, work_date, start_time)
                 let seg_entries: Vec<_> = segments.iter()
-                    .map(|seg| (seg.start, seg.end, find_workday_date(seg.start, seg.end), find_start_time(seg.start)))
+                    .map(|seg| (seg.start, seg.end, seg.start.date(), find_start_time(seg.start)))
                     .collect();
                 unko_segments.insert(row.unko_no.clone(), seg_entries);
 
@@ -636,16 +628,11 @@ async fn calculate_daily_hours(
                     };
                     let day_distance = total_distance * ratio;
 
-                    // work_date: workday内に完全収まる場合はworkday.date、
-                    //            跨る場合はparent segmentの開始日
-                    let work_date = workdays.iter()
-                        .find(|wd| ds.start >= wd.start && ds.end <= wd.end)
-                        .map(|wd| wd.date)
-                        .unwrap_or_else(|| {
-                            let parent_seg = segments.iter()
-                                .find(|seg| ds.start >= seg.start && ds.start < seg.end);
-                            parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date)
-                        });
+                    // work_date: セグメントの開始日
+                    // start_time: workday境界の始業時刻（休息基準で判定）
+                    let parent_seg = segments.iter()
+                        .find(|seg| ds.start >= seg.start && ds.start < seg.end);
+                    let work_date = parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date);
                     let start_time = find_start_time(ds.start);
                     let entry = day_map
                         .entry((row.driver_cd.clone(), work_date, start_time))

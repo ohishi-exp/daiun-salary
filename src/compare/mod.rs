@@ -915,6 +915,18 @@ pub fn post_process_day_map(
                     };
                     let rest_threshold = if is_long_distance { 480 } else { 540 };
                     let mut next_resets = next_gap >= rest_threshold;
+                    if driver_cd == "1029"
+                        && date.month() == 2
+                        && date.day() >= 20
+                        && date.day() <= 24
+                    {
+                        eprintln!(
+                            "OVERLAP 1029 {}月{}日→{}月{}日: gap={} ld={} thresh={} resets={} ol_drive={} unko={:?} next_unko={:?}",
+                            date.month(), date.day(), next_date.month(), next_date.day(),
+                            next_gap, is_long_distance, rest_threshold, next_resets, ol_drive,
+                            &info.unko_nos, &next_info.unko_nos
+                        );
+                    }
                     // 分割特例: 180分以上の休息を蓄積して判定
                     if !next_resets && next_gap >= 180 {
                         split_rests.push(next_gap as i32);

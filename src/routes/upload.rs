@@ -36,6 +36,7 @@ pub fn recalculate_router() -> Router<AppState> {
     Router::new()
         .route("/recalculate", post(internal_recalculate_all))
         .route("/recalculate-driver", post(recalculate_driver))
+        .route("/recalculate-drivers", post(recalculate_drivers_batch))
         .route("/split-csv/{upload_id}", post(split_csv_handler))
         .route("/split-csv-all", post(split_csv_all_handler))
         .route("/uploads", get(list_uploads))
@@ -2500,6 +2501,199 @@ async fn recalculate_driver(
                     .await;
             }
         }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|msg| Ok::<_, std::convert::Infallible>(msg));
+
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// 複数ドライバー一括再計算（SSEストリーム）
+#[derive(Deserialize)]
+struct BatchRecalcBody {
+    year: i32,
+    month: u32,
+    driver_ids: Vec<Uuid>,
+}
+
+async fn recalculate_drivers_batch(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Json(body): Json<BatchRecalcBody>,
+) -> Response<Body> {
+    let tenant_id = auth_user.tenant_id;
+    let year = body.year;
+    let month = body.month;
+    let driver_ids = body.driver_ids;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+
+    tokio::spawn(async move {
+        let send = |json: serde_json::Value| {
+            let tx = tx.clone();
+            async move {
+                let s = serde_json::to_string(&json).unwrap_or_default();
+                let _ = tx.send(format!("data: {s}\n\n")).await;
+            }
+        };
+
+        let total_drivers = driver_ids.len();
+        send(serde_json::json!({
+            "event": "batch_start",
+            "total_drivers": total_drivers
+        }))
+        .await;
+
+        let month_start = match chrono::NaiveDate::from_ymd_opt(year, month, 1) {
+            Some(d) => d,
+            None => {
+                send(serde_json::json!({"event":"error","message":"invalid year/month"})).await;
+                return;
+            }
+        };
+        let month_end = if month == 12 {
+            chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)
+        } else {
+            chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)
+        }
+        .unwrap()
+            - chrono::Duration::days(1);
+
+        // KUDGIVT一括ロード（全ドライバー共通）
+        send(serde_json::json!({"event":"progress","step":"download","current":0,"total":total_drivers})).await;
+        let all_kudgivt = match load_kudgivt_from_zips(&state, tenant_id, month_start, month_end)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                send(serde_json::json!({"event":"error","message":format!("KUDGIVT取得エラー: {e}")})).await;
+                return;
+            }
+        };
+
+        let fetch_end = month_end + chrono::Duration::days(1);
+
+        for (i, driver_id) in driver_ids.iter().enumerate() {
+            // driver_cd取得
+            let driver_cd: Option<String> = match sqlx::query_scalar(
+                "SELECT driver_cd FROM drivers WHERE id = $1 AND tenant_id = $2",
+            )
+            .bind(driver_id)
+            .bind(tenant_id)
+            .fetch_optional(&state.pool)
+            .await
+            {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let Some(driver_cd) = driver_cd else {
+                continue;
+            };
+
+            send(serde_json::json!({
+                "event": "driver_start",
+                "current": i + 1,
+                "total": total_drivers,
+                "driver_cd": &driver_cd
+            }))
+            .await;
+
+            // operations取得
+            #[derive(sqlx::FromRow)]
+            struct OpRow {
+                unko_no: String,
+                reading_date: chrono::NaiveDate,
+                operation_date: Option<chrono::NaiveDate>,
+                departure_at: Option<chrono::DateTime<chrono::Utc>>,
+                return_at: Option<chrono::DateTime<chrono::Utc>>,
+                total_distance: Option<f64>,
+                drive_time_general: Option<i32>,
+                drive_time_highway: Option<i32>,
+                drive_time_bypass: Option<i32>,
+            }
+
+            let op_rows = match sqlx::query_as::<_, OpRow>(
+                r#"SELECT DISTINCT o.unko_no, o.reading_date, o.operation_date,
+                          o.departure_at, o.return_at, o.total_distance,
+                          o.drive_time_general, o.drive_time_highway, o.drive_time_bypass
+                   FROM operations o
+                   WHERE o.tenant_id = $1 AND o.driver_id = $2
+                     AND (o.operation_date >= $3 AND o.operation_date <= $4
+                          OR o.reading_date >= $3 AND o.reading_date <= $4)
+                   ORDER BY o.reading_date, o.unko_no"#,
+            )
+            .bind(tenant_id)
+            .bind(driver_id)
+            .bind(month_start)
+            .bind(fetch_end)
+            .fetch_all(&state.pool)
+            .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    send(serde_json::json!({"event":"driver_error","driver_cd":&driver_cd,"message":format!("{e}")})).await;
+                    continue;
+                }
+            };
+
+            let ops: Vec<KudguriRow> = op_rows
+                .iter()
+                .map(|r| KudguriRow {
+                    unko_no: r.unko_no.clone(),
+                    reading_date: r.reading_date,
+                    operation_date: r.operation_date,
+                    office_cd: String::new(),
+                    office_name: String::new(),
+                    vehicle_cd: String::new(),
+                    vehicle_name: String::new(),
+                    driver_cd: driver_cd.clone(),
+                    driver_name: String::new(),
+                    crew_role: 0,
+                    departure_at: r.departure_at.map(|dt| dt.naive_utc()),
+                    return_at: r.return_at.map(|dt| dt.naive_utc()),
+                    garage_out_at: None,
+                    garage_in_at: None,
+                    meter_start: None,
+                    meter_end: None,
+                    total_distance: r.total_distance,
+                    drive_time_general: r.drive_time_general,
+                    drive_time_highway: r.drive_time_highway,
+                    drive_time_bypass: r.drive_time_bypass,
+                    safety_score: None,
+                    economy_score: None,
+                    total_score: None,
+                    raw_data: serde_json::Value::Null,
+                })
+                .collect();
+
+            let ferry_minutes = load_ferry_minutes(&state, tenant_id, &ops).await;
+
+            match calculate_daily_hours(&state, tenant_id, &ops, &all_kudgivt, &ferry_minutes, None)
+                .await
+            {
+                Ok(()) => {
+                    send(serde_json::json!({
+                        "event": "driver_done",
+                        "current": i + 1,
+                        "total": total_drivers,
+                        "driver_cd": &driver_cd
+                    }))
+                    .await;
+                }
+                Err(e) => {
+                    send(serde_json::json!({"event":"driver_error","driver_cd":&driver_cd,"message":format!("{e}")})).await;
+                }
+            }
+        }
+
+        send(serde_json::json!({"event":"batch_done","total":total_drivers})).await;
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)

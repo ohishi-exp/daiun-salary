@@ -9,13 +9,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::csv_parser;
-use crate::csv_parser::kudgivt::{parse_kudgivt, KudgivtRow};
-use crate::csv_parser::kudguri::{parse_kudguri, KudguriRow};
-use crate::csv_parser::work_segments::{self, EventClass};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
 use chrono::Timelike;
+use daiun_salary::csv_parser;
+use daiun_salary::csv_parser::kudgivt::{parse_kudgivt, KudgivtRow};
+use daiun_salary::csv_parser::kudguri::{parse_kudguri, KudguriRow};
+use daiun_salary::csv_parser::work_segments::{self, EventClass};
 use tokio_stream::StreamExt;
 
 pub fn router() -> Router<AppState> {
@@ -420,6 +420,8 @@ fn group_operations_into_work_days(
 struct FerryData {
     total_minutes: i32,
     start_times: Vec<chrono::NaiveDateTime>,
+    /// フェリー乗船期間(start, end)リスト
+    periods: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>,
 }
 
 /// R2のKUDGFRYからフェリー乗船時間(分)を取得
@@ -447,9 +449,10 @@ async fn load_ferry_minutes(
 
     for (unko_no, result) in results {
         if let Ok(bytes) = result {
-            let text = crate::csv_parser::decode_shift_jis(&bytes);
+            let text = daiun_salary::csv_parser::decode_shift_jis(&bytes);
             let mut total_ferry = 0i32;
             let mut start_times = Vec::new();
+            let mut periods = Vec::new();
             for line in text.lines().skip(1) {
                 let cols: Vec<&str> = line.split(',').collect();
                 if cols.len() > 11 {
@@ -478,6 +481,7 @@ async fn load_ferry_minutes(
                         if mins > 0 {
                             total_ferry += mins;
                             start_times.push(start);
+                            periods.push((start, end));
                             tracing::debug!("Ferry {}: {}min ({} → {})", unko_no, mins, start, end);
                         }
                     }
@@ -489,6 +493,7 @@ async fn load_ferry_minutes(
                     FerryData {
                         total_minutes: total_ferry,
                         start_times,
+                        periods,
                     },
                 );
             }
@@ -1133,7 +1138,7 @@ async fn calculate_daily_hours(
                             match cls {
                                 Some(EventClass::Drive) | Some(EventClass::Cargo) => {
                                     let night =
-                                        crate::csv_parser::work_segments::calc_late_night_mins(
+                                        daiun_salary::csv_parser::work_segments::calc_late_night_mins(
                                             *part_start,
                                             *part_end,
                                         );
@@ -1211,221 +1216,162 @@ async fn calculate_daily_hours(
         // フェリー控除はoverlap計算後（DB書き込み直前）に移動
     }
 
-    // 3.6. 24時間窓ベースの重複時間を計算（KUDGIVTイベント直接集計）
+    // 3.6. 共通post_process_day_mapを使用して構内結合・overlap計算・フェリー控除を実行
     {
-        use std::collections::BTreeMap;
+        use daiun_salary::compare::{DayAgg as CompareDayAgg, FerryInfo, SegRec};
 
-        fn trunc_min(dt: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
-            daiun_salary::compare::trunc_min(dt)
-        }
-
-        // ドライバーCD → 日付順の (始業, 終業, unko_nos)
-        struct DayInfo {
-            start: chrono::NaiveDateTime,
-            end: chrono::NaiveDateTime,
-            unko_nos: Vec<String>,
-        }
-
-        let mut driver_days: HashMap<
-            String,
-            BTreeMap<(chrono::NaiveDate, chrono::NaiveTime), DayInfo>,
+        // upload DayAgg → compare DayAgg に変換
+        let mut compare_day_map: HashMap<
+            (String, chrono::NaiveDate, chrono::NaiveTime),
+            CompareDayAgg,
         > = HashMap::new();
-        for ((driver_cd, date, st), agg) in &day_map {
-            if agg.segments.is_empty() {
-                continue;
-            }
-            let start = trunc_min(agg.segments.iter().map(|s| s.start_at).min().unwrap());
-            let end = trunc_min(agg.segments.iter().map(|s| s.end_at).max().unwrap());
-            driver_days.entry(driver_cd.clone()).or_default().insert(
-                (*date, *st),
-                DayInfo {
-                    start,
-                    end,
+        // upload側の追加情報を保存（compare DayAggにない項目）
+        struct UploadExtra {
+            segments: Vec<SegmentRecord>,
+        }
+        let mut upload_extras: HashMap<
+            (String, chrono::NaiveDate, chrono::NaiveTime),
+            UploadExtra,
+        > = HashMap::new();
+
+        for (key, agg) in &day_map {
+            compare_day_map.insert(
+                key.clone(),
+                CompareDayAgg {
+                    total_work_minutes: agg.total_work_minutes,
+                    late_night_minutes: agg.late_night_minutes,
+                    drive_minutes: agg.drive_minutes,
+                    cargo_minutes: agg.cargo_minutes,
                     unko_nos: agg.unko_nos.clone(),
+                    segments: agg
+                        .segments
+                        .iter()
+                        .map(|s| SegRec {
+                            start_at: s.start_at,
+                            end_at: s.end_at,
+                        })
+                        .collect(),
+                    overlap_drive_minutes: agg.overlap_drive_minutes,
+                    overlap_cargo_minutes: agg.overlap_cargo_minutes,
+                    overlap_break_minutes: agg.overlap_break_minutes,
+                    overlap_restraint_minutes: agg.overlap_restraint_minutes,
+                    ot_late_night_minutes: agg.ot_late_night_minutes,
+                    from_multi_op: false,
+                },
+            );
+            upload_extras.insert(
+                key.clone(),
+                UploadExtra {
+                    segments: agg.segments.clone(),
                 },
             );
         }
 
-        for (driver_cd, dates_map) in &driver_days {
-            let dates: Vec<(chrono::NaiveDate, chrono::NaiveTime)> =
-                dates_map.keys().copied().collect();
-            let mut effective_start: Option<chrono::NaiveDateTime> = None;
-            let mut prev_end: Option<chrono::NaiveDateTime> = None;
-            // 前日から繰り越す重複分の控除（リセットなし時にメイン統合するため）
-            let mut next_day_deduction: Option<(i32, i32, i32, i32)> = None; // (drive, cargo, restraint, late_night)
+        // workday_boundaries（upload.rsには既存のものがないので空で作成）
+        let mut workday_boundaries: HashMap<
+            (String, chrono::NaiveDate, chrono::NaiveTime),
+            (chrono::NaiveDateTime, chrono::NaiveDateTime),
+        > = HashMap::new();
 
-            for (idx, &(date, st)) in dates.iter().enumerate() {
-                let info = &dates_map[&(date, st)];
-
-                // effective_start の判定（8時間ルール）
-                let reset = match prev_end {
-                    Some(pe) => (info.start - pe).num_minutes() >= 480,
-                    None => true,
-                };
-                if reset {
-                    effective_start = Some(info.start);
-                    next_day_deduction = None;
-                } else {
-                    // リセットなし: 前日の24h窓終了時点から新しい24h窓を開始
-                    effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
-                }
-
-                // 前日からの控除を適用（リセットなし時、前日のoverlap分を当日メインから減算）
-                if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) =
-                    next_day_deduction.take()
-                {
-                    if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
-                        agg.drive_minutes = (agg.drive_minutes - ded_drive).max(0);
-                        agg.cargo_minutes = (agg.cargo_minutes - ded_cargo).max(0);
-                        agg.total_work_minutes = (agg.total_work_minutes - ded_restraint).max(0);
-                        agg.late_night_minutes = (agg.late_night_minutes - ded_night).max(0);
-                    }
-                }
-
-                let window_end = effective_start.unwrap() + chrono::Duration::hours(24);
-
-                // 翌稼働日のKUDGIVTイベントで window_end 以前のものを直接集計
-                if idx + 1 < dates.len() {
-                    let (next_date, next_st) = dates[idx + 1];
-                    let next_info = &dates_map[&(next_date, next_st)];
-
-                    // 翌日の全unko_noのイベントを取得
-                    let mut ol_drive = 0i32;
-                    let mut ol_cargo = 0i32;
-                    let mut ol_restraint = 0i32;
-                    let mut ol_late_night_dc = 0i32;
-                    let mut ol_work_events: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> =
-                        Vec::new();
-
-                    for unko_no in &next_info.unko_nos {
-                        if let Some(events) = kudgivt_by_unko.get(unko_no) {
-                            for evt in events {
-                                let cls = classifications.get(&evt.event_cd);
-                                let dur = evt.duration_minutes.unwrap_or(0);
-                                if dur <= 0 {
-                                    continue;
-                                }
-
-                                // イベント開始も分精度に揃える（Excel互換）
-                                let evt_start = trunc_min(evt.start_at);
-
-                                // イベントが窓内かチェック
-                                if evt_start >= window_end {
-                                    continue;
-                                }
-                                let evt_end = evt_start + chrono::Duration::minutes(dur as i64);
-
-                                // 当日の終業より前のイベントはスキップ（当日に属する）
-                                if evt_end <= info.end {
-                                    continue;
-                                }
-                                if evt_start < info.end {
-                                    continue;
-                                }
-
-                                // 窓内に収まる分だけカウント
-                                // イベント起点はセグメント開始(next_info.start)以降に制限
-                                let overlap_start = evt_start.max(next_info.start);
-                                let effective_end = evt_end.min(window_end);
-                                if effective_end <= overlap_start {
-                                    continue;
-                                }
-                                let mins = (effective_end - overlap_start).num_minutes() as i32;
-                                if mins <= 0 {
-                                    continue;
-                                }
-
-                                // イベント全体が窓内ならそのまま、部分的なら按分
-                                let actual_dur = if mins >= dur { dur } else { mins };
-
-                                match cls {
-                                    Some(EventClass::Drive) => {
-                                        ol_drive += actual_dur;
-                                        ol_late_night_dc +=
-                                            crate::csv_parser::work_segments::calc_late_night_mins(
-                                                overlap_start,
-                                                effective_end,
-                                            );
-                                        ol_work_events.push((overlap_start, effective_end));
-                                    }
-                                    Some(EventClass::Cargo) => {
-                                        ol_cargo += actual_dur;
-                                        ol_late_night_dc +=
-                                            crate::csv_parser::work_segments::calc_late_night_mins(
-                                                overlap_start,
-                                                effective_end,
-                                            );
-                                        ol_work_events.push((overlap_start, effective_end));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-
-                    // 重複拘束時間 = 翌日始業 ～ 窓内最終セグメント終了（分精度）
-                    // セグメント間の休息ギャップが窓内にある場合、最終セグメント終了で打ち切る
-                    if next_info.start < window_end {
-                        let restraint_end = day_map
-                            .get(&(driver_cd.clone(), next_date, next_st))
-                            .map(|next_agg| {
-                                next_agg
-                                    .segments
-                                    .iter()
-                                    .filter(|s| trunc_min(s.start_at) < window_end)
-                                    .map(|s| trunc_min(s.end_at).min(window_end))
-                                    .max()
-                                    .unwrap_or(window_end)
+        // FerryInfoをuploadのFerryDataから構築
+        let compare_ferry_info = {
+            let mut fi_minutes: HashMap<String, i32> = HashMap::new();
+            let mut fi_break_dur: HashMap<String, i32> = HashMap::new();
+            let mut fi_period_map: HashMap<
+                String,
+                Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>,
+            > = HashMap::new();
+            for (unko_no, fd) in ferry_minutes.iter() {
+                fi_minutes.insert(unko_no.clone(), fd.total_minutes);
+                fi_period_map.insert(unko_no.clone(), fd.periods.clone());
+                // 各フェリー開始時刻に対応する301イベントをマッチ
+                if let Some(events) = kudgivt_by_unko.get(unko_no.as_str()) {
+                    let mut break_total = 0i32;
+                    for ferry_start in &fd.start_times {
+                        let matched_301 = events
+                            .iter()
+                            .filter(|e| {
+                                classifications.get(&e.event_cd) == Some(&EventClass::Break)
                             })
-                            .unwrap_or(window_end);
-                        if restraint_end > next_info.start {
-                            ol_restraint = (restraint_end - next_info.start).num_minutes() as i32;
+                            .filter(|e| e.duration_minutes.unwrap_or(0) > 0)
+                            .min_by_key(|e| {
+                                (e.start_at - *ferry_start).num_seconds().unsigned_abs()
+                            });
+                        if let Some(evt) = matched_301 {
+                            break_total += evt.duration_minutes.unwrap_or(0);
                         }
                     }
-
-                    let ol_break = (ol_restraint - ol_drive - ol_cargo).max(0);
-
-                    // 翌日がリセットなし（8h未満の休息）→ 重複を当日メインに統合
-                    let next_gap = (next_info.start - info.end).num_minutes();
-                    let next_resets = next_gap >= 480;
-
-                    if !next_resets && ol_restraint > 0 {
-                        // 当日メインに統合（overlapは0にする）
-                        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
-                            agg.drive_minutes += ol_drive;
-                            agg.cargo_minutes += ol_cargo;
-                            agg.total_work_minutes += ol_restraint;
-                            agg.late_night_minutes += ol_late_night_dc;
-                        }
-                        // overlapのDrive/Cargoイベントでot_late_night再計算
-                        if !ol_work_events.is_empty() {
-                            let events_entry = day_work_events_global
-                                .entry((driver_cd.clone(), date, st))
-                                .or_default();
-                            events_entry.extend(ol_work_events);
-                            let mut sorted = events_entry.clone();
-                            sorted.sort_by_key(|&(s, _)| s);
-                            let ot_night =
-                                daiun_salary::compare::calc_ot_late_night_from_events(&sorted);
-                            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
-                                agg.ot_late_night_minutes = ot_night;
-                            }
-                        }
-                        // 翌日のメインから控除する分を記録（深夜も控除）
-                        next_day_deduction =
-                            Some((ol_drive, ol_cargo, ol_restraint, ol_late_night_dc));
-                    } else {
-                        // 通常: 重複として別表示
-                        if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
-                            agg.overlap_drive_minutes = ol_drive;
-                            agg.overlap_cargo_minutes = ol_cargo;
-                            agg.overlap_break_minutes = ol_break;
-                            agg.overlap_restraint_minutes = ol_restraint;
-                        }
+                    if break_total > 0 {
+                        fi_break_dur.insert(unko_no.clone(), break_total);
                     }
                 }
+            }
+            FerryInfo {
+                ferry_minutes: fi_minutes,
+                ferry_break_dur: fi_break_dur,
+                ferry_period_map: fi_period_map,
+            }
+        };
 
-                prev_end = Some(info.end);
+        // 共通post_process呼び出し
+        daiun_salary::compare::post_process_day_map(
+            &mut compare_day_map,
+            &mut workday_boundaries,
+            &mut day_work_events_global,
+            &kudgivt_by_unko,
+            &classifications,
+            rows,
+            &compare_ferry_info,
+        );
+
+        // compare_day_map の結果を day_map に反映
+        // まず、構内結合で消えたキーを day_map からも削除
+        let compare_keys: std::collections::HashSet<_> = compare_day_map.keys().cloned().collect();
+        let upload_keys: Vec<_> = day_map.keys().cloned().collect();
+        for key in &upload_keys {
+            if !compare_keys.contains(key) {
+                day_map.remove(key);
+            }
+        }
+
+        // compare結果をday_mapに書き戻す
+        for (key, c_agg) in &compare_day_map {
+            if let Some(u_agg) = day_map.get_mut(key) {
+                // compare側で更新される項目を反映
+                u_agg.drive_minutes = c_agg.drive_minutes;
+                u_agg.cargo_minutes = c_agg.cargo_minutes;
+                u_agg.total_work_minutes = c_agg.total_work_minutes;
+                u_agg.late_night_minutes = c_agg.late_night_minutes;
+                u_agg.ot_late_night_minutes = c_agg.ot_late_night_minutes;
+                u_agg.overlap_drive_minutes = c_agg.overlap_drive_minutes;
+                u_agg.overlap_cargo_minutes = c_agg.overlap_cargo_minutes;
+                u_agg.overlap_break_minutes = c_agg.overlap_break_minutes;
+                u_agg.overlap_restraint_minutes = c_agg.overlap_restraint_minutes;
+                // 構内結合でunko_nosが変わる場合がある
+                u_agg.unko_nos = c_agg.unko_nos.clone();
+                // セグメントも構内結合で変わる場合 → compare側のsegments順序を反映
+                // ただしuploadのSegmentRecordにはunko_no等の追加情報があるので、
+                // compare側のsegment数が変わった場合のみ再構築
+                if c_agg.segments.len() != u_agg.segments.len() {
+                    // 構内結合された場合: upload_extrasから全unko_noのセグメントを収集
+                    let mut merged_segments: Vec<SegmentRecord> = Vec::new();
+                    for u in &c_agg.unko_nos {
+                        for (_ekey, extra) in &upload_extras {
+                            for seg in &extra.segments {
+                                if seg.unko_no == *u
+                                    && !merged_segments.iter().any(|ms| {
+                                        ms.unko_no == seg.unko_no && ms.start_at == seg.start_at
+                                    })
+                                {
+                                    merged_segments.push(seg.clone());
+                                }
+                            }
+                        }
+                    }
+                    if !merged_segments.is_empty() {
+                        u_agg.segments = merged_segments;
+                    }
+                }
             }
         }
     }
@@ -1468,39 +1414,6 @@ async fn calculate_daily_hours(
             .bind(&all_unko_nos)
             .execute(&state.pool)
             .await?;
-        }
-    }
-
-    // フェリー控除（overlap計算後、DB書き込み直前）
-    // KUDGFRY開始時刻ごとに最も近い301イベントをマッチし、丸め差をdrive_minutesで吸収
-    for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
-        let mut ferry_deduction = 0i32;
-        let mut ferry_break_deduction = 0i32;
-        for unko in &agg.unko_nos {
-            if let Some(fd) = ferry_minutes.get(unko) {
-                ferry_deduction += fd.total_minutes;
-                // 各フェリー開始時刻に最も近い301イベントを個別マッチ
-                if let Some(events) = kudgivt_by_unko.get(unko) {
-                    for ferry_start in &fd.start_times {
-                        let matched_301 = events
-                            .iter()
-                            .filter(|e| {
-                                classifications.get(&e.event_cd) == Some(&EventClass::Break)
-                            })
-                            .filter(|e| e.duration_minutes.unwrap_or(0) > 0)
-                            .min_by_key(|e| (e.start_at - *ferry_start).num_seconds().abs());
-                        if let Some(evt) = matched_301 {
-                            ferry_break_deduction += evt.duration_minutes.unwrap_or(0);
-                        }
-                    }
-                }
-            }
-        }
-        if ferry_deduction > 0 {
-            agg.total_work_minutes = (agg.total_work_minutes - ferry_deduction).max(0);
-            // drive = drive_from_201 - (ferry_KUDGFRY合計 - ferry_301合計)
-            agg.drive_minutes =
-                (agg.drive_minutes - ferry_deduction + ferry_break_deduction).max(0);
         }
     }
 

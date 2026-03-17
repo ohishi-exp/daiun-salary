@@ -1031,7 +1031,10 @@ async fn calculate_daily_hours(
     }
 
     // ot_late_night計算用: ドライバー×日のDrive/Cargoイベント時刻リスト
-    let mut day_work_events_global: HashMap<(String, chrono::NaiveDate, chrono::NaiveTime), Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>> = HashMap::new();
+    let mut day_work_events_global: HashMap<
+        (String, chrono::NaiveDate, chrono::NaiveTime),
+        Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>,
+    > = HashMap::new();
 
     // 3.55. drive/cargo をKUDGIVTイベントから日別に直接集計（カレンダー日付ベース）
     //       total_work_minutes はセグメントから秒単位で四捨五入
@@ -1191,7 +1194,9 @@ async fn calculate_daily_hours(
             // ot_late_night（実働ベース: 累計Drive/Cargo 480分到達後の深夜時間）
             for ((date, st), _night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    let ot_night = if let Some(events) = day_work_events_global.get(&(driver_cd.clone(), *date, *st)) {
+                    let ot_night = if let Some(events) =
+                        day_work_events_global.get(&(driver_cd.clone(), *date, *st))
+                    {
                         let mut sorted = events.clone();
                         sorted.sort_by_key(|&(s, _)| s);
                         daiun_salary::compare::calc_ot_late_night_from_events(&sorted)
@@ -1289,7 +1294,8 @@ async fn calculate_daily_hours(
                     let mut ol_cargo = 0i32;
                     let mut ol_restraint = 0i32;
                     let mut ol_late_night_dc = 0i32;
-                    let mut ol_work_events: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> = Vec::new();
+                    let mut ol_work_events: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> =
+                        Vec::new();
 
                     for unko_no in &next_info.unko_nos {
                         if let Some(events) = kudgivt_by_unko.get(unko_no) {
@@ -1335,12 +1341,20 @@ async fn calculate_daily_hours(
                                 match cls {
                                     Some(EventClass::Drive) => {
                                         ol_drive += actual_dur;
-                                        ol_late_night_dc += crate::csv_parser::work_segments::calc_late_night_mins(overlap_start, effective_end);
+                                        ol_late_night_dc +=
+                                            crate::csv_parser::work_segments::calc_late_night_mins(
+                                                overlap_start,
+                                                effective_end,
+                                            );
                                         ol_work_events.push((overlap_start, effective_end));
                                     }
                                     Some(EventClass::Cargo) => {
                                         ol_cargo += actual_dur;
-                                        ol_late_night_dc += crate::csv_parser::work_segments::calc_late_night_mins(overlap_start, effective_end);
+                                        ol_late_night_dc +=
+                                            crate::csv_parser::work_segments::calc_late_night_mins(
+                                                overlap_start,
+                                                effective_end,
+                                            );
                                         ol_work_events.push((overlap_start, effective_end));
                                     }
                                     _ => {}
@@ -1391,7 +1405,8 @@ async fn calculate_daily_hours(
                             events_entry.extend(ol_work_events);
                             let mut sorted = events_entry.clone();
                             sorted.sort_by_key(|&(s, _)| s);
-                            let ot_night = daiun_salary::compare::calc_ot_late_night_from_events(&sorted);
+                            let ot_night =
+                                daiun_salary::compare::calc_ot_late_night_from_events(&sorted);
                             if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                                 agg.ot_late_night_minutes = ot_night;
                             }

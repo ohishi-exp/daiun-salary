@@ -724,8 +724,7 @@ pub fn process_zip(
                             });
                             if sig_split {
                                 segs = split_work_segments_at_boundary(segs, wd.end);
-                                multi_op_boundaries
-                                    .insert(row.unko_no.clone(), wd.end);
+                                multi_op_boundaries.insert(row.unko_no.clone(), wd.end);
                             }
                         }
                     }
@@ -796,7 +795,7 @@ pub fn process_zip(
                             overlap_break_minutes: 0,
                             overlap_restraint_minutes: 0,
                             ot_late_night_minutes: 0,
-                    from_multi_op: false,
+                            from_multi_op: false,
                         });
                     entry.total_work_minutes += ds.work_minutes;
                     entry.late_night_minutes += ds.late_night_minutes;
@@ -847,8 +846,7 @@ pub fn process_zip(
 
             for row in &valid_ops {
                 // 最初の24h境界をlegacy互換で保存
-                multi_op_boundaries
-                    .insert(row.unko_no.clone(), boundaries_24h[0]);
+                multi_op_boundaries.insert(row.unko_no.clone(), boundaries_24h[0]);
             }
 
             let driver_cd = &valid_ops[0].driver_cd;
@@ -941,7 +939,10 @@ pub fn process_zip(
     }
 
     // ot_late_night計算用: ドライバー×日のDrive/Cargoイベント時刻リスト
-    let mut day_work_events: HashMap<(String, NaiveDate, NaiveTime), Vec<(NaiveDateTime, NaiveDateTime)>> = HashMap::new();
+    let mut day_work_events: HashMap<
+        (String, NaiveDate, NaiveTime),
+        Vec<(NaiveDateTime, NaiveDateTime)>,
+    > = HashMap::new();
 
     // ---- イベント直接集計（秒単位→分変換） ----
     {
@@ -1082,7 +1083,9 @@ pub fn process_zip(
             // ot_late_night（実働ベース: 累計Drive/Cargo 480分到達後の深夜時間）
             for ((date, st), _night) in &day_late_night {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    let ot_night = if let Some(events) = day_work_events.get(&(driver_cd.clone(), *date, *st)) {
+                    let ot_night = if let Some(events) =
+                        day_work_events.get(&(driver_cd.clone(), *date, *st))
+                    {
                         let mut sorted = events.clone();
                         sorted.sort_by_key(|&(s, _)| s);
                         calc_ot_late_night_from_events(&sorted)
@@ -1100,8 +1103,10 @@ pub fn process_zip(
     // overlap計算の前に実行することで、マージ済みエントリの24h窓で正しく重複計算できる
     {
         let keys: Vec<_> = day_map.keys().cloned().collect();
-        let mut driver_date_keys: HashMap<(String, NaiveDate), Vec<(String, NaiveDate, NaiveTime)>> =
-            HashMap::new();
+        let mut driver_date_keys: HashMap<
+            (String, NaiveDate),
+            Vec<(String, NaiveDate, NaiveTime)>,
+        > = HashMap::new();
         for (dc, d, st) in &keys {
             driver_date_keys
                 .entry((dc.clone(), *d))
@@ -1168,7 +1173,9 @@ pub fn process_zip(
                             }
                         }
                         // day_work_eventsも結合
-                        if let Some(b_events) = day_work_events.remove(&(key_b.0.clone(), key_b.1, key_b.2)) {
+                        if let Some(b_events) =
+                            day_work_events.remove(&(key_b.0.clone(), key_b.1, key_b.2))
+                        {
                             day_work_events
                                 .entry((key_a.0.clone(), key_a.1, key_a.2))
                                 .or_default()
@@ -1299,12 +1306,14 @@ pub fn process_zip(
                                 match cls {
                                     Some(EventClass::Drive) => {
                                         ol_drive += actual_dur;
-                                        ol_late_night_dc += calc_late_night_mins(overlap_start, effective_end);
+                                        ol_late_night_dc +=
+                                            calc_late_night_mins(overlap_start, effective_end);
                                         ol_work_events.push((overlap_start, effective_end));
                                     }
                                     Some(EventClass::Cargo) => {
                                         ol_cargo += actual_dur;
-                                        ol_late_night_dc += calc_late_night_mins(overlap_start, effective_end);
+                                        ol_late_night_dc +=
+                                            calc_late_night_mins(overlap_start, effective_end);
                                         ol_work_events.push((overlap_start, effective_end));
                                     }
                                     _ => {}
@@ -1394,10 +1403,8 @@ pub fn process_zip(
                         // 24h境界表示: merge時にworkday_boundariesを更新
                         let eff_start = effective_start.unwrap();
                         // 現在エントリ: start=effective_start, end=window_end(24h境界)
-                        workday_boundaries.insert(
-                            (driver_cd.clone(), date, st),
-                            (eff_start, window_end),
-                        );
+                        workday_boundaries
+                            .insert((driver_cd.clone(), date, st), (eff_start, window_end));
                         // 次エントリ: start=window_end(24h境界), end=実際のsegment終了
                         // (chain最終日はendが実際の時刻で表示される)
                         let next_seg_end = day_map
@@ -1471,10 +1478,14 @@ pub fn process_zip(
             if let (Some(s), Some(e)) = (
                 NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S")
                     .ok()
-                    .or_else(|| NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+                    .or_else(|| {
+                        NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok()
+                    }),
                 NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S")
                     .ok()
-                    .or_else(|| NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+                    .or_else(|| {
+                        NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()
+                    }),
             ) {
                 ferry_period_map.entry(unko_no).or_default().push((s, e));
             }
@@ -1501,7 +1512,9 @@ pub fn process_zip(
                                 _ => continue,
                             }
                             let dur = evt.duration_minutes.unwrap_or(0);
-                            if dur <= 0 { continue; }
+                            if dur <= 0 {
+                                continue;
+                            }
                             // フェリー重複判定は秒精度（trunc_minしない）
                             let es = evt.start_at;
                             let ee = es + chrono::Duration::minutes(dur as i64);

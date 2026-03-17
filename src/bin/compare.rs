@@ -16,7 +16,7 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use daiun_salary::csv_parser;
 use daiun_salary::csv_parser::kudgivt::KudgivtRow;
 use daiun_salary::csv_parser::kudguri::KudguriRow;
-use daiun_salary::csv_parser::work_segments::{self, EventClass, calc_late_night_mins};
+use daiun_salary::csv_parser::work_segments::{self, EventClass, Workday, calc_late_night_mins};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -309,6 +309,37 @@ fn parse_ferry_minutes(zip_files: &[(String, Vec<u8>)]) -> HashMap<String, i32> 
     ferry_map
 }
 
+/// WorkSegmentを任意のNaiveDateTime境界で分割する
+fn split_work_segments_at_boundary(
+    segments: Vec<work_segments::WorkSegment>,
+    boundary: NaiveDateTime,
+) -> Vec<work_segments::WorkSegment> {
+    let mut result = Vec::new();
+    for seg in segments {
+        if seg.start < boundary && seg.end > boundary {
+            let total_mins = (seg.end - seg.start).num_minutes().max(1) as f64;
+            let before_mins = (boundary - seg.start).num_minutes() as f64;
+            let ratio = before_mins / total_mins;
+            let d1 = (seg.drive_minutes as f64 * ratio).round() as i32;
+            let c1 = (seg.cargo_minutes as f64 * ratio).round() as i32;
+            let l1 = (seg.labor_minutes as f64 * ratio).round() as i32;
+            result.push(work_segments::WorkSegment {
+                start: seg.start, end: boundary,
+                labor_minutes: l1, drive_minutes: d1, cargo_minutes: c1,
+            });
+            result.push(work_segments::WorkSegment {
+                start: boundary, end: seg.end,
+                labor_minutes: seg.labor_minutes - l1,
+                drive_minutes: seg.drive_minutes - d1,
+                cargo_minutes: seg.cargo_minutes - c1,
+            });
+        } else {
+            result.push(seg);
+        }
+    }
+    result
+}
+
 /// 秒を切り捨てて分精度に揃える
 fn trunc_min(dt: NaiveDateTime) -> NaiveDateTime {
     dt.with_second(0).unwrap_or(dt)
@@ -339,7 +370,7 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
 
     let ferry_minutes = parse_ferry_minutes(&zip_files);
     let classifications = default_classifications();
-    let _unko_work_date = group_operations_into_work_days(&kudguri_rows);
+    let unko_work_date = group_operations_into_work_days(&kudguri_rows);
 
     // Group KUDGIVT by unko_no
     let mut kudgivt_by_unko: HashMap<String, Vec<&KudgivtRow>> = HashMap::new();
@@ -377,9 +408,64 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
     // unko_no → セグメント情報 (seg.start, seg.end, work_date, start_time)
     let mut unko_segments: HashMap<String, Vec<(NaiveDateTime, NaiveDateTime, NaiveDate, NaiveTime)>> = HashMap::new();
 
+    // 複数運行結合の24h境界: unko_no → boundary_24h（Phase 2でイベント分割に使用）
+    let mut multi_op_boundaries: HashMap<String, NaiveDateTime> = HashMap::new();
+
+    // 運行をworkdayグループにまとめる（同一driver_cd + work_dateの運行を結合）
+    let mut workday_groups: BTreeMap<(String, NaiveDate), Vec<&KudguriRow>> = BTreeMap::new();
     for row in &kudguri_rows {
-        match (row.departure_at, row.return_at) {
-            (Some(dep), Some(ret)) if ret > dep => {
+        let wd = unko_work_date.get(&row.unko_no).copied()
+            .unwrap_or(row.operation_date.unwrap_or(row.reading_date));
+        workday_groups.entry((row.driver_cd.clone(), wd)).or_default().push(row);
+    }
+
+    for ((_group_driver_cd, _group_work_date), ops) in &workday_groups {
+        // 有効な出発・帰庫を持つ運行を抽出
+        let valid_ops: Vec<&&KudguriRow> = ops.iter()
+            .filter(|r| matches!((r.departure_at, r.return_at), (Some(d), Some(r)) if r > d))
+            .collect();
+
+        // 出発・帰庫がない運行はフォールバック処理
+        for row in ops {
+            if matches!((row.departure_at, row.return_at), (Some(d), Some(r)) if r > d) {
+                continue; // valid_opsで処理
+            }
+            let work_date = row.operation_date.unwrap_or(row.reading_date);
+            let total_drive_mins = row.drive_time_general.unwrap_or(0)
+                + row.drive_time_highway.unwrap_or(0)
+                + row.drive_time_bypass.unwrap_or(0);
+            let default_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+            let entry = day_map
+                .entry((row.driver_cd.clone(), work_date, default_time))
+                .or_insert(DayAgg {
+                    total_work_minutes: 0, late_night_minutes: 0,
+                    drive_minutes: 0, cargo_minutes: 0,
+                    unko_nos: Vec::new(), segments: Vec::new(),
+                    overlap_drive_minutes: 0, overlap_cargo_minutes: 0,
+                    overlap_break_minutes: 0, overlap_restraint_minutes: 0,
+                    ot_late_night_minutes: 0,
+                });
+            entry.total_work_minutes += total_drive_mins;
+            entry.unko_nos.push(row.unko_no.clone());
+        }
+
+        if valid_ops.is_empty() { continue; }
+
+        // 複数運行が異なる出発日にまたがる場合のみ結合（同一日の複数運行は別行として維持）
+        let spans_different_days = if valid_ops.len() > 1 {
+            let dates: std::collections::HashSet<NaiveDate> = valid_ops.iter()
+                .filter_map(|r| r.departure_at.map(|d| d.date()))
+                .collect();
+            dates.len() > 1
+        } else {
+            false
+        };
+
+        if !spans_different_days {
+            // ---- 単独運行 or 同一日の複数運行: 各運行を個別に処理 ----
+            for row in &valid_ops {
+                let dep = row.departure_at.unwrap();
+                let ret = row.return_at.unwrap();
                 let events = kudgivt_by_unko.get(&row.unko_no);
                 let event_slice: Vec<&KudgivtRow> = events
                     .map(|e| e.iter().copied().collect())
@@ -389,14 +475,12 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                 let segments = work_segments::split_segments_at_24h(segments);
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 
-                // workday境界を決定
                 let rest_events_for_unko: Vec<(NaiveDateTime, i32)> = event_slice.iter()
                     .filter(|e| classifications.get(&e.event_cd) == Some(&EventClass::RestSplit))
                     .filter_map(|e| e.duration_minutes.filter(|&d| d > 0).map(|d| (e.start_at, d)))
                     .collect();
                 let workdays = work_segments::determine_workdays(&rest_events_for_unko, dep, ret);
 
-                // workday境界を収集
                 for wd in &workdays {
                     workday_boundaries.insert(
                         (row.driver_cd.clone(), wd.date, wd.start.time()),
@@ -411,10 +495,7 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                         .map(|wd| wd.start.time())
                         .unwrap_or(dep.time())
                 };
-
-                // セグメント情報保存（workday日付を使用）
                 let find_workday_date = |start: NaiveDateTime, end: NaiveDateTime| -> NaiveDate {
-                    // セグメントが完全にworkday内に収まる場合、そのworkdayの日付を使用
                     workdays.iter()
                         .find(|wd| start >= wd.start && end <= wd.end)
                         .map(|wd| wd.date)
@@ -426,12 +507,10 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                 unko_segments.insert(row.unko_no.clone(), seg_entries);
 
                 for ds in &daily_segments {
-                    // workday内に完全に収まるか確認
                     let work_date = workdays.iter()
                         .find(|wd| ds.start >= wd.start && ds.end <= wd.end)
                         .map(|wd| wd.date)
                         .unwrap_or_else(|| {
-                            // 複数workdayに跨る場合はparent segmentの日付
                             let parent_seg = segments.iter()
                                 .find(|seg| ds.start >= seg.start && ds.start < seg.end);
                             parent_seg.map(|seg| seg.start.date()).unwrap_or(ds.date)
@@ -440,19 +519,13 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                     let entry = day_map
                         .entry((row.driver_cd.clone(), work_date, start_time))
                         .or_insert(DayAgg {
-                            total_work_minutes: 0,
-                            late_night_minutes: 0,
-                            drive_minutes: 0,
-                            cargo_minutes: 0,
-                            unko_nos: Vec::new(),
-                            segments: Vec::new(),
-                            overlap_drive_minutes: 0,
-                            overlap_cargo_minutes: 0,
-                            overlap_break_minutes: 0,
-                            overlap_restraint_minutes: 0,
+                            total_work_minutes: 0, late_night_minutes: 0,
+                            drive_minutes: 0, cargo_minutes: 0,
+                            unko_nos: Vec::new(), segments: Vec::new(),
+                            overlap_drive_minutes: 0, overlap_cargo_minutes: 0,
+                            overlap_break_minutes: 0, overlap_restraint_minutes: 0,
                             ot_late_night_minutes: 0,
                         });
-
                     entry.total_work_minutes += ds.work_minutes;
                     entry.late_night_minutes += ds.late_night_minutes;
                     entry.drive_minutes += ds.drive_minutes;
@@ -460,37 +533,107 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                     if !entry.unko_nos.contains(&row.unko_no) {
                         entry.unko_nos.push(row.unko_no.clone());
                     }
-                    entry.segments.push(SegRec {
-                        start_at: ds.start,
-                        end_at: ds.end,
-                    });
+                    entry.segments.push(SegRec { start_at: ds.start, end_at: ds.end });
                 }
             }
-            _ => {
-                let work_date = row.operation_date.unwrap_or(row.reading_date);
-                let total_drive_mins = row.drive_time_general.unwrap_or(0)
-                    + row.drive_time_highway.unwrap_or(0)
-                    + row.drive_time_bypass.unwrap_or(0);
+        } else {
+            // ---- 複数運行の結合処理（運行間workday結合） ----
+            // 最早出発・最遅帰庫を決定
+            let merged_dep = valid_ops.iter()
+                .filter_map(|r| r.departure_at).min().unwrap();
+            let merged_ret = valid_ops.iter()
+                .filter_map(|r| r.return_at).max().unwrap();
 
-                let default_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
-                let entry = day_map
-                    .entry((row.driver_cd.clone(), work_date, default_time))
-                    .or_insert(DayAgg {
-                        total_work_minutes: 0,
-                        late_night_minutes: 0,
-                        drive_minutes: 0,
-                        cargo_minutes: 0,
-                        unko_nos: Vec::new(),
-                        segments: Vec::new(),
-                        overlap_drive_minutes: 0,
-                        overlap_cargo_minutes: 0,
-                        overlap_break_minutes: 0,
-                        overlap_restraint_minutes: 0,
-                        ot_late_night_minutes: 0,
-                    });
+            // 24h境界で仮想workdayを作成（分精度に揃える: web地球号互換）
+            let merged_dep_trunc = trunc_min(merged_dep);
+            let boundary_24h = merged_dep_trunc + chrono::Duration::hours(24);
+            let mut virtual_workdays: Vec<Workday> = vec![
+                Workday {
+                    date: merged_dep.date(),
+                    start: merged_dep,
+                    end: boundary_24h.min(merged_ret),
+                },
+            ];
+            if merged_ret > boundary_24h {
+                virtual_workdays.push(Workday {
+                    date: boundary_24h.date(),
+                    start: boundary_24h,
+                    end: merged_ret,
+                });
+            }
 
-                entry.total_work_minutes += total_drive_mins;
-                entry.unko_nos.push(row.unko_no.clone());
+            // 全運行に24h境界を登録（Phase 2のイベント分割用）
+            for row in &valid_ops {
+                multi_op_boundaries.insert(row.unko_no.clone(), boundary_24h);
+            }
+
+            // workday境界を登録
+            let driver_cd = &valid_ops[0].driver_cd;
+            for wd in &virtual_workdays {
+                workday_boundaries.insert(
+                    (driver_cd.clone(), wd.date, wd.start.time()),
+                    (wd.start, wd.end),
+                );
+            }
+
+            let find_vwd_start_time = |ts: NaiveDateTime| -> NaiveTime {
+                virtual_workdays.iter()
+                    .find(|wd| ts >= wd.start && ts < wd.end)
+                    .or_else(|| virtual_workdays.iter().rev().find(|wd| ts >= wd.start))
+                    .map(|wd| wd.start.time())
+                    .unwrap_or(merged_dep.time())
+            };
+            let find_vwd_date = |ts: NaiveDateTime| -> NaiveDate {
+                virtual_workdays.iter()
+                    .find(|wd| ts >= wd.start && ts < wd.end)
+                    .or_else(|| virtual_workdays.iter().rev().find(|wd| ts >= wd.start))
+                    .map(|wd| wd.date)
+                    .unwrap_or(merged_dep.date())
+            };
+
+            // 各運行のセグメントを個別に処理し、仮想workdayに帰属させる
+            for row in &valid_ops {
+                let dep = row.departure_at.unwrap();
+                let ret = row.return_at.unwrap();
+                let events = kudgivt_by_unko.get(&row.unko_no);
+                let event_slice: Vec<&KudgivtRow> = events
+                    .map(|e| e.iter().copied().collect())
+                    .unwrap_or_default();
+
+                let segments = work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
+                let segments = work_segments::split_segments_at_24h(segments);
+                // 24h境界でさらに分割（仮想workday境界に合わせる）
+                let segments = split_work_segments_at_boundary(segments, boundary_24h);
+                let daily_segments = work_segments::split_segments_by_day(&segments);
+
+                // セグメント情報保存（仮想workday基準）
+                let seg_entries: Vec<_> = segments.iter()
+                    .map(|seg| (seg.start, seg.end, find_vwd_date(seg.start), find_vwd_start_time(seg.start)))
+                    .collect();
+                unko_segments.insert(row.unko_no.clone(), seg_entries);
+
+                for ds in &daily_segments {
+                    let work_date = find_vwd_date(ds.start);
+                    let start_time = find_vwd_start_time(ds.start);
+                    let entry = day_map
+                        .entry((driver_cd.clone(), work_date, start_time))
+                        .or_insert(DayAgg {
+                            total_work_minutes: 0, late_night_minutes: 0,
+                            drive_minutes: 0, cargo_minutes: 0,
+                            unko_nos: Vec::new(), segments: Vec::new(),
+                            overlap_drive_minutes: 0, overlap_cargo_minutes: 0,
+                            overlap_break_minutes: 0, overlap_restraint_minutes: 0,
+                            ot_late_night_minutes: 0,
+                        });
+                    entry.total_work_minutes += ds.work_minutes;
+                    entry.late_night_minutes += ds.late_night_minutes;
+                    entry.drive_minutes += ds.drive_minutes;
+                    entry.cargo_minutes += ds.cargo_minutes;
+                    if !entry.unko_nos.contains(&row.unko_no) {
+                        entry.unko_nos.push(row.unko_no.clone());
+                    }
+                    entry.segments.push(SegRec { start_at: ds.start, end_at: ds.end });
+                }
             }
         }
     }
@@ -515,43 +658,64 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
 
             for unko_no in unko_nos {
                 if let Some(events) = kudgivt_by_unko.get(unko_no) {
+                    let boundary_opt = multi_op_boundaries.get(unko_no);
+
                     for evt in events {
                         let dur = evt.duration_minutes.unwrap_or(0);
                         if dur <= 0 { continue; }
-                        let dur_secs = dur as i64 * 60;
 
-                        let (event_date, event_start_time) = unko_segments.get(unko_no)
-                            .and_then(|segs| {
-                                segs.iter()
-                                    .find(|(start, end, _, _)| evt.start_at >= *start && evt.start_at < *end)
-                                    .or_else(|| segs.iter().find(|(start, _, _, _)| evt.start_at < *start))
-                                    .or_else(|| segs.last())
-                                    .map(|(_, _, wd, st)| (*wd, *st))
-                            })
-                            .unwrap_or((evt.start_at.date(), NaiveTime::from_hms_opt(0, 0, 0).unwrap()));
+                        // 分精度に揃えてから計算（web地球号互換）
+                        let evt_start_trunc = trunc_min(evt.start_at);
+                        let evt_end = evt_start_trunc + chrono::Duration::minutes(dur as i64);
 
-                        let cls = classifications.get(&evt.event_cd);
-                        match cls {
-                            Some(EventClass::Drive) => {
-                                *day_drive_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
+                        // イベントが24h境界をまたぐ場合、前半/後半に分割
+                        let mut parts: Vec<(NaiveDateTime, NaiveDateTime, i64)> = Vec::new();
+                        if let Some(&boundary) = boundary_opt {
+                            if evt_start_trunc < boundary && evt_end > boundary {
+                                let before_secs = (boundary - evt_start_trunc).num_seconds();
+                                let after_secs = (evt_end - boundary).num_seconds();
+                                parts.push((evt_start_trunc, boundary, before_secs));
+                                parts.push((boundary, evt_end, after_secs));
+                            } else {
+                                parts.push((evt_start_trunc, evt_end, dur as i64 * 60));
                             }
-                            Some(EventClass::Cargo) => {
-                                *day_cargo_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
-                            }
-                            Some(EventClass::Break) => {
-                                *day_break_secs.entry((event_date, event_start_time)).or_insert(0) += dur_secs;
-                            }
-                            _ => {}
+                        } else {
+                            parts.push((evt_start_trunc, evt_end, dur as i64 * 60));
                         }
-                        match cls {
-                            Some(EventClass::Drive) | Some(EventClass::Cargo) => {
-                                let evt_end = evt.start_at + chrono::Duration::minutes(dur as i64);
-                                let night = calc_late_night_mins(evt.start_at, evt_end);
-                                if night > 0 {
-                                    *day_late_night.entry((event_date, event_start_time)).or_insert(0) += night;
+
+                        for (part_start, part_end, part_secs) in &parts {
+                            let (event_date, event_start_time) = unko_segments.get(unko_no)
+                                .and_then(|segs| {
+                                    segs.iter()
+                                        .find(|(start, end, _, _)| *part_start >= *start && *part_start < *end)
+                                        .or_else(|| segs.iter().find(|(start, _, _, _)| *part_start < *start))
+                                        .or_else(|| segs.last())
+                                        .map(|(_, _, wd, st)| (*wd, *st))
+                                })
+                                .unwrap_or((part_start.date(), NaiveTime::from_hms_opt(0, 0, 0).unwrap()));
+
+                            let cls = classifications.get(&evt.event_cd);
+                            match cls {
+                                Some(EventClass::Drive) => {
+                                    *day_drive_secs.entry((event_date, event_start_time)).or_insert(0) += part_secs;
                                 }
+                                Some(EventClass::Cargo) => {
+                                    *day_cargo_secs.entry((event_date, event_start_time)).or_insert(0) += part_secs;
+                                }
+                                Some(EventClass::Break) => {
+                                    *day_break_secs.entry((event_date, event_start_time)).or_insert(0) += part_secs;
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                            match cls {
+                                Some(EventClass::Drive) | Some(EventClass::Cargo) => {
+                                    let night = calc_late_night_mins(*part_start, *part_end);
+                                    if night > 0 {
+                                        *day_late_night.entry((event_date, event_start_time)).or_insert(0) += night;
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -890,11 +1054,14 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                         _ => String::new(),
                     };
 
+                    // 深夜時間 = 法定内深夜（total deep-night - 時間外深夜）
+                    let standard_late_night = (agg.late_night_minutes - ot_ln).max(0);
+
                     total_drive += day_drive;
                     total_restraint += day_restraint;
                     total_actual_work += actual_work;
                     total_overtime += overtime;
-                    total_late_night += agg.late_night_minutes;
+                    total_late_night += standard_late_night;
 
                     days.push(CsvDayRow {
                         date: format!("{}月{}日", current_date.month(), current_date.day()),
@@ -914,7 +1081,7 @@ fn process_zip(zip_bytes: &[u8], target_year: i32, target_month: u32) -> Result<
                         rest: String::new(),
                         actual_work: fmt_min(actual_work),
                         overtime: fmt_min(overtime),
-                        late_night: fmt_min(agg.late_night_minutes),
+                        late_night: fmt_min(standard_late_night),
                         ot_late_night: fmt_min(ot_ln),
                         remarks: String::new(),
                     });

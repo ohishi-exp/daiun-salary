@@ -643,7 +643,20 @@ pub fn process_zip(
                 .iter()
                 .filter_map(|r| r.departure_at.map(|d| d.date()))
                 .collect();
-            dates.len() > 1
+            if dates.len() <= 1 {
+                false
+            } else {
+                // 前の運行の帰着日と次の運行の出発日が同じ場合は
+                // multi-op mergeを使わない（overlapセクションに任せる）
+                let mut sorted_valid: Vec<_> = valid_ops.iter().collect();
+                sorted_valid.sort_by_key(|r| r.departure_at);
+                let ops_share_date = sorted_valid.windows(2).any(|pair| {
+                    let ret_date = pair[0].return_at.map(|r| r.date());
+                    let dep_date = pair[1].departure_at.map(|d| d.date());
+                    ret_date.is_some() && ret_date == dep_date
+                });
+                !ops_share_date
+            }
         } else {
             false
         };
@@ -1170,7 +1183,9 @@ pub fn process_zip(
                     let rest_threshold = if is_multi_op { 540 } else { 480 };
                     let next_resets = next_gap >= rest_threshold;
 
-                    if !next_resets && ol_restraint > 0 {
+                    // 同日かつ長めのgap(≥180分)は重複表示（24h境界の分割）
+                    let same_date_long_gap = date == next_date && next_gap >= 180;
+                    if !next_resets && ol_restraint > 0 && !same_date_long_gap {
                         let ol_late_night = calc_late_night_mins(next_info.start, window_end);
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                             agg.drive_minutes += ol_drive;

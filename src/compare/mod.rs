@@ -363,6 +363,42 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "長距離480例外: 連鎖 (#3)",
         cascading: false,
     },
+    // 1071: #3バグ（休息529/525/507分が24h内で未分割）
+    KnownBugPattern {
+        driver_cd: "1071",
+        date_contains: "2月2",
+        fields: &["終業", "運転", "重複運転", "小計", "重複小計", "実働", "時間外"],
+        description: "長距離480例外: 休息529分が未分割 (#3)",
+        cascading: true,
+    },
+    KnownBugPattern {
+        driver_cd: "1071",
+        date_contains: "2月3",
+        fields: &["始業", "運転", "重複運転", "小計", "重複小計", "合計", "実働", "深夜"],
+        description: "長距離480例外: 連鎖 (#3)",
+        cascading: false,
+    },
+    KnownBugPattern {
+        driver_cd: "1071",
+        date_contains: "2月5",
+        fields: &["終業", "運転", "重複運転", "小計", "重複小計", "合計", "実働"],
+        description: "24h分離+480例外: 連鎖 (#2/#3)",
+        cascading: false,
+    },
+    KnownBugPattern {
+        driver_cd: "1071",
+        date_contains: "2月14",
+        fields: &["始業", "重複運転", "重複小計", "合計"],
+        description: "長距離480例外: 休息525分が未分割 (#3)",
+        cascading: false,
+    },
+    KnownBugPattern {
+        driver_cd: "1071",
+        date_contains: "2月28",
+        fields: &["始業", "重複運転", "重複小計", "合計"],
+        description: "長距離480例外: 休息507分が未分割 (#3)",
+        cascading: false,
+    },
 ];
 
 /// 差分リストに既知バグアノテーションを付与（連鎖差分の自動計算含む）

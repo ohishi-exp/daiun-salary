@@ -1229,20 +1229,22 @@ fn process_overlap_chain(
                 }
 
                 if next_info.start < window_end {
-                    let restraint_end = day_map
-                        .get(&(driver_cd.clone(), next_date, next_st))
-                        .map(|next_agg| {
-                            next_agg
-                                .segments
-                                .iter()
-                                .filter(|s| trunc_min(s.start_at) < window_end)
-                                .map(|s| trunc_min(s.end_at).min(window_end))
-                                .max()
-                                .unwrap_or(window_end)
-                        })
-                        .unwrap_or(window_end);
-                    if restraint_end > next_info.start {
-                        ol_restraint = (restraint_end - next_info.start).num_minutes() as i32;
+                    // セグメント合計で計算（302休息のギャップを除外）
+                    if let Some(next_agg) =
+                        day_map.get(&(driver_cd.clone(), next_date, next_st))
+                    {
+                        let mut seg_total = 0i32;
+                        for seg in &next_agg.segments {
+                            let seg_s = trunc_min(seg.start_at);
+                            let seg_e = trunc_min(seg.end_at);
+                            if seg_e <= next_info.start || seg_s >= window_end {
+                                continue;
+                            }
+                            let eff_s = seg_s.max(next_info.start);
+                            let eff_e = seg_e.min(window_end);
+                            seg_total += (eff_e - eff_s).num_minutes() as i32;
+                        }
+                        ol_restraint = seg_total;
                     }
                 }
 

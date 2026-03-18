@@ -737,6 +737,144 @@ pub fn split_work_segments_at_boundary(
     result
 }
 
+/// フェリー期間と重なる301(休憩)イベントのduration合計を返す
+pub fn ferry_break_overlap(
+    events: &[&KudgivtRow],
+    ferry_start: NaiveDateTime,
+    ferry_end: NaiveDateTime,
+) -> i32 {
+    let mut total = 0i32;
+    for evt in events {
+        if evt.event_cd != "301" {
+            continue;
+        }
+        let dur = evt.duration_minutes.unwrap_or(0);
+        if dur <= 0 {
+            continue;
+        }
+        let es = evt.start_at;
+        let ee = es + chrono::Duration::minutes(dur as i64);
+        if ee > ferry_start && es < ferry_end {
+            total += dur;
+        }
+    }
+    total
+}
+
+/// フェリー期間と重なるDrive/Cargoイベントの分数合計を返す（分精度）
+pub fn ferry_drive_cargo_overlap(
+    events: &[&KudgivtRow],
+    classifications: &HashMap<String, EventClass>,
+    ferry_start: NaiveDateTime,
+    ferry_end: NaiveDateTime,
+) -> (i32, i32) {
+    let fs_trunc = trunc_min(ferry_start);
+    let fe_trunc = trunc_min(ferry_end);
+    let mut drive = 0i32;
+    let mut cargo = 0i32;
+    for evt in events {
+        let dur = evt.duration_minutes.unwrap_or(0);
+        if dur <= 0 {
+            continue;
+        }
+        let es = trunc_min(evt.start_at);
+        let ee = es + chrono::Duration::minutes(dur as i64);
+        let os = es.max(fs_trunc);
+        let oe = ee.min(fe_trunc);
+        if oe > os {
+            let mins = (oe - os).num_minutes() as i32;
+            match classifications.get(&evt.event_cd) {
+                Some(EventClass::Drive) => drive += mins,
+                Some(EventClass::Cargo) => cargo += mins,
+                _ => {}
+            }
+        }
+    }
+    (drive, cargo)
+}
+
+/// イベントをmulti_op境界で分割する
+pub fn split_event_at_boundaries(
+    evt_start: NaiveDateTime,
+    evt_end: NaiveDateTime,
+    dur_secs: i64,
+    boundaries: Option<&Vec<NaiveDateTime>>,
+) -> Vec<(NaiveDateTime, NaiveDateTime, i64)> {
+    let mut parts = Vec::new();
+    if let Some(bounds) = boundaries {
+        let mut relevant: Vec<NaiveDateTime> = bounds
+            .iter()
+            .filter(|&&b| evt_start < b && evt_end > b)
+            .copied()
+            .collect();
+        relevant.sort();
+        if relevant.is_empty() {
+            parts.push((evt_start, evt_end, dur_secs));
+        } else {
+            let mut cur = evt_start;
+            for b in &relevant {
+                let secs = (*b - cur).num_seconds();
+                parts.push((cur, *b, secs));
+                cur = *b;
+            }
+            let secs = (evt_end - cur).num_seconds();
+            parts.push((cur, evt_end, secs));
+        }
+    } else {
+        parts.push((evt_start, evt_end, dur_secs));
+    }
+    parts
+}
+
+/// イベント開始時刻からworkday(日付,始業時刻)を特定する
+pub fn find_event_workday(
+    part_start: NaiveDateTime,
+    unko_segments: Option<&Vec<(NaiveDateTime, NaiveDateTime, NaiveDate, NaiveTime)>>,
+) -> (NaiveDate, NaiveTime) {
+    let default_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    let segs = match unko_segments {
+        Some(s) => s,
+        None => return (part_start.date(), default_time),
+    };
+    // 直接マッチ: part_startがセグメント[start, end)内
+    if let Some((_, _, wd, st)) = segs
+        .iter()
+        .find(|(start, end, _, _)| part_start >= *start && part_start < *end)
+    {
+        return (*wd, *st);
+    }
+    // fallback: part_startより後に始まるセグメント or 最後のセグメント
+    segs.iter()
+        .find(|(start, _, _, _)| part_start < *start)
+        .or_else(|| segs.last())
+        .map(|(_, _, wd, st)| (*wd, *st))
+        .unwrap_or((part_start.date(), default_time))
+}
+
+/// daily segmentをDayAggに蓄積する
+pub fn accumulate_daily_segment(
+    entry: &mut DayAgg,
+    work_mins: i32,
+    late_night_mins: i32,
+    drive_mins: i32,
+    cargo_mins: i32,
+    seg_start: NaiveDateTime,
+    seg_end: NaiveDateTime,
+    unko_no: &str,
+) {
+    entry.total_work_minutes += work_mins;
+    entry.late_night_minutes += late_night_mins;
+    entry.drive_minutes += drive_mins;
+    entry.cargo_minutes += cargo_mins;
+    if !entry.unko_nos.contains(&unko_no.to_string()) {
+        entry.unko_nos.push(unko_no.to_string());
+    }
+    entry.segments.push(SegRec {
+        start_at: seg_start,
+        end_at: seg_end,
+    });
+}
+
 /// フェリー控除用の事前計算データ（compare/upload共通）
 #[derive(Clone, Default)]
 pub struct FerryInfo {
@@ -1190,7 +1328,6 @@ pub fn post_process_day_map(
                         workday_boundaries.insert(next_key, (window_end, next_end));
                     } else if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                         // 非chain(next_resets): overlap windowにフェリーがあれば控除
-                        // フェリー控除: overlap window内のフェリー時間を控除
                         let mut ferry_ded = 0i32;
                         let mut ferry_drive_ded = 0i32;
                         let mut ferry_cargo_ded = 0i32;
@@ -1199,63 +1336,20 @@ pub fn post_process_day_map(
                                 if let Some(events) = kudgivt_by_unko.get(unko) {
                                     for &(fs, fe) in periods {
                                         if fe > next_info.start && fs < window_end {
-                                            // 従来: 301イベントベースの控除
-                                            let mut break_ded = 0i32;
-                                            for evt in events {
-                                                if evt.event_cd != "301" {
-                                                    continue;
-                                                }
-                                                let dur = evt.duration_minutes.unwrap_or(0);
-                                                if dur <= 0 {
-                                                    continue;
-                                                }
-                                                let es = evt.start_at;
-                                                let ee = es + chrono::Duration::minutes(dur as i64);
-                                                if ee > fs && es < fe {
-                                                    break_ded += dur;
-                                                }
-                                            }
+                                            let break_ded = ferry_break_overlap(events, fs, fe);
                                             if break_ded > 0 {
-                                                // 301イベントがある場合: 従来通り301のdurationで控除
                                                 ferry_ded += break_ded;
                                             } else {
-                                                // 301イベントがない場合（運転中フェリー等）:
-                                                // フェリー期間を直接控除し、運転/荷役からも差し引く
                                                 let f_start = fs.max(next_info.start);
                                                 let f_end = fe.min(window_end);
                                                 let f_mins = (f_end - f_start).num_minutes() as i32;
                                                 if f_mins > 0 {
                                                     ferry_ded += f_mins;
-                                                    for evt in events {
-                                                        let dur = evt.duration_minutes.unwrap_or(0);
-                                                        if dur <= 0 {
-                                                            continue;
-                                                        }
-                                                        let es = trunc_min(evt.start_at);
-                                                        let ee = es
-                                                            + chrono::Duration::minutes(dur as i64);
-                                                        if ee <= fs || es >= fe {
-                                                            continue;
-                                                        }
-                                                        let ov_s = es.max(fs);
-                                                        let ov_e = ee.min(fe);
-                                                        let ov_m =
-                                                            (ov_e - ov_s).num_minutes() as i32;
-                                                        if ov_m <= 0 {
-                                                            continue;
-                                                        }
-                                                        let cls =
-                                                            classifications.get(&evt.event_cd);
-                                                        match cls {
-                                                            Some(EventClass::Drive) => {
-                                                                ferry_drive_ded += ov_m
-                                                            }
-                                                            Some(EventClass::Cargo) => {
-                                                                ferry_cargo_ded += ov_m
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
+                                                    let (d, c) = ferry_drive_cargo_overlap(
+                                                        events, classifications, fs, fe,
+                                                    );
+                                                    ferry_drive_ded += d;
+                                                    ferry_cargo_ded += c;
                                                 }
                                             }
                                         }
@@ -1294,51 +1388,15 @@ pub fn post_process_day_map(
         for unko in &agg.unko_nos {
             if let Some(periods) = ferry_info.ferry_period_map.get(unko) {
                 for &(fs, fe) in periods {
-                    // このday_mapエントリの時間範囲とフェリー期間が重なるか
                     if fe <= seg_start || fs >= seg_end {
-                        continue; // 重ならない → この日のフェリーではない
+                        continue;
                     }
-                    // フェリー時間（KUDGFRY由来）
                     let ferry_mins = ((fe - fs).num_seconds() as f64 / 60.0).round() as i32;
                     ferry_deduction += ferry_mins;
-
-                    // 対応する301イベントのdurationを検索
                     if let Some(events) = kudgivt_by_unko.get(unko) {
-                        for evt in events {
-                            if evt.event_cd != "301" {
-                                continue;
-                            }
-                            let dur = evt.duration_minutes.unwrap_or(0);
-                            if dur <= 0 {
-                                continue;
-                            }
-                            let es = evt.start_at;
-                            let ee = es + chrono::Duration::minutes(dur as i64);
-                            // フェリー期間と301イベントの重なり判定
-                            if ee > fs && es < fe {
-                                ferry_break_deduction += dur;
-                            }
-                        }
-                        // Drive/Cargoとフェリー期間の実重複（分精度で計算）
-                        let fs_trunc = trunc_min(fs);
-                        let fe_trunc = trunc_min(fe);
-                        for evt in events {
-                            match classifications.get(&evt.event_cd) {
-                                Some(EventClass::Drive) | Some(EventClass::Cargo) => {}
-                                _ => continue,
-                            }
-                            let dur = evt.duration_minutes.unwrap_or(0);
-                            if dur <= 0 {
-                                continue;
-                            }
-                            let es = trunc_min(evt.start_at);
-                            let ee = es + chrono::Duration::minutes(dur as i64);
-                            let os = es.max(fs_trunc);
-                            let oe = ee.min(fe_trunc);
-                            if oe > os {
-                                ferry_drive_overlap += (oe - os).num_minutes() as i32;
-                            }
-                        }
+                        ferry_break_deduction += ferry_break_overlap(events, fs, fe);
+                        let (d, c) = ferry_drive_cargo_overlap(events, classifications, fs, fe);
+                        ferry_drive_overlap += d + c;
                     }
                 }
             }
@@ -1745,58 +1803,17 @@ pub fn build_day_map(
                         let evt_start_trunc = trunc_min(evt.start_at);
                         let evt_end = evt_start_trunc + chrono::Duration::minutes(dur as i64);
 
-                        let mut parts: Vec<(NaiveDateTime, NaiveDateTime, i64)> = Vec::new();
-                        if let Some(boundaries) = boundary_opt {
-                            // 複数境界でイベントを分割
-                            let mut relevant: Vec<NaiveDateTime> = boundaries
-                                .iter()
-                                .filter(|&&b| evt_start_trunc < b && evt_end > b)
-                                .copied()
-                                .collect();
-                            relevant.sort();
-                            if relevant.is_empty() {
-                                parts.push((evt_start_trunc, evt_end, dur as i64 * 60));
-                            } else {
-                                let mut cur = evt_start_trunc;
-                                for b in &relevant {
-                                    let secs = (*b - cur).num_seconds();
-                                    parts.push((cur, *b, secs));
-                                    cur = *b;
-                                }
-                                let secs = (evt_end - cur).num_seconds();
-                                parts.push((cur, evt_end, secs));
-                            }
-                        } else {
-                            parts.push((evt_start_trunc, evt_end, dur as i64 * 60));
-                        }
+                        let parts = split_event_at_boundaries(
+                            evt_start_trunc,
+                            evt_end,
+                            dur as i64 * 60,
+                            boundary_opt,
+                        );
 
                         for (part_start, part_end, part_secs) in &parts {
-                            // unko_segmentsの[start, end)に含まれるpartのみ帰属
-                            // clipped_startでworkday始業前の時間が除外される
-                            let segs = unko_segments.get(unko_no);
-                            let direct_match = segs.and_then(|segs| {
-                                segs.iter()
-                                    .find(|(start, end, _, _)| {
-                                        *part_start >= *start && *part_start < *end
-                                    })
-                                    .map(|(_, _, wd, st)| (*wd, *st))
-                            });
-                            let (event_date, event_start_time) = match direct_match {
-                                Some(v) => v,
-                                None => {
-                                    // 通常のfallback（従来の挙動を維持）
-                                    segs.and_then(|segs| {
-                                        segs.iter()
-                                            .find(|(start, _, _, _)| *part_start < *start)
-                                            .or_else(|| segs.last())
-                                            .map(|(_, _, wd, st)| (*wd, *st))
-                                    })
-                                    .unwrap_or((
-                                        part_start.date(),
-                                        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-                                    ))
-                                }
-                            };
+                            let seg_list = unko_segments.get(unko_no);
+                            let (event_date, event_start_time) =
+                                find_event_workday(*part_start, seg_list);
 
                             let cls = classifications.get(&evt.event_cd);
                             match cls {
@@ -2342,5 +2359,286 @@ mod tests {
         assert_eq!(agg.total_work_minutes, 0);
         assert!(agg.unko_nos.is_empty());
         assert!(!agg.from_multi_op);
+    }
+
+    // ---- ferry_break_overlap ----
+    fn make_kudgivt(
+        unko_no: &str,
+        start: NaiveDateTime,
+        event_cd: &str,
+        dur: i32,
+    ) -> csv_parser::kudgivt::KudgivtRow {
+        csv_parser::kudgivt::KudgivtRow {
+            unko_no: unko_no.into(),
+            reading_date: start.date(),
+            driver_cd: "1001".into(),
+            driver_name: "Test".into(),
+            crew_role: 1,
+            start_at: start,
+            end_at: Some(start + chrono::Duration::minutes(dur as i64)),
+            event_cd: event_cd.into(),
+            event_name: "".into(),
+            duration_minutes: Some(dur),
+            section_distance: None,
+            raw_data: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn test_ferry_break_overlap_with_301() {
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 10, 0, 0), "301", 60),
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let result = ferry_break_overlap(
+            &refs,
+            dt(2026, 2, 1, 9, 0, 0),
+            dt(2026, 2, 1, 11, 0, 0),
+        );
+        assert_eq!(result, 60);
+    }
+    #[test]
+    fn test_ferry_break_overlap_no_301() {
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 10, 0, 0), "201", 60), // 運転、301じゃない
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let result = ferry_break_overlap(
+            &refs,
+            dt(2026, 2, 1, 9, 0, 0),
+            dt(2026, 2, 1, 11, 0, 0),
+        );
+        assert_eq!(result, 0);
+    }
+    #[test]
+    fn test_ferry_break_overlap_outside_period() {
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 15, 0, 0), "301", 60),
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let result = ferry_break_overlap(
+            &refs,
+            dt(2026, 2, 1, 9, 0, 0),
+            dt(2026, 2, 1, 11, 0, 0),
+        );
+        assert_eq!(result, 0);
+    }
+
+    // ---- ferry_drive_cargo_overlap ----
+    #[test]
+    fn test_ferry_drive_cargo_overlap_drive() {
+        let cls = default_classifications();
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 10, 0, 0), "201", 60), // 運転
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let (drive, cargo) = ferry_drive_cargo_overlap(
+            &refs,
+            &cls,
+            dt(2026, 2, 1, 10, 30, 0), // フェリー10:30-11:30
+            dt(2026, 2, 1, 11, 30, 0),
+        );
+        assert_eq!(drive, 30); // 10:30-11:00の30分が重複
+        assert_eq!(cargo, 0);
+    }
+    #[test]
+    fn test_ferry_drive_cargo_overlap_cargo() {
+        let cls = default_classifications();
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 10, 0, 0), "202", 60), // 積み
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let (drive, cargo) = ferry_drive_cargo_overlap(
+            &refs,
+            &cls,
+            dt(2026, 2, 1, 10, 0, 0),
+            dt(2026, 2, 1, 11, 0, 0),
+        );
+        assert_eq!(drive, 0);
+        assert_eq!(cargo, 60);
+    }
+    #[test]
+    fn test_ferry_drive_cargo_overlap_no_overlap() {
+        let cls = default_classifications();
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 60),
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let (drive, cargo) = ferry_drive_cargo_overlap(
+            &refs,
+            &cls,
+            dt(2026, 2, 1, 12, 0, 0),
+            dt(2026, 2, 1, 13, 0, 0),
+        );
+        assert_eq!(drive, 0);
+        assert_eq!(cargo, 0);
+    }
+
+    // ---- split_event_at_boundaries ----
+    #[test]
+    fn test_split_event_no_boundary() {
+        let parts = split_event_at_boundaries(
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 1, 10, 0, 0),
+            7200,
+            None,
+        );
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].2, 7200);
+    }
+    #[test]
+    fn test_split_event_one_boundary() {
+        let bounds = vec![dt(2026, 2, 1, 9, 0, 0)];
+        let parts = split_event_at_boundaries(
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 1, 10, 0, 0),
+            7200,
+            Some(&bounds),
+        );
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].2, 3600); // 8:00-9:00
+        assert_eq!(parts[1].2, 3600); // 9:00-10:00
+    }
+    #[test]
+    fn test_split_event_two_boundaries() {
+        let bounds = vec![dt(2026, 2, 1, 9, 0, 0), dt(2026, 2, 1, 11, 0, 0)];
+        let parts = split_event_at_boundaries(
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 1, 12, 0, 0),
+            14400,
+            Some(&bounds),
+        );
+        assert_eq!(parts.len(), 3);
+    }
+    #[test]
+    fn test_split_event_boundary_outside() {
+        let bounds = vec![dt(2026, 2, 1, 15, 0, 0)]; // イベント外
+        let parts = split_event_at_boundaries(
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 1, 10, 0, 0),
+            7200,
+            Some(&bounds),
+        );
+        assert_eq!(parts.len(), 1); // 分割なし
+    }
+
+    // ---- find_event_workday ----
+    #[test]
+    fn test_find_event_workday_direct_match() {
+        let d = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let t = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+        let segs = vec![(dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 17, 0, 0), d, t)];
+        let (wd, st) = find_event_workday(dt(2026, 2, 1, 10, 0, 0), Some(&segs));
+        assert_eq!(wd, d);
+        assert_eq!(st, t);
+    }
+    #[test]
+    fn test_find_event_workday_fallback() {
+        let d = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let t = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+        let segs = vec![(dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 17, 0, 0), d, t)];
+        // 7:00はセグメント[8:00, 17:00)の外 → fallback
+        let (wd, st) = find_event_workday(dt(2026, 2, 1, 7, 0, 0), Some(&segs));
+        assert_eq!(wd, d); // fallbackで最初のセグメント
+    }
+    #[test]
+    fn test_find_event_workday_no_segments() {
+        let (wd, _) = find_event_workday(dt(2026, 2, 1, 10, 0, 0), None);
+        assert_eq!(wd, NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+    }
+
+    // ---- accumulate_daily_segment ----
+    #[test]
+    fn test_accumulate_daily_segment_basic() {
+        let mut entry = DayAgg::default();
+        accumulate_daily_segment(
+            &mut entry, 100, 10, 80, 20,
+            dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 9, 40, 0),
+            "U001",
+        );
+        assert_eq!(entry.total_work_minutes, 100);
+        assert_eq!(entry.drive_minutes, 80);
+        assert_eq!(entry.cargo_minutes, 20);
+        assert_eq!(entry.late_night_minutes, 10);
+        assert_eq!(entry.unko_nos, vec!["U001"]);
+        assert_eq!(entry.segments.len(), 1);
+    }
+    #[test]
+    fn test_accumulate_daily_segment_additive() {
+        let mut entry = DayAgg::default();
+        accumulate_daily_segment(
+            &mut entry, 100, 0, 80, 20,
+            dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 9, 0, 0), "U001",
+        );
+        accumulate_daily_segment(
+            &mut entry, 50, 0, 30, 20,
+            dt(2026, 2, 1, 10, 0, 0), dt(2026, 2, 1, 11, 0, 0), "U001",
+        );
+        assert_eq!(entry.total_work_minutes, 150);
+        assert_eq!(entry.drive_minutes, 110);
+        assert_eq!(entry.unko_nos.len(), 1); // 重複スキップ
+        assert_eq!(entry.segments.len(), 2);
+    }
+
+    // ---- parse_restraint_csv ----
+    #[test]
+    fn test_parse_restraint_csv_basic() {
+        let csv = "拘束時間管理表 (2026年 2月分)\n\
+氏名,テスト太郎,乗務員コード,9999\n\
+日付,始業時刻,終業時刻,運転時間,重複運転時間,荷役時間,重複荷役時間,休憩時間,重複休憩時間,時間,重複時間,拘束時間小計,重複拘束時間小計,拘束時間合計,拘束時間累計,前運転平均,後運転平均,休息時間,実働時間,時間外時間,深夜時間,時間外深夜時間,摘要1,摘要2\n\
+2月1日,8:00,17:00,5:00,,1:00,,1:00,,,,7:00,,7:00,7:00,,,,6:00,,,,テスト,\n\
+合計,,,5:00,,1:00,,1:00,,,,7:00,,,,,,6:00,,,,\n";
+        let result = parse_restraint_csv(csv.as_bytes()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].driver_cd, "9999");
+        assert_eq!(result[0].driver_name, "テスト太郎");
+        assert_eq!(result[0].days.len(), 1);
+        assert_eq!(result[0].days[0].date, "2月1日");
+        assert_eq!(result[0].days[0].drive, "5:00");
+        assert_eq!(result[0].total_drive, "5:00");
+    }
+    #[test]
+    fn test_parse_restraint_csv_holiday() {
+        let csv = "氏名,テスト,乗務員コード,1\n\
+日付,始業時刻\n\
+2月1日,休,\n\
+合計,,\n";
+        let result = parse_restraint_csv(csv.as_bytes()).unwrap();
+        assert_eq!(result[0].days.len(), 1);
+        assert!(result[0].days[0].is_holiday);
+    }
+    #[test]
+    fn test_parse_restraint_csv_empty() {
+        let csv = "何もないデータ\n";
+        let result = parse_restraint_csv(csv.as_bytes());
+        assert!(result.is_err());
+    }
+
+    // ---- annotate_known_bugs ----
+    #[test]
+    fn test_annotate_known_bugs_no_match() {
+        let mut diffs = vec![DiffItem {
+            date: "2月1日".into(),
+            field: "運転".into(),
+            csv_val: "5:00".into(),
+            sys_val: "6:00".into(),
+            known_bug: None,
+        }];
+        let mut totals = vec![];
+        annotate_known_bugs("9999", &mut diffs, &mut totals);
+        assert!(diffs[0].known_bug.is_none());
+    }
+    #[test]
+    fn test_annotate_known_bugs_match() {
+        let mut diffs = vec![DiffItem {
+            date: "2月22日".into(),
+            field: "始業".into(),
+            csv_val: "5:00".into(),
+            sys_val: "6:00".into(),
+            known_bug: None,
+        }];
+        let mut totals = vec![];
+        annotate_known_bugs("1039", &mut diffs, &mut totals);
+        assert!(diffs[0].known_bug.is_some());
     }
 }

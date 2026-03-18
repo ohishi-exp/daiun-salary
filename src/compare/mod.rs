@@ -1693,12 +1693,12 @@ pub fn build_day_map(
 
             for ((date, st), secs) in &day_drive_secs {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    agg.drive_minutes = (*secs / 60) as i32;
+                    agg.drive_minutes = ((*secs + 30) / 60) as i32;
                 }
             }
             for ((date, st), secs) in &day_cargo_secs {
                 if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    agg.cargo_minutes = (*secs / 60) as i32;
+                    agg.cargo_minutes = ((*secs + 30) / 60) as i32;
                 }
             }
             for ((date, st), _) in day_drive_secs
@@ -1710,7 +1710,7 @@ pub fn build_day_map(
                     let d = day_drive_secs.get(&(*date, *st)).copied().unwrap_or(0);
                     let c = day_cargo_secs.get(&(*date, *st)).copied().unwrap_or(0);
                     let b = day_break_secs.get(&(*date, *st)).copied().unwrap_or(0);
-                    agg.total_work_minutes = ((d + c + b) / 60) as i32;
+                    agg.total_work_minutes = ((d + c + b + 30) / 60) as i32;
                 }
             }
             for ((date, st), night) in &day_late_night {

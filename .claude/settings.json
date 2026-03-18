@@ -3,7 +3,10 @@
     "allow": [
       "Bash(iconv -f SHIFT_JIS -t UTF-8 /home/yhonda/rust/daiun-salary/test_data/拘束時間管理表_202602-1021-1026.csv)",
       "Bash(iconv -f SHIFT_JIS -t UTF-8 /home/yhonda/rust/daiun-salary/test_data/拘束時間管理表.csv)",
-      "Bash(cargo run:*)"
+      "Bash(cargo run:*)",
+      "Bash(unzip:*)",
+      "Bash(ls:*)",
+      "Bash(iconv:*)"
     ],
     "additionalDirectories": [
       "/tmp"

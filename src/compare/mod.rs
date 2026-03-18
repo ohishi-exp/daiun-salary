@@ -1942,6 +1942,7 @@ pub fn build_day_map(
     }
 }
 
+/// ZIPからCsvDriverDataを生成（IOラッパー）
 pub fn process_zip(
     zip_bytes: &[u8],
     target_year: i32,
@@ -1967,8 +1968,6 @@ pub fn process_zip(
     let kudgivt_rows = csv_parser::kudgivt::parse_kudgivt(&kudgivt_text)
         .map_err(|e| format!("KUDGIVTパースエラー: {e}"))?;
 
-    let classifications = default_classifications();
-
     let mut kudgivt_by_unko: HashMap<String, Vec<&KudgivtRow>> = HashMap::new();
     for row in &kudgivt_rows {
         kudgivt_by_unko
@@ -1976,15 +1975,36 @@ pub fn process_zip(
             .or_default()
             .push(row);
     }
+    let ferry_info = FerryInfo::from_zip_files(&zip_files, &kudgivt_by_unko);
 
-    let result = build_day_map(&kudguri_rows, &kudgivt_by_unko, &classifications);
+    process_parsed_data(&kudguri_rows, &kudgivt_rows, &ferry_info, target_year, target_month)
+}
+
+/// パース済みデータからCsvDriverDataを生成（IO分離済み・テスト可能）
+pub fn process_parsed_data(
+    kudguri_rows: &[KudguriRow],
+    kudgivt_rows: &[KudgivtRow],
+    ferry_info: &FerryInfo,
+    target_year: i32,
+    target_month: u32,
+) -> Result<Vec<CsvDriverData>, String> {
+    let classifications = default_classifications();
+
+    let mut kudgivt_by_unko: HashMap<String, Vec<&KudgivtRow>> = HashMap::new();
+    for row in kudgivt_rows {
+        kudgivt_by_unko
+            .entry(row.unko_no.clone())
+            .or_default()
+            .push(row);
+    }
+
+    let result = build_day_map(kudguri_rows, &kudgivt_by_unko, &classifications);
     let mut day_map = result.day_map;
     let mut workday_boundaries = result.workday_boundaries;
     let multi_wd_boundaries = result.multi_wd_boundaries;
     let mut day_work_events = result.day_work_events;
     let _calendar_day_total = result.calendar_day_total;
 
-    let ferry_info = FerryInfo::from_zip_files(&zip_files, &kudgivt_by_unko);
     post_process_day_map(
         &mut day_map,
         &mut workday_boundaries,
@@ -1992,13 +2012,13 @@ pub fn process_zip(
         &mut day_work_events,
         &kudgivt_by_unko,
         &classifications,
-        &kudguri_rows,
-        &ferry_info,
+        kudguri_rows,
+        ferry_info,
     );
 
     // ---- CsvDriverData に変換 ----
     let mut driver_map: HashMap<String, String> = HashMap::new();
-    for row in &kudguri_rows {
+    for row in kudguri_rows {
         driver_map
             .entry(row.driver_cd.clone())
             .or_insert_with(|| row.driver_name.clone());
@@ -2828,6 +2848,75 @@ mod tests {
         ];
         let result = calc_ot_late_night_from_events(&events);
         assert_eq!(result, 240); // 4h全部が時間外深夜
+    }
+
+    // ---- process_parsed_data ----
+    #[test]
+    fn test_process_parsed_data_single_day() {
+        let kudguri = vec![make_kudguri(
+            "U1", "D1",
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 1, 17, 0, 0),
+        )];
+        let kudgivt = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 300),
+            make_kudgivt("U1", dt(2026, 2, 1, 13, 0, 0), "301", 60),
+            make_kudgivt("U1", dt(2026, 2, 1, 14, 0, 0), "201", 120),
+        ];
+        let ferry = FerryInfo::default();
+        let result = process_parsed_data(&kudguri, &kudgivt, &ferry, 2026, 2).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].driver_cd, "D1");
+        // 2月1日のデータが含まれる
+        let working_days: Vec<_> = result[0].days.iter().filter(|d| !d.is_holiday).collect();
+        assert!(!working_days.is_empty());
+    }
+    #[test]
+    fn test_process_parsed_data_multi_day_with_rest() {
+        let kudguri = vec![make_kudguri(
+            "U1", "D1",
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 2, 17, 0, 0),
+        )];
+        let kudgivt = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 480),
+            make_kudgivt("U1", dt(2026, 2, 1, 16, 0, 0), "302", 600),
+            make_kudgivt("U1", dt(2026, 2, 2, 2, 0, 0), "201", 480),
+        ];
+        let ferry = FerryInfo::default();
+        let result = process_parsed_data(&kudguri, &kudgivt, &ferry, 2026, 2).unwrap();
+        assert_eq!(result.len(), 1);
+        let working_days: Vec<_> = result[0].days.iter().filter(|d| !d.is_holiday).collect();
+        assert!(working_days.len() >= 2, "Expected ≥2 working days after rest split");
+    }
+    #[test]
+    fn test_process_parsed_data_with_ferry() {
+        let kudguri = vec![make_kudguri(
+            "U1", "D1",
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 1, 17, 0, 0),
+        )];
+        let kudgivt = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 120),
+            make_kudgivt("U1", dt(2026, 2, 1, 10, 0, 0), "301", 60),
+            make_kudgivt("U1", dt(2026, 2, 1, 11, 0, 0), "201", 300),
+        ];
+        let mut ferry = FerryInfo::default();
+        ferry.ferry_period_map.insert(
+            "U1".into(),
+            vec![(dt(2026, 2, 1, 10, 0, 0), dt(2026, 2, 1, 11, 0, 0))],
+        );
+        let result = process_parsed_data(&kudguri, &kudgivt, &ferry, 2026, 2).unwrap();
+        assert_eq!(result.len(), 1);
+        // フェリー控除が適用されている
+        let day = result[0].days.iter().find(|d| d.date == "2月1日").unwrap();
+        assert!(!day.subtotal.is_empty());
+    }
+    #[test]
+    fn test_process_parsed_data_empty() {
+        let result = process_parsed_data(&[], &[], &FerryInfo::default(), 2026, 2);
+        // ドライバーなし → 空結果
+        assert!(result.unwrap().is_empty());
     }
 
     // ---- DayAgg default ----

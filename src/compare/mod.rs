@@ -1055,12 +1055,14 @@ pub fn post_process_day_map(
                     // determine_workdaysが複数workdayを生成し、
                     // 24h境界より前に終業を設定している場合はchainしない
                     // (determine_workdays由来のオリジナルwb.endで判定)
+                    let mut wd_ended_early = false;
                     if !next_resets {
                         let key = (driver_cd.clone(), date, st);
                         if let Some(&det_end) = multi_wd_boundaries.get(&key) {
                             if det_end < window_end {
                                 next_resets = true;
                                 split_rests.clear();
+                                wd_ended_early = true;
                             }
                         }
                     }
@@ -1104,10 +1106,37 @@ pub fn post_process_day_map(
                         let next_end = next_seg_end;
                         workday_boundaries.insert(next_key, (window_end, next_end));
                     } else if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
+                        // 非chain(next_resets): overlap windowにフェリーがあれば控除
+                        let mut ferry_ded = 0i32;
+                        for unko in &next_info.unko_nos {
+                            if let Some(periods) = ferry_info.ferry_period_map.get(unko) {
+                                if let Some(events) = kudgivt_by_unko.get(unko) {
+                                    for &(fs, fe) in periods {
+                                        if fe > next_info.start && fs < window_end {
+                                            for evt in events {
+                                                if evt.event_cd != "301" {
+                                                    continue;
+                                                }
+                                                let dur = evt.duration_minutes.unwrap_or(0);
+                                                if dur <= 0 {
+                                                    continue;
+                                                }
+                                                let es = evt.start_at;
+                                                let ee = es + chrono::Duration::minutes(dur as i64);
+                                                if ee > fs && es < fe {
+                                                    ferry_ded += dur;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let adj_restraint = (ol_restraint - ferry_ded).max(0);
                         agg.overlap_drive_minutes = ol_drive;
                         agg.overlap_cargo_minutes = ol_cargo;
-                        agg.overlap_break_minutes = (ol_restraint - ol_drive - ol_cargo).max(0);
-                        agg.overlap_restraint_minutes = ol_restraint;
+                        agg.overlap_break_minutes = (adj_restraint - ol_drive - ol_cargo).max(0);
+                        agg.overlap_restraint_minutes = adj_restraint;
                     }
                 }
 

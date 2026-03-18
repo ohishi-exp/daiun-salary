@@ -667,6 +667,31 @@ pub fn group_operations_into_work_days(rows: &[KudguriRow]) -> HashMap<String, N
     unko_work_date
 }
 
+/// KUDGFRY CSVテキストからフェリー乗船期間をパースする（IO分離済み）
+pub fn parse_ferry_periods_from_text(
+    text: &str,
+) -> Vec<(String, NaiveDateTime, NaiveDateTime)> {
+    let mut periods = Vec::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() <= 11 {
+            continue;
+        }
+        let unko_no = cols[0].trim().to_string();
+        if let (Some(s), Some(e)) = (
+            NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S")
+                .ok()
+                .or_else(|| NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+            NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S")
+                .ok()
+                .or_else(|| NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()),
+        ) {
+            periods.push((unko_no, s, e));
+        }
+    }
+    periods
+}
+
 fn parse_ferry_minutes(zip_files: &[(String, Vec<u8>)]) -> HashMap<String, i32> {
     let mut ferry_map = HashMap::new();
     for (name, bytes) in zip_files {
@@ -2917,6 +2942,128 @@ mod tests {
         let result = process_parsed_data(&[], &[], &FerryInfo::default(), 2026, 2);
         // ドライバーなし → 空結果
         assert!(result.unwrap().is_empty());
+    }
+
+    // ---- annotate_known_bugs: cascading + total ----
+    #[test]
+    fn test_annotate_known_bugs_cascading() {
+        let mut diffs = vec![
+            DiffItem { date: "2月22日".into(), field: "始業".into(), csv_val: "a".into(), sys_val: "b".into(), known_bug: None },
+            DiffItem { date: "2月23日".into(), field: "累計".into(), csv_val: "100".into(), sys_val: "90".into(), known_bug: None },
+        ];
+        let mut totals = vec![TotalDiffItem { label: "拘束合計".into(), csv_val: "100".into(), sys_val: "90".into(), known_bug: None }];
+        annotate_known_bugs("1039", &mut diffs, &mut totals);
+        assert!(diffs[0].known_bug.is_some()); // 直接マッチ
+        assert!(diffs[1].known_bug.is_some()); // cascading累計
+        assert!(totals[0].known_bug.is_some()); // 合計行
+    }
+
+    // ---- compare_drivers: filter ----
+    #[test]
+    fn test_compare_drivers_with_filter() {
+        let days = vec![make_csv_day("2月1日", "8:00", "17:00", "5:00", "6:00")];
+        let data = vec![CsvDriverData {
+            driver_name: "A".into(), driver_cd: "1001".into(), days: days.clone(),
+            total_drive: "5:00".into(), total_cargo: "".into(), total_break: "".into(),
+            total_restraint: "6:00".into(), total_actual_work: "5:00".into(),
+            total_overtime: "".into(), total_late_night: "".into(), total_ot_late_night: "".into(),
+        }];
+        let report = compare_drivers(&data, &data, Some("9999")); // 存在しないドライバー
+        assert_eq!(report.total_diffs, 0);
+    }
+    #[test]
+    fn test_compare_drivers_missing_in_sys() {
+        let days = vec![make_csv_day("2月1日", "8:00", "17:00", "5:00", "6:00")];
+        let csv_data = vec![CsvDriverData {
+            driver_name: "A".into(), driver_cd: "1001".into(), days,
+            total_drive: "5:00".into(), total_cargo: "".into(), total_break: "".into(),
+            total_restraint: "6:00".into(), total_actual_work: "5:00".into(),
+            total_overtime: "".into(), total_late_night: "".into(), total_ot_late_night: "".into(),
+        }];
+        let report = compare_drivers(&csv_data, &[], None); // sysにドライバーなし
+        // sysに一致するドライバーがない → エラー行として記録される
+        assert!(!report.drivers.is_empty());
+    }
+
+    // ---- parse_restraint_csv: Shift-JIS + multi driver ----
+    #[test]
+    fn test_parse_restraint_csv_multi_driver() {
+        let csv = "氏名,AAA,乗務員コード,1001\n\
+日付,始業時刻\n\
+2月1日,8:00,17:00,5:00,,,,1:00,,,,6:00,,6:00,6:00,,,,5:00,,,,\n\
+合計,,,5:00,,,,1:00,,,,6:00,,,,,5:00,,,,\n\
+氏名,BBB,乗務員コード,1002\n\
+日付,始業時刻\n\
+2月1日,9:00,18:00,6:00,,,,1:00,,,,7:00,,7:00,7:00,,,,6:00,,,,\n\
+合計,,,6:00,,,,1:00,,,,7:00,,,,,6:00,,,,\n";
+        let result = parse_restraint_csv(csv.as_bytes()).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].driver_cd, "1001");
+        assert_eq!(result[1].driver_cd, "1002");
+    }
+
+    // ---- build_day_map: invalid ops (no departure) ----
+    #[test]
+    fn test_build_day_map_invalid_op() {
+        let cls = default_classifications();
+        let mut row = make_kudguri("U1", "D1", dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 17, 0, 0));
+        row.departure_at = None; // invalid
+        row.return_at = None;
+        let kudguri = vec![row];
+        let by_unko: HashMap<String, Vec<&csv_parser::kudgivt::KudgivtRow>> = HashMap::new();
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        // invalid op → drive_time fallback only
+        assert!(result.day_map.len() <= 1);
+    }
+
+    // ---- process_parsed_data: overtime calculation ----
+    #[test]
+    fn test_process_parsed_data_overtime() {
+        let kudguri = vec![make_kudguri("U1", "D1", dt(2026, 2, 1, 6, 0, 0), dt(2026, 2, 1, 18, 0, 0))];
+        let kudgivt = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 6, 0, 0), "201", 600), // 10h運転
+        ];
+        let result = process_parsed_data(&kudguri, &kudgivt, &FerryInfo::default(), 2026, 2).unwrap();
+        let day = result[0].days.iter().find(|d| d.date == "2月1日").unwrap();
+        assert!(!day.overtime.is_empty(), "10h work should have overtime");
+    }
+
+    // ---- process_parsed_data: late night ----
+    #[test]
+    fn test_process_parsed_data_late_night() {
+        let kudguri = vec![make_kudguri("U1", "D1", dt(2026, 2, 1, 22, 0, 0), dt(2026, 2, 2, 5, 0, 0))];
+        let kudgivt = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 22, 0, 0), "201", 420), // 22:00-5:00 全深夜
+        ];
+        let result = process_parsed_data(&kudguri, &kudgivt, &FerryInfo::default(), 2026, 2).unwrap();
+        let working: Vec<_> = result[0].days.iter().filter(|d| !d.is_holiday && !d.late_night.is_empty()).collect();
+        assert!(!working.is_empty(), "22:00-5:00 should have late_night");
+    }
+
+    // ---- parse_ferry_periods_from_text ----
+    #[test]
+    fn test_parse_ferry_periods_basic() {
+        let csv = "ヘッダー行\n\
+U001,x,x,x,x,x,x,x,x,x,2026/02/01 10:00:00,2026/02/01 11:30:00\n\
+U002,x,x,x,x,x,x,x,x,x,2026/02/02 22:00:00,2026/02/03 06:00:00\n";
+        let periods = parse_ferry_periods_from_text(csv);
+        assert_eq!(periods.len(), 2);
+        assert_eq!(periods[0].0, "U001");
+        assert_eq!(periods[1].0, "U002");
+        assert_eq!(periods[0].1, dt(2026, 2, 1, 10, 0, 0));
+        assert_eq!(periods[0].2, dt(2026, 2, 1, 11, 30, 0));
+    }
+    #[test]
+    fn test_parse_ferry_periods_empty() {
+        let csv = "ヘッダー行\n";
+        let periods = parse_ferry_periods_from_text(csv);
+        assert!(periods.is_empty());
+    }
+    #[test]
+    fn test_parse_ferry_periods_short_cols() {
+        let csv = "ヘッダー\nU001,x,x\n"; // cols < 12
+        let periods = parse_ferry_periods_from_text(csv);
+        assert!(periods.is_empty());
     }
 
     // ---- DayAgg default ----

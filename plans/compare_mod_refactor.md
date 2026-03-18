@@ -22,8 +22,8 @@ after:  from_zip_files のみ。parse_ferry_periods_from_text を内部使用。
         parse_ferry_minutes は from_zip_files.ferry_minutes で代替。
 ```
 
-- [ ] `FerryInfo::from_zip_files`で`parse_ferry_periods_from_text`を使う
-- [ ] `parse_ferry_minutes`を削除、呼び出し元を`ferry_info.ferry_minutes`に変更
+- [x] `FerryInfo::from_zip_files`で`parse_ferry_periods_from_text`を使う
+- [x] `parse_ferry_minutes`を削除→`ferry_minutes_from_periods`に統合
 - [ ] テスト追加: FerryInfo構築のユニットテスト
 
 ## Step 2: post_process_day_map 分割 (-100行)
@@ -37,10 +37,10 @@ post_process_day_map()
   └── apply_ferry_deductions()    ← フェリー控除 (L1375-1415)
 ```
 
-- [ ] `merge_same_day_entries(day_map, workday_boundaries)` 抽出
-- [ ] `process_overlap_chain(day_map, ..., long_distance_unkos)` 抽出
-- [ ] `apply_ferry_deductions(day_map, ferry_info, kudgivt_by_unko, classifications)` 抽出
-- [ ] post_process_day_mapは3関数を順に呼ぶだけに
+- [x] `merge_same_day_entries(day_map, day_work_events)` 抽出
+- [x] `process_overlap_chain(day_map, ..., ferry_info)` 抽出
+- [x] `apply_ferry_deductions(day_map, kudgivt_by_unko, classifications, ferry_info)` 抽出
+- [x] post_process_day_mapは3関数を順に呼ぶだけに
 
 ## Step 3: build_day_map 分割 (-100行)
 
@@ -54,10 +54,10 @@ build_day_map()
   └── aggregate_events_by_day()   ← event-level集計 (L1780-1940)
 ```
 
-- [ ] `process_single_op_group(ops, ...)` 抽出
-- [ ] `process_multi_op_group(ops, ...)` 抽出
-- [ ] `aggregate_events_by_day(driver_cd, unko_nos, ...)` 抽出
-- [ ] build_day_mapはオーケストレーションのみに
+- [ ] `process_single_op_group(ops, ...)` 抽出（共有可変状態が多く保留）
+- [ ] `process_multi_op_group(ops, ...)` 抽出（共有可変状態が多く保留）
+- [x] `aggregate_events_by_day(day_map, unko_segments, ...)` 抽出
+- [x] build_day_mapからイベント集計を分離
 
 ## Step 4: DayKey型エイリアス導入 (-30行)
 
@@ -67,8 +67,8 @@ build_day_map()
 pub type DayKey = (String, NaiveDate, NaiveTime);
 ```
 
-- [ ] 型エイリアス定義
-- [ ] day_map, workday_boundaries, multi_wd_boundaries等を置換
+- [x] 型エイリアス定義
+- [x] day_map, workday_boundaries, multi_wd_boundaries等を置換（29箇所→DayKey）
 
 ## Step 5: process_parsed_data のCsvDayRow生成分離 (-50行)
 
@@ -83,7 +83,7 @@ fn build_csv_driver_data(
 ) -> CsvDriverData
 ```
 
-- [ ] 関数抽出
+- [x] `build_csv_driver_data()` 関数抽出
 - [ ] テスト追加
 
 ## 検証（各ステップ後）

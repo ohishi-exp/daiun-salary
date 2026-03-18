@@ -692,37 +692,16 @@ pub fn parse_ferry_periods_from_text(
     periods
 }
 
-fn parse_ferry_minutes(zip_files: &[(String, Vec<u8>)]) -> HashMap<String, i32> {
+/// parse_ferry_periods_from_text の結果から unko_no → 合計フェリー分を算出
+fn ferry_minutes_from_periods(
+    periods: &[(String, NaiveDateTime, NaiveDateTime)],
+) -> HashMap<String, i32> {
     let mut ferry_map = HashMap::new();
-    for (name, bytes) in zip_files {
-        if !name.to_uppercase().contains("KUDGFRY") {
-            continue;
-        }
-        let text = csv_parser::decode_shift_jis(bytes);
-        for line in text.lines().skip(1) {
-            let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() <= 11 {
-                continue;
-            }
-            let unko_no = cols[0].trim().to_string();
-            if let (Some(start), Some(end)) = (
-                NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S")
-                    .ok()
-                    .or_else(|| {
-                        NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok()
-                    }),
-                NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S")
-                    .ok()
-                    .or_else(|| {
-                        NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()
-                    }),
-            ) {
-                let secs = (end - start).num_seconds();
-                let mins = ((secs + 30) / 60) as i32;
-                if mins > 0 {
-                    *ferry_map.entry(unko_no).or_insert(0) += mins;
-                }
-            }
+    for (unko_no, s, e) in periods {
+        let secs = (*e - *s).num_seconds();
+        let mins = ((secs + 30) / 60) as i32;
+        if mins > 0 {
+            *ferry_map.entry(unko_no.clone()).or_insert(0) += mins;
         }
     }
     ferry_map
@@ -917,51 +896,35 @@ impl FerryInfo {
         zip_files: &[(String, Vec<u8>)],
         kudgivt_by_unko: &HashMap<String, Vec<&KudgivtRow>>,
     ) -> Self {
-        let ferry_minutes = parse_ferry_minutes(zip_files);
-
-        let mut ferry_break_dur: HashMap<String, i32> = HashMap::new();
-        let mut ferry_period_map: HashMap<String, Vec<(NaiveDateTime, NaiveDateTime)>> =
-            HashMap::new();
+        // KUDGFRY.csv を1回だけパース
+        let mut all_periods: Vec<(String, NaiveDateTime, NaiveDateTime)> = Vec::new();
         for (name, bytes) in zip_files {
             if !name.to_uppercase().contains("KUDGFRY") {
                 continue;
             }
             let text = csv_parser::decode_shift_jis(bytes);
-            for line in text.lines().skip(1) {
-                let cols: Vec<&str> = line.split(',').collect();
-                if cols.len() <= 11 {
-                    continue;
-                }
-                let unko_no = cols[0].trim().to_string();
-                if let (Some(s), Some(e)) = (
-                    NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %H:%M:%S")
-                        .ok()
-                        .or_else(|| {
-                            NaiveDateTime::parse_from_str(cols[10].trim(), "%Y/%m/%d %k:%M:%S").ok()
-                        }),
-                    NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %H:%M:%S")
-                        .ok()
-                        .or_else(|| {
-                            NaiveDateTime::parse_from_str(cols[11].trim(), "%Y/%m/%d %k:%M:%S").ok()
-                        }),
-                ) {
-                    ferry_period_map
-                        .entry(unko_no.clone())
-                        .or_default()
-                        .push((s, e));
-                    // 対応する301イベントをマッチ
-                    if let Some(events) = kudgivt_by_unko.get(&unko_no) {
-                        let matching_301 = events
-                            .iter()
-                            .filter(|ev| {
-                                ev.event_cd == "301" && ev.duration_minutes.unwrap_or(0) > 0
-                            })
-                            .min_by_key(|ev| (ev.start_at - s).num_seconds().abs());
-                        if let Some(evt) = matching_301 {
-                            let dur = evt.duration_minutes.unwrap_or(0);
-                            *ferry_break_dur.entry(unko_no).or_insert(0) += dur;
-                        }
-                    }
+            all_periods.extend(parse_ferry_periods_from_text(&text));
+        }
+
+        let ferry_minutes = ferry_minutes_from_periods(&all_periods);
+
+        let mut ferry_break_dur: HashMap<String, i32> = HashMap::new();
+        let mut ferry_period_map: HashMap<String, Vec<(NaiveDateTime, NaiveDateTime)>> =
+            HashMap::new();
+        for (unko_no, s, e) in &all_periods {
+            ferry_period_map
+                .entry(unko_no.clone())
+                .or_default()
+                .push((*s, *e));
+            // 対応する301イベントをマッチ
+            if let Some(events) = kudgivt_by_unko.get(unko_no) {
+                let matching_301 = events
+                    .iter()
+                    .filter(|ev| ev.event_cd == "301" && ev.duration_minutes.unwrap_or(0) > 0)
+                    .min_by_key(|ev| (ev.start_at - *s).num_seconds().abs());
+                if let Some(evt) = matching_301 {
+                    let dur = evt.duration_minutes.unwrap_or(0);
+                    *ferry_break_dur.entry(unko_no.clone()).or_insert(0) += dur;
                 }
             }
         }
@@ -975,6 +938,10 @@ impl FerryInfo {
 }
 
 /// ZIP を処理して CsvDriverData を生成
+
+/// (driver_cd, work_date, start_time) — day_map等のキー型
+pub type DayKey = (String, NaiveDate, NaiveTime);
+
 /// 日別集計データ（compare/upload共通）
 #[derive(Clone, Default)]
 pub struct DayAgg {
@@ -999,22 +966,130 @@ pub struct SegRec {
 }
 
 pub fn post_process_day_map(
-    day_map: &mut HashMap<(String, NaiveDate, NaiveTime), DayAgg>,
-    workday_boundaries: &mut HashMap<
-        (String, NaiveDate, NaiveTime),
-        (NaiveDateTime, NaiveDateTime),
-    >,
-    multi_wd_boundaries: &HashMap<(String, NaiveDate, NaiveTime), NaiveDateTime>,
-    day_work_events: &mut HashMap<
-        (String, NaiveDate, NaiveTime),
-        Vec<(NaiveDateTime, NaiveDateTime)>,
-    >,
+    day_map: &mut HashMap<DayKey, DayAgg>,
+    workday_boundaries: &mut HashMap<DayKey, (NaiveDateTime, NaiveDateTime)>,
+    multi_wd_boundaries: &HashMap<DayKey, NaiveDateTime>,
+    day_work_events: &mut HashMap<DayKey, Vec<(NaiveDateTime, NaiveDateTime)>>,
     kudgivt_by_unko: &HashMap<String, Vec<&KudgivtRow>>,
     classifications: &HashMap<String, EventClass>,
     kudguri_rows: &[KudguriRow],
     ferry_info: &FerryInfo,
 ) {
-    // ---- 長距離unko_no事前構築（O(N)）----
+    merge_same_day_entries(day_map, day_work_events);
+    process_overlap_chain(
+        day_map,
+        workday_boundaries,
+        multi_wd_boundaries,
+        day_work_events,
+        kudgivt_by_unko,
+        classifications,
+        kudguri_rows,
+        ferry_info,
+    );
+    apply_ferry_deductions(day_map, kudgivt_by_unko, classifications, ferry_info);
+}
+
+/// 構内結合: 同日・異運行・gap<180分のエントリを結合
+fn merge_same_day_entries(
+    day_map: &mut HashMap<DayKey, DayAgg>,
+    day_work_events: &mut HashMap<DayKey, Vec<(NaiveDateTime, NaiveDateTime)>>,
+) {
+    let keys: Vec<_> = day_map.keys().cloned().collect();
+    let mut driver_date_keys: HashMap<(String, NaiveDate), Vec<DayKey>> = HashMap::new();
+    for (dc, d, st) in &keys {
+        driver_date_keys
+            .entry((dc.clone(), *d))
+            .or_default()
+            .push((dc.clone(), *d, *st));
+    }
+
+    for ((_dc, _d), mut entries) in driver_date_keys {
+        if entries.len() < 2 {
+            continue;
+        }
+        entries.sort_by_key(|(_, _, st)| *st);
+
+        let mut merged_any = true;
+        while merged_any {
+            merged_any = false;
+            for i in 0..entries.len().saturating_sub(1) {
+                let key_a = entries[i].clone();
+                let key_b = entries[i + 1].clone();
+                let merge_info = {
+                    let agg_a = match day_map.get(&key_a) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    let agg_b = match day_map.get(&key_b) {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    let different_ops =
+                        !agg_a.unko_nos.iter().any(|u| agg_b.unko_nos.contains(u));
+                    let gap_info = match (
+                        agg_a.segments.iter().map(|s| s.end_at).max(),
+                        agg_b.segments.iter().map(|s| s.start_at).min(),
+                    ) {
+                        (Some(pe), Some(ns)) => {
+                            let gap_secs = (ns - pe).num_seconds();
+                            let gap = ((gap_secs + 30) / 60) as i64;
+                            if gap >= 0 && gap < 180 {
+                                Some(gap as i32)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if different_ops {
+                        gap_info
+                    } else {
+                        None
+                    }
+                };
+                if let Some(gap_mins) = merge_info {
+                    let b_clone = day_map.get(&key_b).unwrap().clone();
+                    let agg_a_mut = day_map.get_mut(&key_a).unwrap();
+                    agg_a_mut.drive_minutes += b_clone.drive_minutes;
+                    agg_a_mut.cargo_minutes += b_clone.cargo_minutes;
+                    agg_a_mut.total_work_minutes += b_clone.total_work_minutes + gap_mins;
+                    agg_a_mut.late_night_minutes += b_clone.late_night_minutes;
+                    agg_a_mut.ot_late_night_minutes += b_clone.ot_late_night_minutes;
+                    agg_a_mut.segments.extend(b_clone.segments);
+                    for u in &b_clone.unko_nos {
+                        if !agg_a_mut.unko_nos.contains(u) {
+                            agg_a_mut.unko_nos.push(u.clone());
+                        }
+                    }
+                    if let Some(b_events) =
+                        day_work_events.remove(&(key_b.0.clone(), key_b.1, key_b.2))
+                    {
+                        day_work_events
+                            .entry((key_a.0.clone(), key_a.1, key_a.2))
+                            .or_default()
+                            .extend(b_events);
+                    }
+                    day_map.remove(&key_b);
+                    entries.remove(i + 1);
+                    merged_any = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// overlap計算: 連続workday間の24h境界チェーン処理
+fn process_overlap_chain(
+    day_map: &mut HashMap<DayKey, DayAgg>,
+    workday_boundaries: &mut HashMap<DayKey, (NaiveDateTime, NaiveDateTime)>,
+    multi_wd_boundaries: &HashMap<DayKey, NaiveDateTime>,
+    day_work_events: &mut HashMap<DayKey, Vec<(NaiveDateTime, NaiveDateTime)>>,
+    kudgivt_by_unko: &HashMap<String, Vec<&KudgivtRow>>,
+    classifications: &HashMap<String, EventClass>,
+    kudguri_rows: &[KudguriRow],
+    ferry_info: &FerryInfo,
+) {
     let long_distance_unkos: std::collections::HashSet<&str> = kudguri_rows
         .iter()
         .filter(|r| {
@@ -1026,379 +1101,270 @@ pub fn post_process_day_map(
         .map(|r| r.unko_no.as_str())
         .collect();
 
-    // ---- 構内結合 ----
-    {
-        let keys: Vec<_> = day_map.keys().cloned().collect();
-        let mut driver_date_keys: HashMap<
-            (String, NaiveDate),
-            Vec<(String, NaiveDate, NaiveTime)>,
-        > = HashMap::new();
-        for (dc, d, st) in &keys {
-            driver_date_keys
-                .entry((dc.clone(), *d))
-                .or_default()
-                .push((dc.clone(), *d, *st));
-        }
-
-        for ((_dc, _d), mut entries) in driver_date_keys {
-            if entries.len() < 2 {
-                continue;
-            }
-            entries.sort_by_key(|(_, _, st)| *st);
-
-            let mut merged_any = true;
-            while merged_any {
-                merged_any = false;
-                for i in 0..entries.len().saturating_sub(1) {
-                    let key_a = entries[i].clone();
-                    let key_b = entries[i + 1].clone();
-                    let merge_info = {
-                        let agg_a = match day_map.get(&key_a) {
-                            Some(a) => a,
-                            None => continue,
-                        };
-                        let agg_b = match day_map.get(&key_b) {
-                            Some(b) => b,
-                            None => continue,
-                        };
-                        let different_ops =
-                            !agg_a.unko_nos.iter().any(|u| agg_b.unko_nos.contains(u));
-                        let gap_info = match (
-                            agg_a.segments.iter().map(|s| s.end_at).max(),
-                            agg_b.segments.iter().map(|s| s.start_at).min(),
-                        ) {
-                            (Some(pe), Some(ns)) => {
-                                let gap_secs = (ns - pe).num_seconds();
-                                let gap = ((gap_secs + 30) / 60) as i64; // 四捨五入
-                                if gap >= 0 && gap < 180 {
-                                    Some(gap as i32)
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        };
-                        if different_ops {
-                            gap_info
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(gap_mins) = merge_info {
-                        let b_clone = day_map.get(&key_b).unwrap().clone();
-                        let agg_a_mut = day_map.get_mut(&key_a).unwrap();
-                        agg_a_mut.drive_minutes += b_clone.drive_minutes;
-                        agg_a_mut.cargo_minutes += b_clone.cargo_minutes;
-                        agg_a_mut.total_work_minutes += b_clone.total_work_minutes + gap_mins;
-                        agg_a_mut.late_night_minutes += b_clone.late_night_minutes;
-                        agg_a_mut.ot_late_night_minutes += b_clone.ot_late_night_minutes;
-                        agg_a_mut.segments.extend(b_clone.segments);
-                        for u in &b_clone.unko_nos {
-                            if !agg_a_mut.unko_nos.contains(u) {
-                                agg_a_mut.unko_nos.push(u.clone());
-                            }
-                        }
-                        // day_work_eventsも結合
-                        if let Some(b_events) =
-                            day_work_events.remove(&(key_b.0.clone(), key_b.1, key_b.2))
-                        {
-                            day_work_events
-                                .entry((key_a.0.clone(), key_a.1, key_a.2))
-                                .or_default()
-                                .extend(b_events);
-                        }
-                        day_map.remove(&key_b);
-                        entries.remove(i + 1);
-                        merged_any = true;
-                        break;
-                    }
-                }
-            }
-        }
+    struct DayInfo {
+        start: NaiveDateTime,
+        end: NaiveDateTime,
+        unko_nos: Vec<String>,
     }
 
-    // ---- overlap計算 ----
-    {
-        struct DayInfo {
-            start: NaiveDateTime,
-            end: NaiveDateTime,
-            unko_nos: Vec<String>,
+    let mut driver_days: HashMap<String, BTreeMap<(NaiveDate, NaiveTime), DayInfo>> =
+        HashMap::new();
+    for ((driver_cd, date, st), agg) in day_map.iter() {
+        if agg.segments.is_empty() {
+            continue;
         }
+        let start = trunc_min(agg.segments.iter().map(|s| s.start_at).min().unwrap());
+        let end = trunc_min(agg.segments.iter().map(|s| s.end_at).max().unwrap());
+        driver_days.entry(driver_cd.clone()).or_default().insert(
+            (*date, *st),
+            DayInfo {
+                start,
+                end,
+                unko_nos: agg.unko_nos.clone(),
+            },
+        );
+    }
 
-        let mut driver_days: HashMap<String, BTreeMap<(NaiveDate, NaiveTime), DayInfo>> =
-            HashMap::new();
-        for ((driver_cd, date, st), agg) in day_map.iter() {
-            if agg.segments.is_empty() {
-                continue;
+    for (driver_cd, dates_map) in &driver_days {
+        let dates: Vec<(NaiveDate, NaiveTime)> = dates_map.keys().copied().collect();
+        let mut effective_start: Option<NaiveDateTime> = None;
+        let mut prev_end: Option<NaiveDateTime> = None;
+        let mut next_day_deduction: Option<(i32, i32, i32, i32)> = None;
+        let mut split_rests: Vec<i32> = Vec::new();
+        let mut forced_next_reset = false;
+
+        for (idx, &(date, st)) in dates.iter().enumerate() {
+            let info = &dates_map[&(date, st)];
+
+            if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) =
+                next_day_deduction.take()
+            {
+                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
+                    agg.drive_minutes = (agg.drive_minutes - ded_drive).max(0);
+                    agg.cargo_minutes = (agg.cargo_minutes - ded_cargo).max(0);
+                    agg.total_work_minutes = (agg.total_work_minutes - ded_restraint).max(0);
+                    agg.late_night_minutes = (agg.late_night_minutes - ded_night).max(0);
+                }
             }
-            let start = trunc_min(agg.segments.iter().map(|s| s.start_at).min().unwrap());
-            let end = trunc_min(agg.segments.iter().map(|s| s.end_at).max().unwrap());
-            driver_days.entry(driver_cd.clone()).or_default().insert(
-                (*date, *st),
-                DayInfo {
-                    start,
-                    end,
-                    unko_nos: agg.unko_nos.clone(),
-                },
-            );
-        }
 
-        for (driver_cd, dates_map) in &driver_days {
-            let dates: Vec<(NaiveDate, NaiveTime)> = dates_map.keys().copied().collect();
-            let mut effective_start: Option<NaiveDateTime> = None;
-            let mut prev_end: Option<NaiveDateTime> = None;
-            let mut next_day_deduction: Option<(i32, i32, i32, i32)> = None;
-            let mut split_rests: Vec<i32> = Vec::new();
-
-            let mut forced_next_reset = false;
-
-            for (idx, &(date, st)) in dates.iter().enumerate() {
-                let info = &dates_map[&(date, st)];
-
-                // deductionは先に適用（resetで消される前に）
-                if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) =
-                    next_day_deduction.take()
-                {
-                    if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
-                        agg.drive_minutes = (agg.drive_minutes - ded_drive).max(0);
-                        agg.cargo_minutes = (agg.cargo_minutes - ded_cargo).max(0);
-                        agg.total_work_minutes = (agg.total_work_minutes - ded_restraint).max(0);
-                        agg.late_night_minutes = (agg.late_night_minutes - ded_night).max(0);
-                    }
-                }
-
-                let reset = match prev_end {
-                    Some(pe) => (info.start - pe).num_minutes() >= 480,
-                    None => true,
-                } || forced_next_reset;
-                forced_next_reset = false;
-                if reset {
-                    let key = (driver_cd.clone(), date, st);
-                    if let Some(&(wb_start, _)) = workday_boundaries.get(&key) {
-                        // merge由来の24h境界がある → chain最終日
-                        // effective_startは24h境界から（window計算に使用）
-                        effective_start = Some(wb_start);
-                        // endは実際のsegment endに更新
-                        let seg_end = day_map
-                            .get(&key)
-                            .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
-                            .unwrap_or(info.end);
-                        workday_boundaries.insert(key, (wb_start, seg_end));
-                    } else {
-                        effective_start = Some(info.start);
-                    }
+            let reset = match prev_end {
+                Some(pe) => (info.start - pe).num_minutes() >= 480,
+                None => true,
+            } || forced_next_reset;
+            forced_next_reset = false;
+            if reset {
+                let key = (driver_cd.clone(), date, st);
+                if let Some(&(wb_start, _)) = workday_boundaries.get(&key) {
+                    effective_start = Some(wb_start);
+                    let seg_end = day_map
+                        .get(&key)
+                        .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
+                        .unwrap_or(info.end);
+                    workday_boundaries.insert(key, (wb_start, seg_end));
                 } else {
-                    effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
+                    effective_start = Some(info.start);
                 }
+            } else {
+                effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
+            }
 
-                let mut window_end = effective_start.unwrap() + chrono::Duration::hours(24);
+            let mut window_end = effective_start.unwrap() + chrono::Duration::hours(24);
 
-                if idx + 1 < dates.len() {
-                    let (next_date, next_st) = dates[idx + 1];
-                    let next_info = &dates_map[&(next_date, next_st)];
+            if idx + 1 < dates.len() {
+                let (next_date, next_st) = dates[idx + 1];
+                let next_info = &dates_map[&(next_date, next_st)];
 
-                    let mut ol_drive = 0i32;
-                    let mut ol_cargo = 0i32;
-                    let mut ol_restraint = 0i32;
-                    let mut ol_late_night_dc = 0i32; // Drive/Cargoのみの深夜時間
-                    let mut ol_work_events: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
+                let mut ol_drive = 0i32;
+                let mut ol_cargo = 0i32;
+                let mut ol_restraint = 0i32;
+                let mut ol_late_night_dc = 0i32;
+                let mut ol_work_events: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
 
-                    for unko_no in &next_info.unko_nos {
-                        if let Some(events) = kudgivt_by_unko.get(unko_no) {
-                            for evt in events {
-                                let cls = classifications.get(&evt.event_cd);
-                                let dur = evt.duration_minutes.unwrap_or(0);
-                                if dur <= 0 {
-                                    continue;
+                for unko_no in &next_info.unko_nos {
+                    if let Some(events) = kudgivt_by_unko.get(unko_no) {
+                        for evt in events {
+                            let cls = classifications.get(&evt.event_cd);
+                            let dur = evt.duration_minutes.unwrap_or(0);
+                            if dur <= 0 {
+                                continue;
+                            }
+                            let evt_start = trunc_min(evt.start_at);
+                            if evt_start >= window_end {
+                                continue;
+                            }
+                            let evt_end = evt_start + chrono::Duration::minutes(dur as i64);
+                            if evt_end <= info.end {
+                                continue;
+                            }
+                            if evt_start < info.end {
+                                continue;
+                            }
+                            let overlap_start = evt_start.max(next_info.start);
+                            let effective_end = evt_end.min(window_end);
+                            if effective_end <= overlap_start {
+                                continue;
+                            }
+                            let mins = (effective_end - overlap_start).num_minutes() as i32;
+                            if mins <= 0 {
+                                continue;
+                            }
+                            let actual_dur = if mins >= dur { dur } else { mins };
+                            match cls {
+                                Some(EventClass::Drive) => {
+                                    ol_drive += actual_dur;
+                                    ol_late_night_dc +=
+                                        calc_late_night_mins(overlap_start, effective_end);
+                                    ol_work_events.push((overlap_start, effective_end));
                                 }
-                                let evt_start = trunc_min(evt.start_at);
-                                if evt_start >= window_end {
-                                    continue;
+                                Some(EventClass::Cargo) => {
+                                    ol_cargo += actual_dur;
+                                    ol_late_night_dc +=
+                                        calc_late_night_mins(overlap_start, effective_end);
+                                    ol_work_events.push((overlap_start, effective_end));
                                 }
-                                let evt_end = evt_start + chrono::Duration::minutes(dur as i64);
-                                if evt_end <= info.end {
-                                    continue;
-                                }
-                                if evt_start < info.end {
-                                    continue;
-                                }
-                                let overlap_start = evt_start.max(next_info.start);
-                                let effective_end = evt_end.min(window_end);
-                                if effective_end <= overlap_start {
-                                    continue;
-                                }
-                                let mins = (effective_end - overlap_start).num_minutes() as i32;
-                                if mins <= 0 {
-                                    continue;
-                                }
-                                let actual_dur = if mins >= dur { dur } else { mins };
-                                match cls {
-                                    Some(EventClass::Drive) => {
-                                        ol_drive += actual_dur;
-                                        ol_late_night_dc +=
-                                            calc_late_night_mins(overlap_start, effective_end);
-                                        ol_work_events.push((overlap_start, effective_end));
-                                    }
-                                    Some(EventClass::Cargo) => {
-                                        ol_cargo += actual_dur;
-                                        ol_late_night_dc +=
-                                            calc_late_night_mins(overlap_start, effective_end);
-                                        ol_work_events.push((overlap_start, effective_end));
-                                    }
-                                    _ => {}
-                                }
+                                _ => {}
                             }
                         }
                     }
+                }
 
-                    if next_info.start < window_end {
-                        let restraint_end = day_map
-                            .get(&(driver_cd.clone(), next_date, next_st))
-                            .map(|next_agg| {
-                                next_agg
-                                    .segments
-                                    .iter()
-                                    .filter(|s| trunc_min(s.start_at) < window_end)
-                                    .map(|s| trunc_min(s.end_at).min(window_end))
-                                    .max()
-                                    .unwrap_or(window_end)
-                            })
-                            .unwrap_or(window_end);
-                        if restraint_end > next_info.start {
-                            ol_restraint = (restraint_end - next_info.start).num_minutes() as i32;
-                        }
+                if next_info.start < window_end {
+                    let restraint_end = day_map
+                        .get(&(driver_cd.clone(), next_date, next_st))
+                        .map(|next_agg| {
+                            next_agg
+                                .segments
+                                .iter()
+                                .filter(|s| trunc_min(s.start_at) < window_end)
+                                .map(|s| trunc_min(s.end_at).min(window_end))
+                                .max()
+                                .unwrap_or(window_end)
+                        })
+                        .unwrap_or(window_end);
+                    if restraint_end > next_info.start {
+                        ol_restraint = (restraint_end - next_info.start).num_minutes() as i32;
                     }
+                }
 
-                    let next_gap = (next_info.start - info.end).num_minutes();
-                    // 長距離判定: 現在or次のエントリの運行が日跨ぎ（宿泊伴う）なら480（例外）、
-                    // それ以外は540（原則）
-                    let is_long_distance = info
-                        .unko_nos
-                        .iter()
-                        .chain(next_info.unko_nos.iter())
-                        .any(|u| long_distance_unkos.contains(u.as_str()));
-                    let rest_threshold = if is_long_distance { 480 } else { 540 };
-                    let mut next_resets = next_gap >= rest_threshold;
-                    // 分割特例: 180分以上の休息を蓄積して判定
-                    if !next_resets && next_gap >= 180 {
-                        split_rests.push(next_gap as i32);
-                        let total: i32 = split_rests.iter().sum();
-                        let threshold = match split_rests.len() {
-                            2 => 600,
-                            n if n >= 3 => 720,
-                            _ => i32::MAX,
-                        };
-                        if total >= threshold {
-                            next_resets = true;
-                            split_rests.clear();
-                        }
-                    } else if next_resets {
+                let next_gap = (next_info.start - info.end).num_minutes();
+                let is_long_distance = info
+                    .unko_nos
+                    .iter()
+                    .chain(next_info.unko_nos.iter())
+                    .any(|u| long_distance_unkos.contains(u.as_str()));
+                let rest_threshold = if is_long_distance { 480 } else { 540 };
+                let mut next_resets = next_gap >= rest_threshold;
+                if !next_resets && next_gap >= 180 {
+                    split_rests.push(next_gap as i32);
+                    let total: i32 = split_rests.iter().sum();
+                    let threshold = match split_rests.len() {
+                        2 => 600,
+                        n if n >= 3 => 720,
+                        _ => i32::MAX,
+                    };
+                    if total >= threshold {
+                        next_resets = true;
                         split_rests.clear();
                     }
+                } else if next_resets {
+                    split_rests.clear();
+                }
 
-                    // determine_workdaysが複数workdayを生成し、
-                    // 24h境界より前に終業を設定している場合はchainしない
-                    // (determine_workdays由来のオリジナルwb.endで判定)
-                    if !next_resets {
-                        let key = (driver_cd.clone(), date, st);
-                        if let Some(&det_end) = multi_wd_boundaries.get(&key) {
-                            if det_end < window_end {
-                                next_resets = true;
-                                split_rests.clear();
-                                forced_next_reset = true;
-                                // workday実終了でwindow_endをクランプ
-                                // （24hチェーンのwindowが実workdayを超えないように）
-                                window_end = det_end;
-                            }
+                if !next_resets {
+                    let key = (driver_cd.clone(), date, st);
+                    if let Some(&det_end) = multi_wd_boundaries.get(&key) {
+                        if det_end < window_end {
+                            next_resets = true;
+                            split_rests.clear();
+                            forced_next_reset = true;
+                            window_end = det_end;
                         }
                     }
+                }
 
-                    // 同日かつ長めのgap(≥180分)は重複表示（24h境界の分割）
-                    let same_date_long_gap = date == next_date && next_gap >= 180;
-                    if !next_resets && ol_restraint > 0 && !same_date_long_gap {
+                let same_date_long_gap = date == next_date && next_gap >= 180;
+                if !next_resets && ol_restraint > 0 && !same_date_long_gap {
+                    if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
+                        agg.drive_minutes += ol_drive;
+                        agg.cargo_minutes += ol_cargo;
+                        agg.total_work_minutes += ol_restraint;
+                        agg.late_night_minutes += ol_late_night_dc;
+                    }
+                    if !ol_work_events.is_empty() {
+                        let events_entry = day_work_events
+                            .entry((driver_cd.clone(), date, st))
+                            .or_default();
+                        events_entry.extend(ol_work_events);
+                        let mut sorted = events_entry.clone();
+                        sorted.sort_by_key(|&(s, _)| s);
+                        let ot_night = calc_ot_late_night_from_events(&sorted);
                         if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
-                            agg.drive_minutes += ol_drive;
-                            agg.cargo_minutes += ol_cargo;
-                            agg.total_work_minutes += ol_restraint;
-                            agg.late_night_minutes += ol_late_night_dc;
+                            agg.ot_late_night_minutes = ot_night;
                         }
-                        // overlapのDrive/Cargoイベントをday_work_eventsに追加してot_late_night再計算
-                        if !ol_work_events.is_empty() {
-                            let events_entry = day_work_events
-                                .entry((driver_cd.clone(), date, st))
-                                .or_default();
-                            events_entry.extend(ol_work_events);
-                            let mut sorted = events_entry.clone();
-                            sorted.sort_by_key(|&(s, _)| s);
-                            let ot_night = calc_ot_late_night_from_events(&sorted);
-                            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
-                                agg.ot_late_night_minutes = ot_night;
-                            }
-                        }
-                        next_day_deduction =
-                            Some((ol_drive, ol_cargo, ol_restraint, ol_late_night_dc));
-                        // 24h境界表示: merge時にworkday_boundariesを更新
-                        let eff_start = effective_start.unwrap();
-                        // 現在エントリ: start=effective_start, end=window_end(24h境界)
-                        workday_boundaries
-                            .insert((driver_cd.clone(), date, st), (eff_start, window_end));
-                        // 次エントリ: start=window_end(24h境界), end=実際のsegment終了
-                        // (chain最終日はendが実際の時刻で表示される)
-                        let next_key = (driver_cd.clone(), next_date, next_st);
-                        let next_seg_end = day_map
-                            .get(&next_key)
-                            .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
-                            .unwrap_or(window_end + chrono::Duration::hours(24));
-                        let next_end = next_seg_end;
-                        workday_boundaries.insert(next_key, (window_end, next_end));
-                    } else if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
-                        // 非chain(next_resets): overlap windowにフェリーがあれば控除
-                        let mut ferry_ded = 0i32;
-                        let mut ferry_drive_ded = 0i32;
-                        let mut ferry_cargo_ded = 0i32;
-                        for unko in &next_info.unko_nos {
-                            if let Some(periods) = ferry_info.ferry_period_map.get(unko) {
-                                if let Some(events) = kudgivt_by_unko.get(unko) {
-                                    for &(fs, fe) in periods {
-                                        if fe > next_info.start && fs < window_end {
-                                            let break_ded = ferry_break_overlap(events, fs, fe);
-                                            if break_ded > 0 {
-                                                ferry_ded += break_ded;
-                                            } else {
-                                                let f_start = fs.max(next_info.start);
-                                                let f_end = fe.min(window_end);
-                                                let f_mins = (f_end - f_start).num_minutes() as i32;
-                                                if f_mins > 0 {
-                                                    ferry_ded += f_mins;
-                                                    let (d, c) = ferry_drive_cargo_overlap(
-                                                        events, classifications, fs, fe,
-                                                    );
-                                                    ferry_drive_ded += d;
-                                                    ferry_cargo_ded += c;
-                                                }
+                    }
+                    next_day_deduction =
+                        Some((ol_drive, ol_cargo, ol_restraint, ol_late_night_dc));
+                    let eff_start = effective_start.unwrap();
+                    workday_boundaries
+                        .insert((driver_cd.clone(), date, st), (eff_start, window_end));
+                    let next_key = (driver_cd.clone(), next_date, next_st);
+                    let next_seg_end = day_map
+                        .get(&next_key)
+                        .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
+                        .unwrap_or(window_end + chrono::Duration::hours(24));
+                    workday_boundaries.insert(next_key, (window_end, next_seg_end));
+                } else if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
+                    let mut ferry_ded = 0i32;
+                    let mut ferry_drive_ded = 0i32;
+                    let mut ferry_cargo_ded = 0i32;
+                    for unko in &next_info.unko_nos {
+                        if let Some(periods) = ferry_info.ferry_period_map.get(unko) {
+                            if let Some(events) = kudgivt_by_unko.get(unko) {
+                                for &(fs, fe) in periods {
+                                    if fe > next_info.start && fs < window_end {
+                                        let break_ded = ferry_break_overlap(events, fs, fe);
+                                        if break_ded > 0 {
+                                            ferry_ded += break_ded;
+                                        } else {
+                                            let f_start = fs.max(next_info.start);
+                                            let f_end = fe.min(window_end);
+                                            let f_mins = (f_end - f_start).num_minutes() as i32;
+                                            if f_mins > 0 {
+                                                ferry_ded += f_mins;
+                                                let (d, c) = ferry_drive_cargo_overlap(
+                                                    events, classifications, fs, fe,
+                                                );
+                                                ferry_drive_ded += d;
+                                                ferry_cargo_ded += c;
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                        let adj_restraint = (ol_restraint - ferry_ded).max(0);
-                        let adj_drive = (ol_drive - ferry_drive_ded).max(0);
-                        let adj_cargo = (ol_cargo - ferry_cargo_ded).max(0);
-                        agg.overlap_drive_minutes = adj_drive;
-                        agg.overlap_cargo_minutes = adj_cargo;
-                        agg.overlap_break_minutes = (adj_restraint - adj_drive - adj_cargo).max(0);
-                        agg.overlap_restraint_minutes = adj_restraint;
                     }
+                    let adj_restraint = (ol_restraint - ferry_ded).max(0);
+                    let adj_drive = (ol_drive - ferry_drive_ded).max(0);
+                    let adj_cargo = (ol_cargo - ferry_cargo_ded).max(0);
+                    agg.overlap_drive_minutes = adj_drive;
+                    agg.overlap_cargo_minutes = adj_cargo;
+                    agg.overlap_break_minutes = (adj_restraint - adj_drive - adj_cargo).max(0);
+                    agg.overlap_restraint_minutes = adj_restraint;
                 }
-
-                prev_end = Some(info.end);
             }
+
+            prev_end = Some(info.end);
         }
     }
+}
 
-    // ---- フェリー控除 ----
-    // day_mapエントリのセグメント時間範囲と重なるフェリーのみ控除
+/// フェリー控除: day_mapエントリのセグメント時間範囲と重なるフェリーのみ控除
+fn apply_ferry_deductions(
+    day_map: &mut HashMap<DayKey, DayAgg>,
+    kudgivt_by_unko: &HashMap<String, Vec<&KudgivtRow>>,
+    classifications: &HashMap<String, EventClass>,
+    ferry_info: &FerryInfo,
+) {
     for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
         let seg_start = agg.segments.iter().map(|s| s.start_at).min();
         let seg_end = agg.segments.iter().map(|s| s.end_at).max();
@@ -1437,12 +1403,12 @@ pub fn post_process_day_map(
 }
 
 pub struct BuildDayMapResult {
-    pub day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg>,
-    pub workday_boundaries: HashMap<(String, NaiveDate, NaiveTime), (NaiveDateTime, NaiveDateTime)>,
+    pub day_map: HashMap<DayKey, DayAgg>,
+    pub workday_boundaries: HashMap<DayKey, (NaiveDateTime, NaiveDateTime)>,
     /// determine_workdaysが複数workdayを生成した場合の、オリジナルのwd.end
-    pub multi_wd_boundaries: HashMap<(String, NaiveDate, NaiveTime), NaiveDateTime>,
+    pub multi_wd_boundaries: HashMap<DayKey, NaiveDateTime>,
     pub day_work_events:
-        HashMap<(String, NaiveDate, NaiveTime), Vec<(NaiveDateTime, NaiveDateTime)>>,
+        HashMap<DayKey, Vec<(NaiveDateTime, NaiveDateTime)>>,
     /// カレンダー日ベースの全拘束時間（分）: (driver_cd, date) → minutes
     pub calendar_day_total: HashMap<(String, NaiveDate), i32>,
 }
@@ -1454,15 +1420,12 @@ pub fn build_day_map(
 ) -> BuildDayMapResult {
     let unko_work_date = group_operations_into_work_days(kudguri_rows);
 
-    let mut workday_boundaries: HashMap<
-        (String, NaiveDate, NaiveTime),
-        (NaiveDateTime, NaiveDateTime),
-    > = HashMap::new();
+    let mut workday_boundaries: HashMap<DayKey, (NaiveDateTime, NaiveDateTime)> = HashMap::new();
     // determine_workdaysが複数workdayを生成した境界（分割休息/24h境界等）
     // overlap計算でのchain上書きを防止するために使用
-    let mut multi_wd_boundaries: HashMap<(String, NaiveDate, NaiveTime), NaiveDateTime> =
+    let mut multi_wd_boundaries: HashMap<DayKey, NaiveDateTime> =
         HashMap::new();
-    let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+    let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
     let mut unko_segments: HashMap<
         String,
         Vec<(NaiveDateTime, NaiveDateTime, NaiveDate, NaiveTime)>,
@@ -1778,185 +1741,13 @@ pub fn build_day_map(
         }
     }
 
-    // ot_late_night計算用: ドライバー×日のDrive/Cargoイベント時刻リスト
-    let mut day_work_events: HashMap<
-        (String, NaiveDate, NaiveTime),
-        Vec<(NaiveDateTime, NaiveDateTime)>,
-    > = HashMap::new();
-
-    // カレンダー日ベースの全拘束時間（重複小計=合計-小計の計算用）
-    let mut calendar_day_total: HashMap<(String, NaiveDate), i32> = HashMap::new();
-
-    // ---- イベント直接集計（秒単位→分変換） ----
-    {
-        let mut driver_unko_map: HashMap<String, Vec<String>> = HashMap::new();
-        for ((driver_cd, _, _), agg) in &day_map {
-            let entry = driver_unko_map.entry(driver_cd.clone()).or_default();
-            for u in &agg.unko_nos {
-                if !entry.contains(u) {
-                    entry.push(u.clone());
-                }
-            }
-        }
-
-        for (driver_cd, unko_nos) in &driver_unko_map {
-            // day_mapの既存エントリを0初期化（segment pro-rata値をevent実値で上書きするため）
-            let mut day_drive_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
-            let mut day_cargo_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
-            let mut day_break_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
-            for ((dc, date, st), _) in day_map.iter() {
-                if dc == driver_cd {
-                    day_drive_secs.entry((*date, *st)).or_insert(0);
-                    day_cargo_secs.entry((*date, *st)).or_insert(0);
-                    day_break_secs.entry((*date, *st)).or_insert(0);
-                }
-            }
-            let mut day_late_night: HashMap<(NaiveDate, NaiveTime), i32> = HashMap::new();
-            // カレンダー日ベースの全拘束時間（重複小計=合計-小計の計算用）
-            let mut calendar_day_secs: HashMap<NaiveDate, i64> = HashMap::new();
-
-            for unko_no in unko_nos {
-                if let Some(events) = kudgivt_by_unko.get(unko_no) {
-                    let boundary_opt = multi_op_boundaries.get(unko_no);
-
-                    for evt in events {
-                        let dur = evt.duration_minutes.unwrap_or(0);
-                        if dur <= 0 {
-                            continue;
-                        }
-
-                        let evt_start_trunc = trunc_min(evt.start_at);
-                        let evt_end = evt_start_trunc + chrono::Duration::minutes(dur as i64);
-
-                        let parts = split_event_at_boundaries(
-                            evt_start_trunc,
-                            evt_end,
-                            dur as i64 * 60,
-                            boundary_opt,
-                        );
-
-                        for (part_start, part_end, part_secs) in &parts {
-                            let seg_list = unko_segments.get(unko_no);
-                            let (event_date, event_start_time) =
-                                find_event_workday(*part_start, seg_list);
-
-                            let cls = classifications.get(&evt.event_cd);
-                            match cls {
-                                Some(EventClass::Drive) => {
-                                    *day_drive_secs
-                                        .entry((event_date, event_start_time))
-                                        .or_insert(0) += part_secs;
-                                }
-                                Some(EventClass::Cargo) => {
-                                    *day_cargo_secs
-                                        .entry((event_date, event_start_time))
-                                        .or_insert(0) += part_secs;
-                                }
-                                Some(EventClass::Break) => {
-                                    *day_break_secs
-                                        .entry((event_date, event_start_time))
-                                        .or_insert(0) += part_secs;
-                                }
-                                _ => {}
-                            }
-                            // カレンダー日ベース集計（Drive/Cargo/Break）
-                            match cls {
-                                Some(EventClass::Drive)
-                                | Some(EventClass::Cargo)
-                                | Some(EventClass::Break) => {
-                                    // 日跨ぎeventはカレンダー日で按分
-                                    let cal_date = part_start.date();
-                                    let next_midnight = (cal_date + chrono::Duration::days(1))
-                                        .and_hms_opt(0, 0, 0)
-                                        .unwrap();
-                                    if *part_end <= next_midnight {
-                                        *calendar_day_secs.entry(cal_date).or_insert(0) +=
-                                            part_secs;
-                                    } else {
-                                        let before = (next_midnight - *part_start).num_seconds();
-                                        let after = (*part_end - next_midnight).num_seconds();
-                                        *calendar_day_secs.entry(cal_date).or_insert(0) += before;
-                                        *calendar_day_secs
-                                            .entry(cal_date + chrono::Duration::days(1))
-                                            .or_insert(0) += after;
-                                    }
-                                }
-                                _ => {}
-                            }
-                            match cls {
-                                Some(EventClass::Drive) | Some(EventClass::Cargo) => {
-                                    let night = calc_late_night_mins(*part_start, *part_end);
-                                    if night > 0 {
-                                        *day_late_night
-                                            .entry((event_date, event_start_time))
-                                            .or_insert(0) += night;
-                                    }
-                                    day_work_events
-                                        .entry((driver_cd.clone(), event_date, event_start_time))
-                                        .or_default()
-                                        .push((*part_start, *part_end));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-
-            for ((date, st), secs) in &day_drive_secs {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    agg.drive_minutes = ((*secs + 30) / 60) as i32;
-                }
-            }
-            for ((date, st), secs) in &day_cargo_secs {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    agg.cargo_minutes = ((*secs + 30) / 60) as i32;
-                }
-            }
-            for ((date, st), _) in day_drive_secs
-                .iter()
-                .chain(day_cargo_secs.iter())
-                .chain(day_break_secs.iter())
-            {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    let d = day_drive_secs.get(&(*date, *st)).copied().unwrap_or(0);
-                    let c = day_cargo_secs.get(&(*date, *st)).copied().unwrap_or(0);
-                    let b = day_break_secs.get(&(*date, *st)).copied().unwrap_or(0);
-                    agg.total_work_minutes = ((d + c + b + 30) / 60) as i32;
-                }
-            }
-            for ((date, st), night) in &day_late_night {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    agg.late_night_minutes = *night;
-                }
-            }
-            for ((dc, _date, _st), agg) in day_map.iter_mut() {
-                if dc == driver_cd && !day_late_night.contains_key(&(*_date, *_st)) {
-                    agg.late_night_minutes = 0;
-                }
-            }
-            // ot_late_night（実働ベース: 累計Drive/Cargo 480分到達後の深夜時間）
-            for ((date, st), _night) in &day_late_night {
-                if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
-                    let ot_night = if let Some(events) =
-                        day_work_events.get(&(driver_cd.clone(), *date, *st))
-                    {
-                        let mut sorted = events.clone();
-                        sorted.sort_by_key(|&(s, _)| s);
-                        calc_ot_late_night_from_events(&sorted)
-                    } else {
-                        0
-                    };
-                    agg.ot_late_night_minutes = ot_night;
-                }
-            }
-            // calendar_day_secsをcalendar_day_totalに集約
-            for (date, secs) in &calendar_day_secs {
-                let mins = ((*secs + 30) / 60) as i32;
-                calendar_day_total.insert((driver_cd.clone(), *date), mins);
-            }
-        }
-    }
+    let (day_work_events, calendar_day_total) = aggregate_events_by_day(
+        &mut day_map,
+        &unko_segments,
+        &multi_op_boundaries,
+        kudgivt_by_unko,
+        classifications,
+    );
 
     BuildDayMapResult {
         day_map,
@@ -1965,6 +1756,184 @@ pub fn build_day_map(
         day_work_events,
         calendar_day_total,
     }
+}
+
+/// イベント直接集計: KUDGIVTイベントからDrive/Cargo/Break秒数を集計してday_mapを上書き
+fn aggregate_events_by_day<'a>(
+    day_map: &mut HashMap<DayKey, DayAgg>,
+    unko_segments: &HashMap<String, Vec<(NaiveDateTime, NaiveDateTime, NaiveDate, NaiveTime)>>,
+    multi_op_boundaries: &HashMap<String, Vec<NaiveDateTime>>,
+    kudgivt_by_unko: &'a HashMap<String, Vec<&'a KudgivtRow>>,
+    classifications: &HashMap<String, EventClass>,
+) -> (
+    HashMap<DayKey, Vec<(NaiveDateTime, NaiveDateTime)>>,
+    HashMap<(String, NaiveDate), i32>,
+) {
+    let mut day_work_events: HashMap<DayKey, Vec<(NaiveDateTime, NaiveDateTime)>> = HashMap::new();
+    let mut calendar_day_total: HashMap<(String, NaiveDate), i32> = HashMap::new();
+
+    let mut driver_unko_map: HashMap<String, Vec<String>> = HashMap::new();
+    for ((driver_cd, _, _), agg) in day_map.iter() {
+        let entry = driver_unko_map.entry(driver_cd.clone()).or_default();
+        for u in &agg.unko_nos {
+            if !entry.contains(u) {
+                entry.push(u.clone());
+            }
+        }
+    }
+
+    for (driver_cd, unko_nos) in &driver_unko_map {
+        let mut day_drive_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
+        let mut day_cargo_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
+        let mut day_break_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
+        for ((dc, date, st), _) in day_map.iter() {
+            if dc == driver_cd {
+                day_drive_secs.entry((*date, *st)).or_insert(0);
+                day_cargo_secs.entry((*date, *st)).or_insert(0);
+                day_break_secs.entry((*date, *st)).or_insert(0);
+            }
+        }
+        let mut day_late_night: HashMap<(NaiveDate, NaiveTime), i32> = HashMap::new();
+        let mut calendar_day_secs: HashMap<NaiveDate, i64> = HashMap::new();
+
+        for unko_no in unko_nos {
+            if let Some(events) = kudgivt_by_unko.get(unko_no) {
+                let boundary_opt = multi_op_boundaries.get(unko_no);
+
+                for evt in events {
+                    let dur = evt.duration_minutes.unwrap_or(0);
+                    if dur <= 0 {
+                        continue;
+                    }
+
+                    let evt_start_trunc = trunc_min(evt.start_at);
+                    let evt_end = evt_start_trunc + chrono::Duration::minutes(dur as i64);
+
+                    let parts = split_event_at_boundaries(
+                        evt_start_trunc,
+                        evt_end,
+                        dur as i64 * 60,
+                        boundary_opt,
+                    );
+
+                    for (part_start, part_end, part_secs) in &parts {
+                        let seg_list = unko_segments.get(unko_no);
+                        let (event_date, event_start_time) =
+                            find_event_workday(*part_start, seg_list);
+
+                        let cls = classifications.get(&evt.event_cd);
+                        match cls {
+                            Some(EventClass::Drive) => {
+                                *day_drive_secs
+                                    .entry((event_date, event_start_time))
+                                    .or_insert(0) += part_secs;
+                            }
+                            Some(EventClass::Cargo) => {
+                                *day_cargo_secs
+                                    .entry((event_date, event_start_time))
+                                    .or_insert(0) += part_secs;
+                            }
+                            Some(EventClass::Break) => {
+                                *day_break_secs
+                                    .entry((event_date, event_start_time))
+                                    .or_insert(0) += part_secs;
+                            }
+                            _ => {}
+                        }
+                        match cls {
+                            Some(EventClass::Drive)
+                            | Some(EventClass::Cargo)
+                            | Some(EventClass::Break) => {
+                                let cal_date = part_start.date();
+                                let next_midnight = (cal_date + chrono::Duration::days(1))
+                                    .and_hms_opt(0, 0, 0)
+                                    .unwrap();
+                                if *part_end <= next_midnight {
+                                    *calendar_day_secs.entry(cal_date).or_insert(0) += part_secs;
+                                } else {
+                                    let before = (next_midnight - *part_start).num_seconds();
+                                    let after = (*part_end - next_midnight).num_seconds();
+                                    *calendar_day_secs.entry(cal_date).or_insert(0) += before;
+                                    *calendar_day_secs
+                                        .entry(cal_date + chrono::Duration::days(1))
+                                        .or_insert(0) += after;
+                                }
+                            }
+                            _ => {}
+                        }
+                        match cls {
+                            Some(EventClass::Drive) | Some(EventClass::Cargo) => {
+                                let night = calc_late_night_mins(*part_start, *part_end);
+                                if night > 0 {
+                                    *day_late_night
+                                        .entry((event_date, event_start_time))
+                                        .or_insert(0) += night;
+                                }
+                                day_work_events
+                                    .entry((driver_cd.clone(), event_date, event_start_time))
+                                    .or_default()
+                                    .push((*part_start, *part_end));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        for ((date, st), secs) in &day_drive_secs {
+            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
+                agg.drive_minutes = ((*secs + 30) / 60) as i32;
+            }
+        }
+        for ((date, st), secs) in &day_cargo_secs {
+            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
+                agg.cargo_minutes = ((*secs + 30) / 60) as i32;
+            }
+        }
+        for ((date, st), _) in day_drive_secs
+            .iter()
+            .chain(day_cargo_secs.iter())
+            .chain(day_break_secs.iter())
+        {
+            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
+                let d = day_drive_secs.get(&(*date, *st)).copied().unwrap_or(0);
+                let c = day_cargo_secs.get(&(*date, *st)).copied().unwrap_or(0);
+                let b = day_break_secs.get(&(*date, *st)).copied().unwrap_or(0);
+                agg.total_work_minutes = ((d + c + b + 30) / 60) as i32;
+            }
+        }
+        for ((date, st), night) in &day_late_night {
+            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
+                agg.late_night_minutes = *night;
+            }
+        }
+        for ((dc, _date, _st), agg) in day_map.iter_mut() {
+            if dc == driver_cd && !day_late_night.contains_key(&(*_date, *_st)) {
+                agg.late_night_minutes = 0;
+            }
+        }
+        for ((date, st), _night) in &day_late_night {
+            if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), *date, *st)) {
+                let ot_night = if let Some(events) =
+                    day_work_events.get(&(driver_cd.clone(), *date, *st))
+                {
+                    let mut sorted = events.clone();
+                    sorted.sort_by_key(|&(s, _)| s);
+                    calc_ot_late_night_from_events(&sorted)
+                } else {
+                    0
+                };
+                agg.ot_late_night_minutes = ot_night;
+            }
+        }
+        for (date, secs) in &calendar_day_secs {
+            let mins = ((*secs + 30) / 60) as i32;
+            calendar_day_total.insert((driver_cd.clone(), *date), mins);
+        }
+    }
+
+    (day_work_events, calendar_day_total)
 }
 
 /// ZIPからCsvDriverDataを生成（IOラッパー）
@@ -2041,7 +2010,24 @@ pub fn process_parsed_data(
         ferry_info,
     );
 
-    // ---- CsvDriverData に変換 ----
+    let result = build_csv_driver_data(
+        &day_map,
+        &workday_boundaries,
+        kudguri_rows,
+        target_year,
+        target_month,
+    );
+    Ok(result)
+}
+
+/// day_map + workday_boundaries から CsvDriverData を生成
+fn build_csv_driver_data(
+    day_map: &HashMap<DayKey, DayAgg>,
+    workday_boundaries: &HashMap<DayKey, (NaiveDateTime, NaiveDateTime)>,
+    kudguri_rows: &[KudguriRow],
+    target_year: i32,
+    target_month: u32,
+) -> Vec<CsvDriverData> {
     let mut driver_map: HashMap<String, String> = HashMap::new();
     for row in kudguri_rows {
         driver_map
@@ -2055,6 +2041,10 @@ pub fn process_parsed_data(
     } else {
         NaiveDate::from_ymd_opt(target_year, target_month + 1, 1).unwrap()
     } - chrono::Duration::days(1);
+
+    let fmt_trunc_time = |dt: NaiveDateTime| -> String {
+        format!("{}:{:02}", dt.hour(), dt.minute())
+    };
 
     let mut result = Vec::new();
 
@@ -2115,9 +2105,6 @@ pub fn process_parsed_data(
                     let total_ot = (actual_work - 480).max(0);
                     let overtime = (total_ot - ot_ln).max(0);
 
-                    let fmt_trunc_time = |dt: NaiveDateTime| -> String {
-                        format!("{}:{:02}", dt.hour(), dt.minute())
-                    };
                     let wb = workday_boundaries.get(&(driver_cd.clone(), current_date, *_st));
                     let start_time = wb
                         .map(|(wd_start, _)| fmt_trunc_time(*wd_start))
@@ -2131,8 +2118,6 @@ pub fn process_parsed_data(
                         .unwrap_or_default();
                     let seg_max_end = agg.segments.iter().map(|s| s.end_at).max();
                     let end_time = match (wb, seg_max_end) {
-                        // 日跨ぎworkday: seg_endがwd_endより60分以上前
-                        // → 24h境界等の強制日締めでwd_endが正しい終業
                         (Some((wd_start, wd_end)), Some(seg_end))
                             if wd_start.date() != wd_end.date()
                                 && (*wd_end - seg_end).num_minutes() > 60 =>
@@ -2195,7 +2180,7 @@ pub fn process_parsed_data(
         });
     }
 
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
@@ -2477,7 +2462,7 @@ mod tests {
         let d1 = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
         let t = NaiveTime::from_hms_opt(5, 0, 0).unwrap();
-        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
         // Day1: 5:00→翌3:00 (22h)
         let mut agg1 = DayAgg::default();
         agg1.drive_minutes = 600;
@@ -2532,7 +2517,7 @@ mod tests {
         let d2 = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
         let t1 = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
         let t2 = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
-        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
         let mut agg1 = DayAgg::default();
         agg1.drive_minutes = 300;
         agg1.total_work_minutes = 300;
@@ -2587,7 +2572,7 @@ mod tests {
         let cls = default_classifications();
         let d1 = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
         let t1 = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
-        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
         let mut agg = DayAgg::default();
         agg.drive_minutes = 300;
         agg.total_work_minutes = 400;
@@ -2630,7 +2615,7 @@ mod tests {
         let d2 = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
         let t1 = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
         let t2 = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
-        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
         // Day1: 24h workday
         let mut agg1 = DayAgg::default();
         agg1.drive_minutes = 600;
@@ -2777,7 +2762,7 @@ mod tests {
         let d2 = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
         let t1 = NaiveTime::from_hms_opt(14, 0, 0).unwrap();
         let t2 = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
-        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
         let mut agg1 = DayAgg::default();
         agg1.drive_minutes = 200;
         agg1.total_work_minutes = 250;
@@ -3128,7 +3113,7 @@ mod tests {
         let t1 = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
         let t2 = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
         let t3 = NaiveTime::from_hms_opt(5, 0, 0).unwrap();
-        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
         for (d, t, start_h, end_h) in [
             (d1, t1, 6, 18), (d2, t2, 12, 22), (d3, t3, 5, 15)
         ] {
@@ -3190,7 +3175,7 @@ mod tests {
         let d = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
         let t1 = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
         let t2 = NaiveTime::from_hms_opt(14, 0, 0).unwrap();
-        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
         // 同日2エントリ、異なる運行、gap短い → 構内結合
         let mut a1 = DayAgg::default();
         a1.drive_minutes = 200; a1.total_work_minutes = 200;

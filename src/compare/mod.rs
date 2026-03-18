@@ -339,6 +339,14 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "web地球号バグ: 休息基準未達で終業扱い (#1)",
         cascading: true,
     },
+    // 1068: 2/2 24h分離バグ（連続運行のカード乗換時、運行内休息でshigyo未リセット）
+    KnownBugPattern {
+        driver_cd: "1068",
+        date_contains: "2月2",
+        fields: &["終業", "運転", "重複運転", "小計", "重複小計", "実働", "時間外"],
+        description: "24h分離バグ: 運行内休息でshigyo未リセット (#2)",
+        cascading: false,
+    },
 ];
 
 /// 差分リストに既知バグアノテーションを付与（連鎖差分の自動計算含む）

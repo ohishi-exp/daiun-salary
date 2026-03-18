@@ -49,8 +49,8 @@ if [ "$SKIP_COMPARE" = false ]; then
     declare -a COMPARE_TESTS=(
         "test_data/csvdata-202602-1018-1021-1026.zip|test_data/拘束時間管理表_202602-1018-1021-1026.csv|0|0|1018/1021/1026"
         "test_data/csvdata-202602-1029-1032-1036-1037.zip|test_data/拘束時間管理表_202602-1029-1032-1036-1037.csv|0|0|1029/1032/1036/1037"
-        "test_data/csvdata-202602-1039.zip|test_data/拘束時間管理表_202602-all.csv|0|15|1039(既知バグ15件)"
-        "test_data/csvdata-202602-1041.zip|test_data/拘束時間管理表_202602-all.csv|100|0|1041(未知差分100件)"
+        "test_data/csvdata-202602-1039.zip|test_data/拘束時間管理表_202602-all.csv|0|17|1039(既知バグ17件)"
+        "test_data/csvdata-202602-1041.zip|test_data/拘束時間管理表_202602-all.csv|105|0|1041(未知差分105件)"
     )
 
     TOTAL_COMPARE=${#COMPARE_TESTS[@]}

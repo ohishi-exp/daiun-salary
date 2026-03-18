@@ -339,6 +339,14 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "web地球号バグ: 休息基準未達で終業扱い (#1)",
         cascading: true,
     },
+    // 1049: 2/8 24h境界分割ズレ（split_segments_at_24hがseg基準で始業基準と67分ズレ）
+    KnownBugPattern {
+        driver_cd: "1049",
+        date_contains: "2月8",
+        fields: &["運転", "小計", "合計", "実働", "時間外"],
+        description: "既知: 24h分割がseg基準で始業基準と67分ズレ",
+        cascading: true,
+    },
 ];
 
 /// 差分リストに既知バグアノテーションを付与（連鎖差分の自動計算含む）
@@ -1331,6 +1339,9 @@ pub fn build_day_map(
                         }
                     }
                 }
+                let segments = work_segments::split_segments_at_24h(segments);
+                // workday境界でセグメントを分割（長距離運行の24hルール対応）
+                // 条件: 3日以上スパン、分割後の両パートが60分以上
                 let segments = if span_days >= 3 && workdays.len() >= 2 {
                     let mut segs = segments;
                     for wd in &workdays {
@@ -1348,8 +1359,7 @@ pub fn build_day_map(
                     }
                     segs
                 } else {
-                    // 単一workday: 従来の24h分割
-                    work_segments::split_segments_at_24h(segments)
+                    segments
                 };
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 

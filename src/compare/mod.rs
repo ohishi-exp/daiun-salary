@@ -1117,20 +1117,47 @@ pub fn post_process_day_map(
     }
 
     // ---- フェリー控除 ----
+    // day_mapエントリのセグメント時間範囲と重なるフェリーのみ控除
     for ((_driver_cd, _date, _st), agg) in day_map.iter_mut() {
-        let mut ferry_deduction = 0i32; // KUDGFRY時間（四捨五入）
-        let mut ferry_break_deduction = 0i32; // 対応301イベントのduration
-        let mut ferry_drive_overlap = 0i32; // Drive/Cargoとフェリー期間の実重複
+        let seg_start = agg.segments.iter().map(|s| s.start_at).min();
+        let seg_end = agg.segments.iter().map(|s| s.end_at).max();
+        let (seg_start, seg_end) = match (seg_start, seg_end) {
+            (Some(s), Some(e)) => (s, e),
+            _ => continue,
+        };
+
+        let mut ferry_deduction = 0i32;
+        let mut ferry_break_deduction = 0i32;
+        let mut ferry_drive_overlap = 0i32;
         for unko in &agg.unko_nos {
-            if let Some(&fm) = ferry_info.ferry_minutes.get(unko) {
-                ferry_deduction += fm;
-            }
-            if let Some(&fb) = ferry_info.ferry_break_dur.get(unko) {
-                ferry_break_deduction += fb;
-            }
             if let Some(periods) = ferry_info.ferry_period_map.get(unko) {
-                if let Some(events) = kudgivt_by_unko.get(unko) {
-                    for &(fs, fe) in periods {
+                for &(fs, fe) in periods {
+                    // このday_mapエントリの時間範囲とフェリー期間が重なるか
+                    if fe <= seg_start || fs >= seg_end {
+                        continue; // 重ならない → この日のフェリーではない
+                    }
+                    // フェリー時間（KUDGFRY由来）
+                    let ferry_mins = ((fe - fs).num_seconds() as f64 / 60.0).round() as i32;
+                    ferry_deduction += ferry_mins;
+
+                    // 対応する301イベントのdurationを検索
+                    if let Some(events) = kudgivt_by_unko.get(unko) {
+                        for evt in events {
+                            if evt.event_cd != "301" {
+                                continue;
+                            }
+                            let dur = evt.duration_minutes.unwrap_or(0);
+                            if dur <= 0 {
+                                continue;
+                            }
+                            let es = evt.start_at;
+                            let ee = es + chrono::Duration::minutes(dur as i64);
+                            // フェリー期間と301イベントの重なり判定
+                            if ee > fs && es < fe {
+                                ferry_break_deduction += dur;
+                            }
+                        }
+                        // Drive/Cargoとフェリー期間の実重複
                         for evt in events {
                             match classifications.get(&evt.event_cd) {
                                 Some(EventClass::Drive) | Some(EventClass::Cargo) => {}
@@ -1140,7 +1167,6 @@ pub fn post_process_day_map(
                             if dur <= 0 {
                                 continue;
                             }
-                            // フェリー重複判定は秒精度（trunc_minしない）
                             let es = evt.start_at;
                             let ee = es + chrono::Duration::minutes(dur as i64);
                             let os = es.max(fs);
@@ -1155,10 +1181,8 @@ pub fn post_process_day_map(
             }
         }
         if ferry_deduction > 0 {
-            // drive控除 = 丸め差(ferry-break)と実重複の小さい方
             let rounding_diff = (ferry_deduction - ferry_break_deduction).max(0);
             let drive_ded = rounding_diff.min(ferry_drive_overlap);
-            // total_work控除 = break + drive控除分
             let total_ded = ferry_break_deduction + drive_ded;
             agg.total_work_minutes = (agg.total_work_minutes - total_ded).max(0);
             agg.drive_minutes = (agg.drive_minutes - drive_ded).max(0);

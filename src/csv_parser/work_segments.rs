@@ -354,9 +354,12 @@ pub fn split_segments_at_24h_with_workdays(
     for seg in segments {
         let total_mins = (seg.end - seg.start).num_minutes();
         // workday境界がセグメント内にあれば分割（24h未満でも）
+        // 境界は分単位に切り捨て済みなので、seg側も分単位で比較
+        let seg_start_trunc = seg.start.with_second(0).unwrap_or(seg.start);
+        let seg_end_trunc = seg.end.with_second(0).unwrap_or(seg.end);
         let wd_boundaries: Vec<NaiveDateTime> = workday_ends
             .iter()
-            .filter(|&&b| b > seg.start && b < seg.end)
+            .filter(|&&b| b > seg_start_trunc && b < seg_end_trunc)
             .copied()
             .collect();
         if total_mins <= max_mins && wd_boundaries.is_empty() {

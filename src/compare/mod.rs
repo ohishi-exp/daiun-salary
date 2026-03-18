@@ -2339,6 +2339,46 @@ mod tests {
         assert_eq!(result[1].start, boundary);
     }
 
+    // ---- split_segments_at_24h_with_workdays: workday boundary < 24h ----
+    #[test]
+    fn test_split_segments_at_workday_boundary_under_24h() {
+        // セグメント: 13:05→翌10:01 (20h56min < 24h)
+        // workday境界: 翌8:15
+        // → 境界で分割されるべき
+        let seg = work_segments::WorkSegment {
+            start: dt(2026, 2, 27, 13, 5, 0),
+            end: dt(2026, 2, 28, 10, 1, 0),
+            labor_minutes: 600,
+            drive_minutes: 500,
+            cargo_minutes: 100,
+        };
+        let wd_ends = vec![dt(2026, 2, 28, 8, 15, 0)];
+        let result = work_segments::split_segments_at_24h_with_workdays(vec![seg], &wd_ends);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start, dt(2026, 2, 27, 13, 5, 0));
+        assert_eq!(result[0].end, dt(2026, 2, 28, 8, 15, 0));
+        assert_eq!(result[1].start, dt(2026, 2, 28, 8, 15, 0));
+        assert_eq!(result[1].end, dt(2026, 2, 28, 10, 1, 0));
+        // pro-rata: 前半(1150min)/全体(1256min) ≈ 91.6%
+        assert!(result[0].drive_minutes > result[1].drive_minutes);
+        assert_eq!(result[0].drive_minutes + result[1].drive_minutes, 500);
+    }
+
+    #[test]
+    fn test_split_segments_no_workday_boundary_under_24h() {
+        // セグメント < 24h, workday境界なし → 分割しない
+        let seg = work_segments::WorkSegment {
+            start: dt(2026, 2, 27, 13, 5, 0),
+            end: dt(2026, 2, 28, 10, 1, 0),
+            labor_minutes: 600,
+            drive_minutes: 500,
+            cargo_minutes: 100,
+        };
+        let result = work_segments::split_segments_at_24h_with_workdays(vec![seg], &[]);
+        assert_eq!(result.len(), 1);
+    }
+
     // ---- group_operations_into_work_days ----
     #[test]
     fn test_group_ops_single_run() {

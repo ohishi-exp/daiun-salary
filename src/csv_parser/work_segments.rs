@@ -83,8 +83,13 @@ pub fn determine_workdays(
             continue;
         }
 
-        // 原則: 連続540分以上 / 長距離例外: 480分以上
-        let threshold = if is_long_distance {
+        // 原則: 連続540分以上
+        // 長距離例外: 最後の休息のみ480分以上（運行終了後の休息基準）
+        let is_last_rest = rest_events
+            .last()
+            .map(|&(s, _)| s == rest_start)
+            .unwrap_or(false);
+        let threshold = if is_long_distance && is_last_rest {
             480
         } else {
             REST_THRESHOLD_PRINCIPAL

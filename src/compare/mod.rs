@@ -1315,7 +1315,7 @@ pub fn build_day_map(
                     &rest_events_for_unko,
                     dep,
                     ret,
-                    false, // 長距離480例外はoverlap計算側で処理
+                    dep.date() != ret.date(), // 長距離480例外: 日跨ぎ運行
                 );
 
                 let segments =

@@ -1219,7 +1219,7 @@ pub fn build_day_map(
         String,
         Vec<(NaiveDateTime, NaiveDateTime, NaiveDate, NaiveTime)>,
     > = HashMap::new();
-    let mut multi_op_boundaries: HashMap<String, NaiveDateTime> = HashMap::new();
+    let mut multi_op_boundaries: HashMap<String, Vec<NaiveDateTime>> = HashMap::new();
 
     let mut workday_groups: BTreeMap<(String, NaiveDate), Vec<&KudguriRow>> = BTreeMap::new();
     for row in kudguri_rows {
@@ -1320,10 +1320,17 @@ pub fn build_day_map(
 
                 let segments =
                     work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
-                let segments = work_segments::split_segments_at_24h(segments);
-                // workday境界でセグメントを分割（長距離運行の24hルール対応）
-                // 条件: 3日以上スパン、分割後の両パートが60分以上
+                // workday境界でセグメントを分割（24hルール対応）
                 let span_days = (ret.date() - dep.date()).num_days();
+                // 全workday境界をイベント分割用に登録
+                if workdays.len() >= 2 {
+                    let boundaries = multi_op_boundaries.entry(row.unko_no.clone()).or_default();
+                    for wd in &workdays {
+                        if wd.end < ret && !boundaries.contains(&wd.end) {
+                            boundaries.push(wd.end);
+                        }
+                    }
+                }
                 let segments = if span_days >= 3 && workdays.len() >= 2 {
                     let mut segs = segments;
                     for wd in &workdays {
@@ -1336,13 +1343,13 @@ pub fn build_day_map(
                             });
                             if sig_split {
                                 segs = split_work_segments_at_boundary(segs, wd.end);
-                                multi_op_boundaries.insert(row.unko_no.clone(), wd.end);
                             }
                         }
                     }
                     segs
                 } else {
-                    segments
+                    // 単一workday: 従来の24h分割
+                    work_segments::split_segments_at_24h(segments)
                 };
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 
@@ -1460,7 +1467,10 @@ pub fn build_day_map(
 
             for row in &valid_ops {
                 // 最初の24h境界をlegacy互換で保存
-                multi_op_boundaries.insert(row.unko_no.clone(), boundaries_24h[0]);
+                multi_op_boundaries
+                    .entry(row.unko_no.clone())
+                    .or_default()
+                    .push(boundaries_24h[0]);
             }
 
             let driver_cd = &valid_ops[0].driver_cd;
@@ -1590,14 +1600,25 @@ pub fn build_day_map(
                         let evt_end = evt_start_trunc + chrono::Duration::minutes(dur as i64);
 
                         let mut parts: Vec<(NaiveDateTime, NaiveDateTime, i64)> = Vec::new();
-                        if let Some(&boundary) = boundary_opt {
-                            if evt_start_trunc < boundary && evt_end > boundary {
-                                let before_secs = (boundary - evt_start_trunc).num_seconds();
-                                let after_secs = (evt_end - boundary).num_seconds();
-                                parts.push((evt_start_trunc, boundary, before_secs));
-                                parts.push((boundary, evt_end, after_secs));
-                            } else {
+                        if let Some(boundaries) = boundary_opt {
+                            // 複数境界でイベントを分割
+                            let mut relevant: Vec<NaiveDateTime> = boundaries
+                                .iter()
+                                .filter(|&&b| evt_start_trunc < b && evt_end > b)
+                                .copied()
+                                .collect();
+                            relevant.sort();
+                            if relevant.is_empty() {
                                 parts.push((evt_start_trunc, evt_end, dur as i64 * 60));
+                            } else {
+                                let mut cur = evt_start_trunc;
+                                for b in &relevant {
+                                    let secs = (*b - cur).num_seconds();
+                                    parts.push((cur, *b, secs));
+                                    cur = *b;
+                                }
+                                let secs = (evt_end - cur).num_seconds();
+                                parts.push((cur, evt_end, secs));
                             }
                         } else {
                             parts.push((evt_start_trunc, evt_end, dur as i64 * 60));

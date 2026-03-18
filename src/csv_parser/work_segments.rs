@@ -337,7 +337,13 @@ pub fn split_by_rest(
 
 /// 24時間超のセグメントを24h境界で強制分割する（休息未取得時例外）
 /// 改善基準告示: 集計開始時刻の24時間後を日締め時刻とする
-pub fn split_segments_at_24h(segments: Vec<WorkSegment>) -> Vec<WorkSegment> {
+///
+/// workday_ends: determine_workdaysのwd.end一覧（始業基準の24h境界）
+/// workday_endsがある場合、seg基準ではなく始業基準で分割する
+pub fn split_segments_at_24h_with_workdays(
+    segments: Vec<WorkSegment>,
+    workday_ends: &[NaiveDateTime],
+) -> Vec<WorkSegment> {
     let max_mins = 24 * 60i64;
     let mut result = Vec::new();
     for seg in segments {
@@ -346,14 +352,34 @@ pub fn split_segments_at_24h(segments: Vec<WorkSegment>) -> Vec<WorkSegment> {
             result.push(seg);
             continue;
         }
-        // 24h超: 分割
-        let mut cur_start = seg.start;
+        // 24h超: workday境界で分割（なければseg基準）
+        let mut boundaries: Vec<NaiveDateTime> = workday_ends
+            .iter()
+            .filter(|&&b| b > seg.start && b < seg.end)
+            .copied()
+            .collect();
+        if boundaries.is_empty() {
+            // workday境界がない場合はseg基準で24h分割（従来動作）
+            let mut cur_start = seg.start;
+            while cur_start < seg.end {
+                let cur_end = (cur_start + chrono::Duration::minutes(max_mins)).min(seg.end);
+                boundaries.push(cur_end);
+                cur_start = cur_end;
+            }
+            boundaries.pop(); // seg.endは不要
+        }
+        boundaries.sort();
+
         let total_labor = seg.labor_minutes as f64;
         let total_drive = seg.drive_minutes as f64;
         let total_cargo = seg.cargo_minutes as f64;
         let total_wall = total_mins as f64;
-        while cur_start < seg.end {
-            let cur_end = (cur_start + chrono::Duration::minutes(max_mins)).min(seg.end);
+        let mut cur_start = seg.start;
+        for boundary in boundaries.iter().chain(std::iter::once(&seg.end)) {
+            if *boundary <= cur_start {
+                continue;
+            }
+            let cur_end = *boundary;
             let chunk_mins = (cur_end - cur_start).num_minutes() as f64;
             let ratio = chunk_mins / total_wall;
             result.push(WorkSegment {
@@ -367,6 +393,11 @@ pub fn split_segments_at_24h(segments: Vec<WorkSegment>) -> Vec<WorkSegment> {
         }
     }
     result
+}
+
+/// 互換ラッパー: workday境界なしの24h分割
+pub fn split_segments_at_24h(segments: Vec<WorkSegment>) -> Vec<WorkSegment> {
+    split_segments_at_24h_with_workdays(segments, &[])
 }
 
 /// 指定範囲内のイベントを運転/荷役に分けて duration_minutes を合計

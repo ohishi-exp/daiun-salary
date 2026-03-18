@@ -1330,17 +1330,22 @@ pub fn build_day_map(
                     work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
                 // workday境界でセグメントを分割（24hルール対応）
                 let span_days = (ret.date() - dep.date()).num_days();
-                // 全workday境界をイベント分割用に登録
+                // 全workday境界をイベント分割用に登録（分単位に揃える）
                 if workdays.len() >= 2 {
                     let boundaries = multi_op_boundaries.entry(row.unko_no.clone()).or_default();
                     for wd in &workdays {
-                        if wd.end < ret && !boundaries.contains(&wd.end) {
-                            boundaries.push(wd.end);
+                        let trunc_end = trunc_min(wd.end);
+                        if wd.end < ret && !boundaries.contains(&trunc_end) {
+                            boundaries.push(trunc_end);
                         }
                     }
                 }
-                let segments = work_segments::split_segments_at_24h(segments);
-                // workday境界でセグメントを分割（長距離運行の24hルール対応）
+                // workday境界で始業基準の24h分割（分単位に揃える）
+                let wd_ends: Vec<NaiveDateTime> =
+                    workdays.iter().map(|wd| trunc_min(wd.end)).collect();
+                let segments =
+                    work_segments::split_segments_at_24h_with_workdays(segments, &wd_ends);
+                // workday境界でセグメントを追加分割（長距離運行の24hルール対応）
                 // 条件: 3日以上スパン、分割後の両パートが60分以上
                 let segments = if span_days >= 3 && workdays.len() >= 2 {
                     let mut segs = segments;
@@ -1591,9 +1596,17 @@ pub fn build_day_map(
         }
 
         for (driver_cd, unko_nos) in &driver_unko_map {
+            // day_mapの既存エントリを0初期化（segment pro-rata値をevent実値で上書きするため）
             let mut day_drive_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
             let mut day_cargo_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
             let mut day_break_secs: HashMap<(NaiveDate, NaiveTime), i64> = HashMap::new();
+            for ((dc, date, st), _) in day_map.iter() {
+                if dc == driver_cd {
+                    day_drive_secs.entry((*date, *st)).or_insert(0);
+                    day_cargo_secs.entry((*date, *st)).or_insert(0);
+                    day_break_secs.entry((*date, *st)).or_insert(0);
+                }
+            }
             let mut day_late_night: HashMap<(NaiveDate, NaiveTime), i32> = HashMap::new();
 
             for unko_no in unko_nos {

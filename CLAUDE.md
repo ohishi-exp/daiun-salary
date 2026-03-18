@@ -39,10 +39,30 @@ src/
 │   ├── allowance.rs     # 運行費・種別・地方手当・調整手当
 │   ├── summary.rs       # 月次集計
 │   └── payroll.rs       # 総支給額計算
+├── compare/             # 拘束時間管理表CSV比較（コア計算モジュール）
+│   └── mod.rs           # ~3600行（テスト1830行含む）
 ├── repository/          # DB アクセス層（SQLx CRUD）
 ├── api/                 # Axum ハンドラ・ルーティング・DTO
 └── import/              # Excel インポート（calamine）
 ```
+
+### compare/mod.rs 関数構造
+
+```
+process_zip() / process_parsed_data()  ← エントリポイント
+  ├── build_day_map()                  ← KUDGURI/KUDGIVTからday_map構築
+  │     ├── single-op / multi-op パス  ← workday分割・セグメント生成
+  │     └── aggregate_events_by_day()  ← イベント直接集計（秒→分変換）
+  ├── post_process_day_map()           ← 後処理オーケストレーター
+  │     ├── merge_same_day_entries()   ← 構内結合（異運行・gap<180分）
+  │     ├── process_overlap_chain()    ← 24hチェーン・overlap計算
+  │     └── apply_ferry_deductions()   ← フェリー控除
+  └── build_csv_driver_data()          ← day_map→CsvDayRow変換
+```
+
+- **DayKey**: `type DayKey = (String, NaiveDate, NaiveTime)` — (driver_cd, work_date, start_time)
+- **DayAgg**: 日別集計データ（運転/荷役/休憩/深夜/overlap等の分数）
+- **FerryInfo**: フェリー控除用データ（`from_zip_files`で構築、`parse_ferry_periods_from_text`使用）
 
 ## Domain-Specific Rules
 

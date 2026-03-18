@@ -355,6 +355,14 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "長距離480例外: 24h内の休息534分が未分割 (#3)",
         cascading: false,
     },
+    // 1069: 2/9 #3バグの連鎖（overlap windowサイズのずれ）
+    KnownBugPattern {
+        driver_cd: "1069",
+        date_contains: "2月9",
+        fields: &["重複小計", "合計"],
+        description: "長距離480例外: 連鎖 (#3)",
+        cascading: false,
+    },
 ];
 
 /// 差分リストに既知バグアノテーションを付与（連鎖差分の自動計算含む）

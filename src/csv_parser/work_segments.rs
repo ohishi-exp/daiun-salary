@@ -353,16 +353,17 @@ pub fn split_segments_at_24h_with_workdays(
     let mut result = Vec::new();
     for seg in segments {
         let total_mins = (seg.end - seg.start).num_minutes();
-        if total_mins <= max_mins {
-            result.push(seg);
-            continue;
-        }
-        // 24h超: workday境界で分割（なければseg基準）
-        let mut boundaries: Vec<NaiveDateTime> = workday_ends
+        // workday境界がセグメント内にあれば分割（24h未満でも）
+        let wd_boundaries: Vec<NaiveDateTime> = workday_ends
             .iter()
             .filter(|&&b| b > seg.start && b < seg.end)
             .copied()
             .collect();
+        if total_mins <= max_mins && wd_boundaries.is_empty() {
+            result.push(seg);
+            continue;
+        }
+        let mut boundaries = wd_boundaries;
         if boundaries.is_empty() {
             // workday境界がない場合はseg基準で24h分割（従来動作）
             let mut cur_start = seg.start;

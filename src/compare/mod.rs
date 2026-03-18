@@ -2568,6 +2568,111 @@ mod tests {
         assert!(entry1.overlap_restraint_minutes >= 0);
     }
 
+    // ---- post_process: overlap excludes 302 rest ----
+    #[test]
+    fn test_post_process_overlap_excludes_rest302() {
+        // Day1: 6:00-11:00, Day2: 4:40-10:35 (with 302 rest gap 4:55-7:59 = 184min)
+        // gap = 11:00→4:40(next day) = 17h40m > 540min → reset → overlap表示
+        // 24h window: 6:00+24h = 翌6:00
+        // Day2 starts at 4:40, but segments: [4:40-4:55] + [7:59-10:35]
+        // overlap in window (before 翌6:00): seg1=4:40-4:55(15min) + seg2 clipped=0min(7:59>6:00? no 7:59>6:00 next day)
+        // Actually: Day1 starts 2/4 6:00, window_end = 2/5 6:00
+        // Day2 segments start on 2/5: [2/5 4:40 - 2/5 4:55] and [2/5 7:59 - 2/5 10:35]
+        // overlap window: 2/5 4:40 to 2/5 6:00
+        // seg1: 4:40-4:55, clipped to 4:40-4:55 = 15min (within window)
+        // seg2: 7:59-10:35, starts after window_end(6:00) → excluded
+        // Old (span-based): restraint_end=4:55(max seg_end in window), ol_restraint=4:55-4:40=15min
+        // Hmm, that doesn't show the bug. Let me redesign.
+        //
+        // Better scenario: Day1 6:00-11:00, Day2 segments [14:00-15:00]+[20:00-22:00]
+        // with 302 rest gap between 15:00-20:00 (300min)
+        // gap = 11:00→14:00 = 3h < 540 but this would NOT reset...
+        // Need gap >= 540 for the non-chain (overlap display) path.
+        //
+        // Correct scenario for overlap display (next_resets=true):
+        // Day1: 2/1 6:00-11:00, Day2: 2/2 3:00 (gap=16h>540→reset)
+        // Day2 segments: [2/2 3:00-5:00] + [2/2 8:00-10:00] (302 rest 5:00-8:00=180min)
+        // 24h window: 2/1 6:00+24h = 2/2 6:00
+        // Old: restraint_end = max(5:00, 10:00→clipped to 6:00) = 6:00
+        //      ol_restraint = 6:00 - 3:00 = 180min (includes rest gap)
+        // New: seg1 3:00-5:00 → clipped 3:00-5:00 = 120min
+        //      seg2 8:00-10:00 → starts after 6:00 window but clipped to 6:00... no, 8:00>6:00 → skip
+        //      Actually seg2 start=8:00 > window_end=6:00 → excluded
+        //      seg_total = 120min
+        // Expected: overlap_restraint = 120, not 180
+        let cls = default_classifications();
+        let d1 = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
+        let t1 = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
+        let t2 = NaiveTime::from_hms_opt(3, 0, 0).unwrap();
+
+        let mut day_map: HashMap<DayKey, DayAgg> = HashMap::new();
+        let mut agg1 = DayAgg::default();
+        agg1.drive_minutes = 300;
+        agg1.total_work_minutes = 300;
+        agg1.unko_nos = vec!["U1".into()];
+        agg1.segments = vec![SegRec {
+            start_at: dt(2026, 2, 1, 6, 0, 0),
+            end_at: dt(2026, 2, 1, 11, 0, 0),
+        }];
+        day_map.insert(("D1".into(), d1, t1), agg1);
+
+        let mut agg2 = DayAgg::default();
+        agg2.drive_minutes = 200;
+        agg2.total_work_minutes = 200;
+        agg2.unko_nos = vec!["U1".into()];
+        // 2 segments with 302 rest gap (5:00-8:00)
+        agg2.segments = vec![
+            SegRec {
+                start_at: dt(2026, 2, 2, 3, 0, 0),
+                end_at: dt(2026, 2, 2, 5, 0, 0),
+            },
+            SegRec {
+                start_at: dt(2026, 2, 2, 8, 0, 0),
+                end_at: dt(2026, 2, 2, 10, 0, 0),
+            },
+        ];
+        day_map.insert(("D1".into(), d2, t2), agg2);
+
+        let mut wb = HashMap::new();
+        wb.insert(
+            ("D1".into(), d1, t1),
+            (dt(2026, 2, 1, 6, 0, 0), dt(2026, 2, 1, 11, 0, 0)),
+        );
+        wb.insert(
+            ("D1".into(), d2, t2),
+            (dt(2026, 2, 2, 3, 0, 0), dt(2026, 2, 2, 10, 0, 0)),
+        );
+        let mwb = HashMap::new();
+        let mut dwe = HashMap::new();
+        let kudguri = vec![
+            make_kudguri("U1", "D1", dt(2026, 2, 1, 6, 0, 0), dt(2026, 2, 1, 11, 0, 0)),
+        ];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 2, 3, 0, 0), "201", 120),
+            make_kudgivt("U1", dt(2026, 2, 2, 8, 0, 0), "201", 120),
+        ];
+        let erefs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), erefs);
+        let ferry = FerryInfo::default();
+
+        post_process_day_map(
+            &mut day_map, &mut wb, &mwb, &mut dwe,
+            &by_unko, &cls, &kudguri, &ferry,
+        );
+
+        let entry1 = &day_map[&("D1".into(), d1, t1)];
+        // gap=16h > 540 → reset → overlap表示
+        // 24h window: 6:00+24h = 翌6:00
+        // overlap = seg1(3:00-5:00 within window) = 120min
+        // NOT 180min (which would include 302 rest gap 5:00-8:00)
+        assert_eq!(entry1.overlap_restraint_minutes, 120);
+        // overlap_break = restraint - drive - cargo
+        // drive overlap from events: 120min (3:00-5:00 event, within window)
+        assert_eq!(entry1.overlap_break_minutes, 0);
+    }
+
     // ---- post_process: ferry deduction ----
     #[test]
     fn test_post_process_ferry_deduction() {

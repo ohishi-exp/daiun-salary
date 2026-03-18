@@ -347,6 +347,14 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "24h分離バグ: 運行内休息でshigyo未リセット (#2)",
         cascading: false,
     },
+    // 1069: 2/4 長距離480例外（24h境界手前の休息534分が分割されない）
+    KnownBugPattern {
+        driver_cd: "1069",
+        date_contains: "2月4",
+        fields: &["始業", "重複運転", "重複小計", "合計"],
+        description: "長距離480例外: 24h内の休息534分が未分割 (#3)",
+        cascading: false,
+    },
 ];
 
 /// 差分リストに既知バグアノテーションを付与（連鎖差分の自動計算含む）

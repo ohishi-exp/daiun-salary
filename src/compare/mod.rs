@@ -339,14 +339,6 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "web地球号バグ: 休息基準未達で終業扱い (#1)",
         cascading: true,
     },
-    // 1049: 2/8 24h境界分割ズレ（split_segments_at_24hがseg基準で始業基準と67分ズレ）
-    KnownBugPattern {
-        driver_cd: "1049",
-        date_contains: "2月8",
-        fields: &["運転", "小計", "合計", "実働", "時間外"],
-        description: "既知: 24h分割がseg基準で始業基準と67分ズレ",
-        cascading: true,
-    },
 ];
 
 /// 差分リストに既知バグアノテーションを付与（連鎖差分の自動計算含む）

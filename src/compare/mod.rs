@@ -3249,27 +3249,27 @@ mod tests {
     #[test]
     fn test_build_day_map_multi_op_path() {
         let cls = default_classifications();
-        // 2運行、日を共有しない → spans_different_days=true → multi-op
-        let mut k1 = make_kudguri("U1", "D1", dt(2026,2,1,8,0,0), dt(2026,2,2,10,0,0));
-        let mut k2 = make_kudguri("U2", "D1", dt(2026,2,5,8,0,0), dt(2026,2,6,10,0,0));
-        // group_operations_into_work_daysで同じwork_dateになるようgap < threshold
-        // → 手動で同日に設定（opdate同日）
-        k1.operation_date = Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
-        k2.operation_date = Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
-        let kudguri = vec![k1, k2];
+        // k1: dep=2/1 ret=2/1(同日), k2: dep=2/2 ret=2/4(日跨ぎ)
+        // gap: 2/1 18:00→2/2 1:00 = 7h=420 < 480(long) → same group
+        // dep dates: {2/1, 2/2} → 2 dates. ret/dep: k1.ret.date=2/1≠k2.dep.date=2/2 → no share
+        // → spans_different_days=true → multi-op path!
+        let kudguri = vec![
+            make_kudguri("U1", "D1", dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 18, 0, 0)),
+            make_kudguri("U2", "D1", dt(2026, 2, 2, 1, 0, 0), dt(2026, 2, 4, 10, 0, 0)),
+        ];
         let evts = vec![
-            make_kudgivt("U1", dt(2026,2,1,8,0,0), "201", 600),
-            make_kudgivt("U1", dt(2026,2,1,18,0,0), "302", 900),
-            make_kudgivt("U1", dt(2026,2,2,9,0,0), "201", 60),
-            make_kudgivt("U2", dt(2026,2,5,8,0,0), "201", 600),
-            make_kudgivt("U2", dt(2026,2,5,18,0,0), "302", 900),
-            make_kudgivt("U2", dt(2026,2,6,9,0,0), "201", 60),
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 600),
+            make_kudgivt("U2", dt(2026, 2, 2, 1, 0, 0), "201", 600),
+            make_kudgivt("U2", dt(2026, 2, 2, 11, 0, 0), "302", 900),
+            make_kudgivt("U2", dt(2026, 2, 3, 2, 0, 0), "201", 600),
+            make_kudgivt("U2", dt(2026, 2, 3, 12, 0, 0), "302", 900),
+            make_kudgivt("U2", dt(2026, 2, 4, 3, 0, 0), "201", 420),
         ];
         let refs: Vec<&_> = evts.iter().collect();
         let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
         for e in &refs { by_unko.entry(e.unko_no.clone()).or_default().push(*e); }
         let result = build_day_map(&kudguri, &by_unko, &cls);
-        assert!(result.day_map.len() >= 2);
+        assert!(result.day_map.len() >= 3, "multi-op should produce ≥3 entries, got {}", result.day_map.len());
     }
 
     // ---- build_day_map: event-level calendar day split ----

@@ -851,6 +851,18 @@ pub fn post_process_day_map(
     kudguri_rows: &[KudguriRow],
     ferry_info: &FerryInfo,
 ) {
+    // ---- 長距離unko_no事前構築（O(N)）----
+    let long_distance_unkos: std::collections::HashSet<&str> = kudguri_rows
+        .iter()
+        .filter(|r| {
+            r.departure_at
+                .zip(r.return_at)
+                .map(|(dep, ret)| dep.date() != ret.date())
+                .unwrap_or(false)
+        })
+        .map(|r| r.unko_no.as_str())
+        .collect();
+
     // ---- 構内結合 ----
     {
         let keys: Vec<_> = day_map.keys().cloned().collect();
@@ -1097,20 +1109,11 @@ pub fn post_process_day_map(
                     let next_gap = (next_info.start - info.end).num_minutes();
                     // 長距離判定: 現在or次のエントリの運行が日跨ぎ（宿泊伴う）なら480（例外）、
                     // それ以外は540（原則）
-                    let is_long_distance = {
-                        let check_unko = |unko_nos: &[String]| -> bool {
-                            unko_nos.iter().any(|u| {
-                                kudguri_rows.iter().any(|r| {
-                                    r.unko_no == *u
-                                        && r.departure_at
-                                            .zip(r.return_at)
-                                            .map(|(dep, ret)| dep.date() != ret.date())
-                                            .unwrap_or(false)
-                                })
-                            })
-                        };
-                        check_unko(&info.unko_nos) || check_unko(&next_info.unko_nos)
-                    };
+                    let is_long_distance = info
+                        .unko_nos
+                        .iter()
+                        .chain(next_info.unko_nos.iter())
+                        .any(|u| long_distance_unkos.contains(u.as_str()));
                     let rest_threshold = if is_long_distance { 480 } else { 540 };
                     let mut next_resets = next_gap >= rest_threshold;
                     // 分割特例: 180分以上の休息を蓄積して判定
@@ -1133,14 +1136,12 @@ pub fn post_process_day_map(
                     // determine_workdaysが複数workdayを生成し、
                     // 24h境界より前に終業を設定している場合はchainしない
                     // (determine_workdays由来のオリジナルwb.endで判定)
-                    let mut _wd_ended_early = false;
                     if !next_resets {
                         let key = (driver_cd.clone(), date, st);
                         if let Some(&det_end) = multi_wd_boundaries.get(&key) {
                             if det_end < window_end {
                                 next_resets = true;
                                 split_rests.clear();
-                                _wd_ended_early = true;
                                 forced_next_reset = true;
                                 // workday実終了でwindow_endをクランプ
                                 // （24hチェーンのwindowが実workdayを超えないように）
@@ -1414,20 +1415,7 @@ pub fn build_day_map(
             let default_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
             let entry = day_map
                 .entry((row.driver_cd.clone(), work_date, default_time))
-                .or_insert(DayAgg {
-                    total_work_minutes: 0,
-                    late_night_minutes: 0,
-                    drive_minutes: 0,
-                    cargo_minutes: 0,
-                    unko_nos: Vec::new(),
-                    segments: Vec::new(),
-                    overlap_drive_minutes: 0,
-                    overlap_cargo_minutes: 0,
-                    overlap_break_minutes: 0,
-                    overlap_restraint_minutes: 0,
-                    ot_late_night_minutes: 0,
-                    from_multi_op: false,
-                });
+                .or_insert_with(DayAgg::default);
             entry.total_work_minutes += total_drive_mins;
             entry.unko_nos.push(row.unko_no.clone());
         }
@@ -1575,20 +1563,7 @@ pub fn build_day_map(
                     let start_time = find_start_time(ds.start);
                     let entry = day_map
                         .entry((row.driver_cd.clone(), work_date, start_time))
-                        .or_insert(DayAgg {
-                            total_work_minutes: 0,
-                            late_night_minutes: 0,
-                            drive_minutes: 0,
-                            cargo_minutes: 0,
-                            unko_nos: Vec::new(),
-                            segments: Vec::new(),
-                            overlap_drive_minutes: 0,
-                            overlap_cargo_minutes: 0,
-                            overlap_break_minutes: 0,
-                            overlap_restraint_minutes: 0,
-                            ot_late_night_minutes: 0,
-                            from_multi_op: false,
-                        });
+                        .or_insert_with(DayAgg::default);
                     entry.total_work_minutes += ds.work_minutes;
                     entry.late_night_minutes += ds.late_night_minutes;
                     entry.drive_minutes += ds.drive_minutes;
@@ -1702,20 +1677,7 @@ pub fn build_day_map(
                     let start_time = find_vwd_start_time(ds.start);
                     let entry = day_map
                         .entry((driver_cd.clone(), work_date, start_time))
-                        .or_insert(DayAgg {
-                            total_work_minutes: 0,
-                            late_night_minutes: 0,
-                            drive_minutes: 0,
-                            cargo_minutes: 0,
-                            unko_nos: Vec::new(),
-                            segments: Vec::new(),
-                            overlap_drive_minutes: 0,
-                            overlap_cargo_minutes: 0,
-                            overlap_break_minutes: 0,
-                            overlap_restraint_minutes: 0,
-                            ot_late_night_minutes: 0,
-                            from_multi_op: true,
-                        });
+                        .or_insert_with(DayAgg::default);
                     entry.from_multi_op = true;
                     entry.total_work_minutes += ds.work_minutes;
                     entry.late_night_minutes += ds.late_night_minutes;
@@ -2003,7 +1965,7 @@ pub fn process_zip(
     let mut workday_boundaries = result.workday_boundaries;
     let multi_wd_boundaries = result.multi_wd_boundaries;
     let mut day_work_events = result.day_work_events;
-    let calendar_day_total = result.calendar_day_total;
+    let _calendar_day_total = result.calendar_day_total;
 
     let ferry_info = FerryInfo::from_zip_files(&zip_files, &kudgivt_by_unko);
     post_process_day_map(

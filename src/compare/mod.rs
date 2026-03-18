@@ -1153,20 +1153,27 @@ pub fn post_process_day_map(
                                                             continue;
                                                         }
                                                         let es = trunc_min(evt.start_at);
-                                                        let ee = es + chrono::Duration::minutes(dur as i64);
+                                                        let ee = es
+                                                            + chrono::Duration::minutes(dur as i64);
                                                         if ee <= fs || es >= fe {
                                                             continue;
                                                         }
                                                         let ov_s = es.max(fs);
                                                         let ov_e = ee.min(fe);
-                                                        let ov_m = (ov_e - ov_s).num_minutes() as i32;
+                                                        let ov_m =
+                                                            (ov_e - ov_s).num_minutes() as i32;
                                                         if ov_m <= 0 {
                                                             continue;
                                                         }
-                                                        let cls = classifications.get(&evt.event_cd);
+                                                        let cls =
+                                                            classifications.get(&evt.event_cd);
                                                         match cls {
-                                                            Some(EventClass::Drive) => ferry_drive_ded += ov_m,
-                                                            Some(EventClass::Cargo) => ferry_cargo_ded += ov_m,
+                                                            Some(EventClass::Drive) => {
+                                                                ferry_drive_ded += ov_m
+                                                            }
+                                                            Some(EventClass::Cargo) => {
+                                                                ferry_cargo_ded += ov_m
+                                                            }
                                                             _ => {}
                                                         }
                                                     }
@@ -1233,7 +1240,9 @@ pub fn post_process_day_map(
                                 ferry_break_deduction += dur;
                             }
                         }
-                        // Drive/Cargoとフェリー期間の実重複
+                        // Drive/Cargoとフェリー期間の実重複（分精度で計算）
+                        let fs_trunc = trunc_min(fs);
+                        let fe_trunc = trunc_min(fe);
                         for evt in events {
                             match classifications.get(&evt.event_cd) {
                                 Some(EventClass::Drive) | Some(EventClass::Cargo) => {}
@@ -1243,13 +1252,12 @@ pub fn post_process_day_map(
                             if dur <= 0 {
                                 continue;
                             }
-                            let es = evt.start_at;
+                            let es = trunc_min(evt.start_at);
                             let ee = es + chrono::Duration::minutes(dur as i64);
-                            let os = es.max(fs);
-                            let oe = ee.min(fe);
+                            let os = es.max(fs_trunc);
+                            let oe = ee.min(fe_trunc);
                             if oe > os {
-                                let secs = (oe - os).num_seconds();
-                                ferry_drive_overlap += ((secs + 30) / 60) as i32;
+                                ferry_drive_overlap += (oe - os).num_minutes() as i32;
                             }
                         }
                     }

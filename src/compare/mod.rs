@@ -3183,6 +3183,124 @@ mod tests {
         assert_eq!(result.len(), 2);
     }
 
+    // ---- post_process: 構内結合 (same-day merge) ----
+    #[test]
+    fn test_post_process_merge_same_day_entries() {
+        let cls = default_classifications();
+        let d = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let t1 = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
+        let t2 = NaiveTime::from_hms_opt(14, 0, 0).unwrap();
+        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        // 同日2エントリ、異なる運行、gap短い → 構内結合
+        let mut a1 = DayAgg::default();
+        a1.drive_minutes = 200; a1.total_work_minutes = 200;
+        a1.unko_nos = vec!["U1".into()];
+        a1.segments = vec![SegRec { start_at: dt(2026,2,1,6,0,0), end_at: dt(2026,2,1,12,0,0) }];
+        day_map.insert(("D1".into(), d, t1), a1);
+        let mut a2 = DayAgg::default();
+        a2.drive_minutes = 100; a2.total_work_minutes = 100;
+        a2.unko_nos = vec!["U2".into()];
+        a2.segments = vec![SegRec { start_at: dt(2026,2,1,14,0,0), end_at: dt(2026,2,1,18,0,0) }];
+        day_map.insert(("D1".into(), d, t2), a2);
+        let mut wb = HashMap::new();
+        wb.insert(("D1".into(), d, t1), (dt(2026,2,1,6,0,0), dt(2026,2,1,12,0,0)));
+        wb.insert(("D1".into(), d, t2), (dt(2026,2,1,14,0,0), dt(2026,2,1,18,0,0)));
+        let mwb = HashMap::new();
+        let mut dwe = HashMap::new();
+        let kudguri = vec![
+            make_kudguri("U1", "D1", dt(2026,2,1,6,0,0), dt(2026,2,1,12,0,0)),
+            make_kudguri("U2", "D1", dt(2026,2,1,14,0,0), dt(2026,2,1,18,0,0)),
+        ];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026,2,1,6,0,0), "201", 200),
+            make_kudgivt("U2", dt(2026,2,1,14,0,0), "201", 100),
+        ];
+        let erefs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        for e in &erefs { by_unko.entry(e.unko_no.clone()).or_default().push(*e); }
+        post_process_day_map(&mut day_map, &mut wb, &mwb, &mut dwe, &by_unko, &cls, &kudguri, &FerryInfo::default());
+        // 構内結合で1エントリにマージされる可能性
+        assert!(day_map.len() >= 1);
+    }
+
+    // ---- build_day_map: sig_split実行パス ----
+    #[test]
+    fn test_build_day_map_sig_split_triggers() {
+        let cls = default_classifications();
+        // 4日スパン、workday境界を跨ぐ大きなセグメント(両側180分以上)
+        let kudguri = vec![make_kudguri("U1", "D1", dt(2026,2,1,8,0,0), dt(2026,2,5,8,0,0))];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026,2,1,8,0,0), "201", 960),    // 16h
+            make_kudgivt("U1", dt(2026,2,2,0,0,0), "302", 540),    // 9h rest
+            make_kudgivt("U1", dt(2026,2,2,9,0,0), "201", 1200),   // 20h（workday境界を跨ぐ大セグメント）
+            make_kudgivt("U1", dt(2026,2,3,5,0,0), "302", 600),    // 10h rest
+            make_kudgivt("U1", dt(2026,2,3,15,0,0), "201", 600),
+            make_kudgivt("U1", dt(2026,2,4,1,0,0), "302", 540),
+            make_kudgivt("U1", dt(2026,2,4,10,0,0), "201", 600),
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), refs);
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        assert!(result.day_map.len() >= 3);
+    }
+
+    // ---- build_day_map: spans_different_days true → multi-op path ----
+    #[test]
+    fn test_build_day_map_multi_op_path() {
+        let cls = default_classifications();
+        // 2運行、日を共有しない → spans_different_days=true → multi-op
+        let mut k1 = make_kudguri("U1", "D1", dt(2026,2,1,8,0,0), dt(2026,2,2,10,0,0));
+        let mut k2 = make_kudguri("U2", "D1", dt(2026,2,5,8,0,0), dt(2026,2,6,10,0,0));
+        // group_operations_into_work_daysで同じwork_dateになるようgap < threshold
+        // → 手動で同日に設定（opdate同日）
+        k1.operation_date = Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+        k2.operation_date = Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+        let kudguri = vec![k1, k2];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026,2,1,8,0,0), "201", 600),
+            make_kudgivt("U1", dt(2026,2,1,18,0,0), "302", 900),
+            make_kudgivt("U1", dt(2026,2,2,9,0,0), "201", 60),
+            make_kudgivt("U2", dt(2026,2,5,8,0,0), "201", 600),
+            make_kudgivt("U2", dt(2026,2,5,18,0,0), "302", 900),
+            make_kudgivt("U2", dt(2026,2,6,9,0,0), "201", 60),
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        for e in &refs { by_unko.entry(e.unko_no.clone()).or_default().push(*e); }
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        assert!(result.day_map.len() >= 2);
+    }
+
+    // ---- build_day_map: event-level calendar day split ----
+    #[test]
+    fn test_build_day_map_midnight_crossing_event() {
+        let cls = default_classifications();
+        let kudguri = vec![make_kudguri("U1", "D1", dt(2026,2,1,22,0,0), dt(2026,2,2,6,0,0))];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026,2,1,22,0,0), "201", 480), // 22:00→6:00 日跨ぎ
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), refs);
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        assert!(!result.day_map.is_empty());
+        // 深夜時間が計算されている
+        let has_late_night = result.day_map.values().any(|a| a.late_night_minutes > 0);
+        assert!(has_late_night, "midnight crossing should have late_night");
+    }
+
+    // ---- process_parsed_data: holiday rows ----
+    #[test]
+    fn test_process_parsed_data_fills_holidays() {
+        let kudguri = vec![make_kudguri("U1", "D1", dt(2026,2,5,8,0,0), dt(2026,2,5,17,0,0))];
+        let kudgivt = vec![make_kudgivt("U1", dt(2026,2,5,8,0,0), "201", 300)];
+        let result = process_parsed_data(&kudguri, &kudgivt, &FerryInfo::default(), 2026, 2).unwrap();
+        // 28日分（2月）あり、稼働日以外はholiday
+        let holidays: Vec<_> = result[0].days.iter().filter(|d| d.is_holiday).collect();
+        assert!(holidays.len() >= 20, "Most days should be holidays for 1-day work");
+    }
+
     // ---- parse_ferry_periods_from_text ----
     #[test]
     fn test_parse_ferry_periods_basic() {

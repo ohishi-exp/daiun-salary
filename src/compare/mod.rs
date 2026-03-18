@@ -1197,6 +1197,8 @@ pub struct BuildDayMapResult {
     pub multi_wd_boundaries: HashMap<(String, NaiveDate, NaiveTime), NaiveDateTime>,
     pub day_work_events:
         HashMap<(String, NaiveDate, NaiveTime), Vec<(NaiveDateTime, NaiveDateTime)>>,
+    /// カレンダー日ベースの全拘束時間（分）: (driver_cd, date) → minutes
+    pub calendar_day_total: HashMap<(String, NaiveDate), i32>,
 }
 
 pub fn build_day_map(
@@ -1575,6 +1577,9 @@ pub fn build_day_map(
         Vec<(NaiveDateTime, NaiveDateTime)>,
     > = HashMap::new();
 
+    // カレンダー日ベースの全拘束時間（重複小計=合計-小計の計算用）
+    let mut calendar_day_total: HashMap<(String, NaiveDate), i32> = HashMap::new();
+
     // ---- イベント直接集計（秒単位→分変換） ----
     {
         let mut driver_unko_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -1600,6 +1605,8 @@ pub fn build_day_map(
                 }
             }
             let mut day_late_night: HashMap<(NaiveDate, NaiveTime), i32> = HashMap::new();
+            // カレンダー日ベースの全拘束時間（重複小計=合計-小計の計算用）
+            let mut calendar_day_secs: HashMap<NaiveDate, i64> = HashMap::new();
 
             for unko_no in unko_nos {
                 if let Some(events) = kudgivt_by_unko.get(unko_no) {
@@ -1686,6 +1693,30 @@ pub fn build_day_map(
                                 }
                                 _ => {}
                             }
+                            // カレンダー日ベース集計（Drive/Cargo/Break）
+                            match cls {
+                                Some(EventClass::Drive)
+                                | Some(EventClass::Cargo)
+                                | Some(EventClass::Break) => {
+                                    // 日跨ぎeventはカレンダー日で按分
+                                    let cal_date = part_start.date();
+                                    let next_midnight = (cal_date + chrono::Duration::days(1))
+                                        .and_hms_opt(0, 0, 0)
+                                        .unwrap();
+                                    if *part_end <= next_midnight {
+                                        *calendar_day_secs.entry(cal_date).or_insert(0) +=
+                                            part_secs;
+                                    } else {
+                                        let before = (next_midnight - *part_start).num_seconds();
+                                        let after = (*part_end - next_midnight).num_seconds();
+                                        *calendar_day_secs.entry(cal_date).or_insert(0) += before;
+                                        *calendar_day_secs
+                                            .entry(cal_date + chrono::Duration::days(1))
+                                            .or_insert(0) += after;
+                                    }
+                                }
+                                _ => {}
+                            }
                             match cls {
                                 Some(EventClass::Drive) | Some(EventClass::Cargo) => {
                                     let night = calc_late_night_mins(*part_start, *part_end);
@@ -1753,6 +1784,11 @@ pub fn build_day_map(
                     agg.ot_late_night_minutes = ot_night;
                 }
             }
+            // calendar_day_secsをcalendar_day_totalに集約
+            for (date, secs) in &calendar_day_secs {
+                let mins = ((*secs + 30) / 60) as i32;
+                calendar_day_total.insert((driver_cd.clone(), *date), mins);
+            }
         }
     }
 
@@ -1761,6 +1797,7 @@ pub fn build_day_map(
         workday_boundaries,
         multi_wd_boundaries,
         day_work_events,
+        calendar_day_total,
     }
 }
 
@@ -1804,6 +1841,7 @@ pub fn process_zip(
     let mut workday_boundaries = result.workday_boundaries;
     let multi_wd_boundaries = result.multi_wd_boundaries;
     let mut day_work_events = result.day_work_events;
+    let calendar_day_total = result.calendar_day_total;
 
     let ferry_info = FerryInfo::from_zip_files(&zip_files, &kudgivt_by_unko);
     post_process_day_map(

@@ -363,6 +363,21 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "長距離480例外: 連鎖 (#3)",
         cascading: false,
     },
+    // 1078: #3バグ（休息521分が24h内で未分割）
+    KnownBugPattern {
+        driver_cd: "1078",
+        date_contains: "2月15",
+        fields: &["終業", "運転", "重複運転", "小計", "重複小計", "合計", "実働", "時間外"],
+        description: "長距離480例外: 休息521分が未分割 (#3)",
+        cascading: true,
+    },
+    KnownBugPattern {
+        driver_cd: "1078",
+        date_contains: "2月16",
+        fields: &["始業", "終業", "運転", "小計", "合計", "実働", "時間外", "深夜"],
+        description: "長距離480例外: 連鎖 (#3)",
+        cascading: true,
+    },
     // 1071: #3バグ（休息529/525/507分が24h内で未分割）
     KnownBugPattern {
         driver_cd: "1071",
@@ -1001,7 +1016,7 @@ pub fn post_process_day_map(
                     effective_start = Some(effective_start.unwrap() + chrono::Duration::hours(24));
                 }
 
-                let window_end = effective_start.unwrap() + chrono::Duration::hours(24);
+                let mut window_end = effective_start.unwrap() + chrono::Duration::hours(24);
 
                 if idx + 1 < dates.len() {
                     let (next_date, next_st) = dates[idx + 1];
@@ -1127,6 +1142,9 @@ pub fn post_process_day_map(
                                 split_rests.clear();
                                 _wd_ended_early = true;
                                 forced_next_reset = true;
+                                // workday実終了でwindow_endをクランプ
+                                // （24hチェーンのwindowが実workdayを超えないように）
+                                window_end = det_end;
                             }
                         }
                     }

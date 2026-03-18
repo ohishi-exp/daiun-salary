@@ -349,18 +349,61 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
             "重複運転",
             "小計",
             "重複小計",
+            "合計",
+            "実働",
+            "時間外",
+            "深夜",
+        ],
+        description: "24h分離バグ: 運行内休息でshigyo未リセット (#2)",
+        cascading: true,
+    },
+    KnownBugPattern {
+        driver_cd: "1068",
+        date_contains: "2月3",
+        fields: &[
+            "始業",
+            "終業",
+            "運転",
+            "重複運転",
+            "小計",
+            "重複小計",
+            "合計",
+            "実働",
+            "時間外",
+            "深夜",
+        ],
+        description: "24h分離バグ: 連鎖 (#2)",
+        cascading: false,
+    },
+    // 1069: 2/3-4 長距離480例外（24h境界手前の休息534分が分割されない）
+    KnownBugPattern {
+        driver_cd: "1069",
+        date_contains: "2月3",
+        fields: &[
+            "終業",
+            "運転",
+            "重複運転",
+            "小計",
+            "重複小計",
             "実働",
             "時間外",
         ],
-        description: "24h分離バグ: 運行内休息でshigyo未リセット (#2)",
-        cascading: false,
+        description: "長距離480例外: 休息534分が未分割 (#3)",
+        cascading: true,
     },
-    // 1069: 2/4 長距離480例外（24h境界手前の休息534分が分割されない）
     KnownBugPattern {
         driver_cd: "1069",
         date_contains: "2月4",
-        fields: &["始業", "重複運転", "重複小計", "合計"],
-        description: "長距離480例外: 24h内の休息534分が未分割 (#3)",
+        fields: &[
+            "始業",
+            "運転",
+            "重複運転",
+            "小計",
+            "重複小計",
+            "合計",
+            "実働",
+        ],
+        description: "長距離480例外: 連鎖 (#3)",
         cascading: false,
     },
     // 1069: 2/9 #3バグの連鎖（overlap windowサイズのずれ）
@@ -451,6 +494,29 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "24h分離+480例外: 連鎖 (#2/#3)",
         cascading: false,
     },
+    // 1071: 2/13-14 長距離480例外（休息507分が未分割）
+    KnownBugPattern {
+        driver_cd: "1071",
+        date_contains: "2月13",
+        fields: &[
+            "終業",
+            "運転",
+            "重複運転",
+            "小計",
+            "重複小計",
+            "実働",
+            "時間外",
+        ],
+        description: "長距離480例外: 休息507分が未分割 (#3)",
+        cascading: true,
+    },
+    KnownBugPattern {
+        driver_cd: "1071",
+        date_contains: "2月14",
+        fields: &["運転", "小計", "実働", "時間外", "深夜"],
+        description: "長距離480例外: 連鎖 (#3)",
+        cascading: false,
+    },
     KnownBugPattern {
         driver_cd: "1071",
         date_contains: "2月14",
@@ -493,20 +559,17 @@ pub fn annotate_known_bugs(
 
     // Phase 2: 連鎖差分（cascading=trueのパターンがあれば、以降の累計差分もマーク）
     if has_cascading {
-        // 直接マッチした最初の日付を取得
-        let first_bug_date = diffs
-            .iter()
-            .find(|d| d.known_bug.is_some())
-            .map(|d| d.date.clone());
+        // 直接マッチした最初の日付インデックスを取得
+        let first_bug_idx = diffs.iter().position(|d| d.known_bug.is_some());
 
-        if let Some(ref bug_date) = first_bug_date {
-            for diff in diffs.iter_mut() {
-                if diff.known_bug.is_some() {
+        if let Some(idx) = first_bug_idx {
+            for i in idx..diffs.len() {
+                if diffs[i].known_bug.is_some() {
                     continue;
                 }
                 // 累計は始点以降の全日が影響を受ける
-                if diff.field == "累計" && diff.date >= *bug_date {
-                    diff.known_bug = Some("連鎖: 既知バグによる累計ずれ (#1)".to_string());
+                if diffs[i].field == "累計" {
+                    diffs[i].known_bug = Some("連鎖: 既知バグによる累計ずれ (#1)".to_string());
                 }
             }
         }

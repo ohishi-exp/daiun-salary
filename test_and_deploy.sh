@@ -53,9 +53,9 @@ if [ "$SKIP_COMPARE" = false ]; then
         "test_data/csvdata-202602-1041.zip|test_data/拘束時間管理表_202602-all.csv|105|0|1041(未知差分105件)"
         "test_data/csvdata-202602-1049.zip|test_data/拘束時間管理表_202602-all.csv|0|0|1049"
         "test_data/csvdata-202602-1051.zip|test_data/拘束時間管理表_202602-all.csv|0|0|1051"
-        "test_data/csvdata-202602-1068.zip|test_data/拘束時間管理表_202602-all.csv|16|5|1068(未知16件,既知バグ5件)"
-        "test_data/csvdata-202602-1069.zip|test_data/拘束時間管理表_202602-all.csv|12|4|1069(未知12件,既知バグ4件)"
-        "test_data/csvdata-202602-1071.zip|test_data/拘束時間管理表_202602-all.csv|16|42|1071(未知16件,既知バグ42件)"
+        "test_data/csvdata-202602-1068.zip|test_data/拘束時間管理表_202602-all.csv|0|21|1068(既知バグ21件)"
+        "test_data/csvdata-202602-1069.zip|test_data/拘束時間管理表_202602-all.csv|0|16|1069(既知バグ16件)"
+        "test_data/csvdata-202602-1071.zip|test_data/拘束時間管理表_202602-all.csv|0|58|1071(既知バグ58件)"
         "test_data/csvdata-202602-1078.zip|test_data/拘束時間管理表_202602-all.csv|0|29|1078(既知バグ29件)"
     )
 

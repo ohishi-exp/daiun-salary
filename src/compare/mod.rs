@@ -3040,6 +3040,149 @@ mod tests {
         assert!(!working.is_empty(), "22:00-5:00 should have late_night");
     }
 
+    // ---- build_day_map: spans_different_days (multi-op merge path) ----
+    #[test]
+    fn test_build_day_map_spans_different_days() {
+        let cls = default_classifications();
+        // 2運行、異なる日に出発（ret/depが日を共有しない）→ multi-op merge
+        let kudguri = vec![
+            make_kudguri("U1", "D1", dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 2, 10, 0, 0)),
+            make_kudguri("U2", "D1", dt(2026, 2, 4, 8, 0, 0), dt(2026, 2, 5, 10, 0, 0)),
+        ];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 600),
+            make_kudgivt("U1", dt(2026, 2, 1, 18, 0, 0), "302", 840),
+            make_kudgivt("U1", dt(2026, 2, 2, 8, 0, 0), "201", 120),
+            make_kudgivt("U2", dt(2026, 2, 4, 8, 0, 0), "201", 600),
+            make_kudgivt("U2", dt(2026, 2, 4, 18, 0, 0), "302", 840),
+            make_kudgivt("U2", dt(2026, 2, 5, 8, 0, 0), "201", 120),
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        for e in &refs {
+            by_unko.entry(e.unko_no.clone()).or_default().push(*e);
+        }
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        assert!(result.day_map.len() >= 2);
+    }
+
+    // ---- build_day_map: 3日以上スパンのsig_split ----
+    #[test]
+    fn test_build_day_map_sig_split_3day() {
+        let cls = default_classifications();
+        let kudguri = vec![make_kudguri(
+            "U1", "D1",
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 5, 17, 0, 0), // 4日スパン
+        )];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 600),
+            make_kudgivt("U1", dt(2026, 2, 1, 18, 0, 0), "302", 840), // 14h rest → split
+            make_kudgivt("U1", dt(2026, 2, 2, 8, 0, 0), "201", 1200), // 20h span crossing boundary
+            make_kudgivt("U1", dt(2026, 2, 3, 4, 0, 0), "302", 840),
+            make_kudgivt("U1", dt(2026, 2, 3, 18, 0, 0), "201", 600),
+            make_kudgivt("U1", dt(2026, 2, 4, 4, 0, 0), "302", 840),
+            make_kudgivt("U1", dt(2026, 2, 4, 18, 0, 0), "201", 600),
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), refs);
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        assert!(result.day_map.len() >= 3, "4-day span should produce ≥3 workdays");
+    }
+
+    // ---- build_day_map: same-day multi ops (shares date, not spans_different) ----
+    #[test]
+    fn test_build_day_map_same_day_multi_ops() {
+        let cls = default_classifications();
+        // 2運行が同日帰着/出発を共有 → spans_different_days=false
+        let kudguri = vec![
+            make_kudguri("U1", "D1", dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 2, 12, 0, 0)),
+            make_kudguri("U2", "D1", dt(2026, 2, 2, 14, 0, 0), dt(2026, 2, 3, 12, 0, 0)),
+        ];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 480),
+            make_kudgivt("U1", dt(2026, 2, 1, 16, 0, 0), "302", 840),
+            make_kudgivt("U1", dt(2026, 2, 2, 6, 0, 0), "201", 360),
+            make_kudgivt("U2", dt(2026, 2, 2, 14, 0, 0), "201", 480),
+            make_kudgivt("U2", dt(2026, 2, 2, 22, 0, 0), "302", 600),
+            make_kudgivt("U2", dt(2026, 2, 3, 8, 0, 0), "201", 240),
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        for e in &refs {
+            by_unko.entry(e.unko_no.clone()).or_default().push(*e);
+        }
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        assert!(result.day_map.len() >= 2);
+    }
+
+    // ---- post_process: split_rests accumulation ----
+    #[test]
+    fn test_post_process_split_rests() {
+        // 2分割休息: 200分 + 400分 = 600 ≥ 600 → reset
+        let cls = default_classifications();
+        let d1 = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
+        let d3 = NaiveDate::from_ymd_opt(2026, 2, 3).unwrap();
+        let t1 = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
+        let t2 = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        let t3 = NaiveTime::from_hms_opt(5, 0, 0).unwrap();
+        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        for (d, t, start_h, end_h) in [
+            (d1, t1, 6, 18), (d2, t2, 12, 22), (d3, t3, 5, 15)
+        ] {
+            let mut agg = DayAgg::default();
+            agg.drive_minutes = 300;
+            agg.total_work_minutes = 300;
+            agg.unko_nos = vec!["U1".into()];
+            agg.segments = vec![SegRec {
+                start_at: d.and_hms_opt(start_h, 0, 0).unwrap(),
+                end_at: d.and_hms_opt(end_h, 0, 0).unwrap(),
+            }];
+            day_map.insert(("D1".into(), d, t), agg);
+        }
+        let mut wb = HashMap::new();
+        for (d, t, s, e) in [
+            (d1, t1, dt(2026,2,1,6,0,0), dt(2026,2,1,18,0,0)),
+            (d2, t2, dt(2026,2,2,12,0,0), dt(2026,2,2,22,0,0)),
+            (d3, t3, dt(2026,2,3,5,0,0), dt(2026,2,3,15,0,0)),
+        ] { wb.insert(("D1".into(), d, t), (s, e)); }
+        let mwb = HashMap::new();
+        let mut dwe = HashMap::new();
+        let kudguri = vec![
+            make_kudguri("U1", "D1", dt(2026,2,1,6,0,0), dt(2026,2,1,18,0,0)),
+            make_kudguri("U1", "D1", dt(2026,2,2,12,0,0), dt(2026,2,2,22,0,0)),
+            make_kudguri("U1", "D1", dt(2026,2,3,5,0,0), dt(2026,2,3,15,0,0)),
+        ];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026,2,1,6,0,0), "201", 300),
+            make_kudgivt("U1", dt(2026,2,2,12,0,0), "201", 300),
+            make_kudgivt("U1", dt(2026,2,3,5,0,0), "201", 300),
+        ];
+        let erefs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), erefs);
+        let ferry = FerryInfo::default();
+        post_process_day_map(&mut day_map, &mut wb, &mwb, &mut dwe, &by_unko, &cls, &kudguri, &ferry);
+        assert_eq!(day_map.len(), 3);
+    }
+
+    // ---- process_parsed_data: 2 drivers ----
+    #[test]
+    fn test_process_parsed_data_two_drivers() {
+        let kudguri = vec![
+            make_kudguri("U1", "D1", dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 17, 0, 0)),
+            make_kudguri("U2", "D2", dt(2026, 2, 1, 9, 0, 0), dt(2026, 2, 1, 18, 0, 0)),
+        ];
+        let kudgivt = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 300),
+            make_kudgivt("U2", dt(2026, 2, 1, 9, 0, 0), "201", 300),
+        ];
+        let result = process_parsed_data(&kudguri, &kudgivt, &FerryInfo::default(), 2026, 2).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
     // ---- parse_ferry_periods_from_text ----
     #[test]
     fn test_parse_ferry_periods_basic() {

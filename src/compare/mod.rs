@@ -531,6 +531,39 @@ const KNOWN_BUGS: &[KnownBugPattern] = &[
         description: "長距離480例外: 休息507分が未分割 (#3)",
         cascading: false,
     },
+    // 1072: 2/18-19 長距離480例外（休息530分が未分割）
+    KnownBugPattern {
+        driver_cd: "1072",
+        date_contains: "2月18",
+        fields: &[
+            "終業",
+            "運転",
+            "重複運転",
+            "小計",
+            "重複小計",
+            "実働",
+            "時間外",
+        ],
+        description: "長距離480例外: 休息530分が未分割 (#3)",
+        cascading: true,
+    },
+    KnownBugPattern {
+        driver_cd: "1072",
+        date_contains: "2月19",
+        fields: &[
+            "始業",
+            "運転",
+            "重複運転",
+            "小計",
+            "重複小計",
+            "合計",
+            "実働",
+            "時間外",
+            "深夜",
+        ],
+        description: "長距離480例外: 連鎖 (#3)",
+        cascading: true,
+    },
 ];
 
 /// 差分リストに既知バグアノテーションを付与（連鎖差分の自動計算含む）
@@ -1146,8 +1179,7 @@ fn merge_same_day_entries(
                         agg_b.segments.iter().map(|s| s.start_at).min(),
                     ) {
                         (Some(pe), Some(ns)) => {
-                            let gap_secs = (ns - pe).num_seconds();
-                            let gap = ((gap_secs + 30) / 60) as i64;
+                            let gap = (trunc_min(ns) - trunc_min(pe)).num_minutes();
                             if gap >= 0 && gap < 180 {
                                 Some(gap as i32)
                             } else {

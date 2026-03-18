@@ -57,6 +57,7 @@ if [ "$SKIP_COMPARE" = false ]; then
         "test_data/csvdata-202602-1069.zip|test_data/拘束時間管理表_202602-all.csv|0|16|1069(既知バグ16件)"
         "test_data/csvdata-202602-1071.zip|test_data/拘束時間管理表_202602-all.csv|0|58|1071(既知バグ58件)"
         "test_data/csvdata-202602-1078.zip|test_data/拘束時間管理表_202602-all.csv|0|29|1078(既知バグ29件)"
+        "test_data/csvdata-202602-1072.zip|test_data/拘束時間管理表_202602-all.csv|0|19|1072(既知バグ19件)"
     )
 
     TOTAL_COMPARE=${#COMPARE_TESTS[@]}

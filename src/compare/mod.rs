@@ -766,7 +766,7 @@ pub fn post_process_day_map(
         (String, NaiveDate, NaiveTime),
         (NaiveDateTime, NaiveDateTime),
     >,
-    multi_wd_boundaries: &std::collections::HashSet<(String, NaiveDate, NaiveTime)>,
+    multi_wd_boundaries: &HashMap<(String, NaiveDate, NaiveTime), NaiveDateTime>,
     day_work_events: &mut HashMap<
         (String, NaiveDate, NaiveTime),
         Vec<(NaiveDateTime, NaiveDateTime)>,
@@ -903,6 +903,11 @@ pub fn post_process_day_map(
             for (idx, &(date, st)) in dates.iter().enumerate() {
                 let info = &dates_map[&(date, st)];
 
+                // determine_workdays由来のwb_endを保存（line932で上書きされる前）
+                let orig_wb_end = workday_boundaries
+                    .get(&(driver_cd.clone(), date, st))
+                    .map(|&(_, end)| end);
+
                 // deductionは先に適用（resetで消される前に）
                 if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) =
                     next_day_deduction.take()
@@ -921,17 +926,16 @@ pub fn post_process_day_map(
                 };
                 if reset {
                     let key = (driver_cd.clone(), date, st);
-                    if let Some(&(wb_start, wb_end_orig)) = workday_boundaries.get(&key) {
+                    if let Some(&(wb_start, _)) = workday_boundaries.get(&key) {
                         // merge由来の24h境界がある → chain最終日
                         // effective_startは24h境界から（window計算に使用）
                         effective_start = Some(wb_start);
-                        // endは実際のsegment endに更新（ただし24h境界を縮めない）
+                        // endは実際のsegment endに更新
                         let seg_end = day_map
                             .get(&key)
                             .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
                             .unwrap_or(info.end);
-                        let end = wb_end_orig.max(seg_end);
-                        workday_boundaries.insert(key, (wb_start, end));
+                        workday_boundaries.insert(key, (wb_start, seg_end));
                     } else {
                         effective_start = Some(info.start);
                     }
@@ -1055,14 +1059,13 @@ pub fn post_process_day_map(
 
                     // determine_workdaysが複数workdayを生成し、
                     // 24h境界より前に終業を設定している場合はchainしない
+                    // (determine_workdays由来のオリジナルwb.endで判定)
                     if !next_resets {
                         let key = (driver_cd.clone(), date, st);
-                        if multi_wd_boundaries.contains(&key) {
-                            if let Some(&(_, wb_end)) = workday_boundaries.get(&key) {
-                                if wb_end < window_end {
-                                    next_resets = true;
-                                    split_rests.clear();
-                                }
+                        if let Some(&det_end) = multi_wd_boundaries.get(&key) {
+                            if det_end < window_end {
+                                next_resets = true;
+                                split_rests.clear();
                             }
                         }
                     }
@@ -1103,11 +1106,7 @@ pub fn post_process_day_map(
                             .get(&next_key)
                             .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
                             .unwrap_or(window_end + chrono::Duration::hours(24));
-                        // 既存のwb.endがnext_seg_endより後なら保持（24h境界を縮めない）
-                        let next_end = workday_boundaries
-                            .get(&next_key)
-                            .map(|&(_, orig_end)| orig_end.max(next_seg_end))
-                            .unwrap_or(next_seg_end);
+                        let next_end = next_seg_end;
                         workday_boundaries.insert(next_key, (window_end, next_end));
                     } else if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                         agg.overlap_drive_minutes = ol_drive;
@@ -1175,7 +1174,8 @@ pub fn post_process_day_map(
 pub struct BuildDayMapResult {
     pub day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg>,
     pub workday_boundaries: HashMap<(String, NaiveDate, NaiveTime), (NaiveDateTime, NaiveDateTime)>,
-    pub multi_wd_boundaries: std::collections::HashSet<(String, NaiveDate, NaiveTime)>,
+    /// determine_workdaysが複数workdayを生成した場合の、オリジナルのwd.end
+    pub multi_wd_boundaries: HashMap<(String, NaiveDate, NaiveTime), NaiveDateTime>,
     pub day_work_events:
         HashMap<(String, NaiveDate, NaiveTime), Vec<(NaiveDateTime, NaiveDateTime)>>,
 }
@@ -1193,8 +1193,8 @@ pub fn build_day_map(
     > = HashMap::new();
     // determine_workdaysが複数workdayを生成した境界（分割休息/24h境界等）
     // overlap計算でのchain上書きを防止するために使用
-    let mut multi_wd_boundaries: std::collections::HashSet<(String, NaiveDate, NaiveTime)> =
-        std::collections::HashSet::new();
+    let mut multi_wd_boundaries: HashMap<(String, NaiveDate, NaiveTime), NaiveDateTime> =
+        HashMap::new();
     let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
     let mut unko_segments: HashMap<
         String,
@@ -1332,7 +1332,7 @@ pub fn build_day_map(
                     workday_boundaries.insert(key.clone(), (wd.start, wd.end));
                     // 複数workdayの場合、各境界をauthoritativeとして登録
                     if workdays.len() >= 2 {
-                        multi_wd_boundaries.insert(key);
+                        multi_wd_boundaries.insert(key, wd.end);
                     }
                 }
 

@@ -2135,3 +2135,212 @@ pub fn process_zip(
 
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn dt(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, mi, s)
+            .unwrap()
+    }
+
+    fn make_kudguri(
+        unko_no: &str,
+        driver_cd: &str,
+        dep: NaiveDateTime,
+        ret: NaiveDateTime,
+    ) -> csv_parser::kudguri::KudguriRow {
+        csv_parser::kudguri::KudguriRow {
+            unko_no: unko_no.into(),
+            reading_date: dep.date(),
+            driver_cd: driver_cd.into(),
+            driver_name: "Test".into(),
+            vehicle_cd: "V1".into(),
+            vehicle_name: "V1".into(),
+            office_cd: "1".into(),
+            office_name: "Test".into(),
+            crew_role: 1,
+            operation_date: Some(dep.date()),
+            departure_at: Some(dep),
+            return_at: Some(ret),
+            garage_out_at: None,
+            garage_in_at: None,
+            meter_start: None,
+            meter_end: None,
+            total_distance: None,
+            drive_time_general: None,
+            drive_time_highway: None,
+            drive_time_bypass: None,
+            safety_score: None,
+            economy_score: None,
+            total_score: None,
+            raw_data: serde_json::Value::Null,
+        }
+    }
+
+    fn make_csv_day(date: &str, start: &str, end: &str, drive: &str, subtotal: &str) -> CsvDayRow {
+        CsvDayRow {
+            date: date.into(),
+            is_holiday: false,
+            start_time: start.into(),
+            end_time: end.into(),
+            drive: drive.into(),
+            overlap_drive: "".into(),
+            cargo: "".into(),
+            overlap_cargo: "".into(),
+            break_time: "".into(),
+            overlap_break: "".into(),
+            subtotal: subtotal.into(),
+            overlap_subtotal: "".into(),
+            total: subtotal.into(),
+            cumulative: subtotal.into(),
+            rest: "".into(),
+            actual_work: drive.into(),
+            overtime: "".into(),
+            late_night: "".into(),
+            ot_late_night: "".into(),
+            remarks: "".into(),
+        }
+    }
+
+    // ---- fmt_min ----
+    #[test]
+    fn test_fmt_min_zero() {
+        assert_eq!(fmt_min(0), "");
+    }
+    #[test]
+    fn test_fmt_min_hours_and_minutes() {
+        assert_eq!(fmt_min(90), "1:30");
+        assert_eq!(fmt_min(605), "10:05");
+    }
+    #[test]
+    fn test_fmt_min_minutes_only() {
+        assert_eq!(fmt_min(45), "0:45");
+    }
+
+    // ---- trunc_min ----
+    #[test]
+    fn test_trunc_min() {
+        assert_eq!(trunc_min(dt(2026, 2, 5, 8, 15, 49)), dt(2026, 2, 5, 8, 15, 0));
+        assert_eq!(trunc_min(dt(2026, 2, 5, 0, 0, 0)), dt(2026, 2, 5, 0, 0, 0));
+    }
+
+    // ---- normalize_time ----
+    #[test]
+    fn test_normalize_time() {
+        assert_eq!(normalize_time("01:30"), "1:30");
+        assert_eq!(normalize_time("9:05"), "9:05");
+        assert_eq!(normalize_time(""), "");
+        assert_eq!(normalize_time("  3:00  "), "3:00");
+    }
+
+    // ---- calc_ot_late_night_from_events ----
+    #[test]
+    fn test_ot_late_night_no_overtime() {
+        // 8h以内 → 時間外なし → 深夜0
+        let events = vec![
+            (dt(2026, 2, 1, 22, 0, 0), dt(2026, 2, 2, 5, 0, 0)), // 7h (22-5 = all deep night but < 8h)
+        ];
+        assert_eq!(calc_ot_late_night_from_events(&events), 0);
+    }
+    #[test]
+    fn test_ot_late_night_with_overtime() {
+        // 合計9h → 1h時間外。最後の1h(4:00-5:00)が深夜帯
+        let events = vec![
+            (dt(2026, 2, 1, 20, 0, 0), dt(2026, 2, 2, 5, 0, 0)), // 9h
+        ];
+        let result = calc_ot_late_night_from_events(&events);
+        assert_eq!(result, 60); // 4:00-5:00 = 1h deep night overtime
+    }
+
+    // ---- split_work_segments_at_boundary ----
+    #[test]
+    fn test_split_at_boundary_no_crossing() {
+        let segs = vec![work_segments::WorkSegment {
+            start: dt(2026, 2, 1, 8, 0, 0),
+            end: dt(2026, 2, 1, 16, 0, 0),
+            labor_minutes: 480,
+            drive_minutes: 400,
+            cargo_minutes: 80,
+        }];
+        let boundary = dt(2026, 2, 1, 20, 0, 0); // after segment end
+        let result = split_work_segments_at_boundary(segs, boundary);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].drive_minutes, 400);
+    }
+    #[test]
+    fn test_split_at_boundary_crossing() {
+        let segs = vec![work_segments::WorkSegment {
+            start: dt(2026, 2, 1, 8, 0, 0),
+            end: dt(2026, 2, 1, 16, 0, 0),
+            labor_minutes: 480,
+            drive_minutes: 480,
+            cargo_minutes: 0,
+        }];
+        let boundary = dt(2026, 2, 1, 12, 0, 0); // midpoint
+        let result = split_work_segments_at_boundary(segs, boundary);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].drive_minutes, 240); // 50% of 480
+        assert_eq!(result[1].drive_minutes, 240);
+        assert_eq!(result[0].end, boundary);
+        assert_eq!(result[1].start, boundary);
+    }
+
+    // ---- group_operations_into_work_days ----
+    #[test]
+    fn test_group_ops_single_run() {
+        let rows = vec![make_kudguri("U001", "1001", dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 17, 0, 0))];
+        let result = group_operations_into_work_days(&rows);
+        assert_eq!(result.get("U001"), Some(&NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()));
+    }
+    #[test]
+    fn test_group_ops_short_gap_same_day() {
+        let rows = vec![
+            make_kudguri("U001", "1001", dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 12, 0, 0)),
+            make_kudguri("U002", "1001", dt(2026, 2, 1, 12, 30, 0), dt(2026, 2, 1, 17, 0, 0)),
+        ];
+        let result = group_operations_into_work_days(&rows);
+        assert_eq!(result["U001"], result["U002"]);
+    }
+    #[test]
+    fn test_group_ops_long_gap_new_day() {
+        // gap=20h > 540 → 別work_date
+        let rows = vec![
+            make_kudguri("U001", "1001", dt(2026, 2, 1, 8, 0, 0), dt(2026, 2, 1, 12, 0, 0)),
+            make_kudguri("U002", "1001", dt(2026, 2, 2, 8, 0, 0), dt(2026, 2, 2, 17, 0, 0)),
+        ];
+        let result = group_operations_into_work_days(&rows);
+        assert_ne!(result["U001"], result["U002"]);
+    }
+
+    // ---- detect_diffs_csv ----
+    #[test]
+    fn test_detect_diffs_no_diff() {
+        let day = make_csv_day("2月1日", "8:00", "17:00", "5:00", "7:00");
+        let diffs = detect_diffs_csv(&[day.clone()], &[day]);
+        assert!(diffs.is_empty());
+    }
+    #[test]
+    fn test_detect_diffs_with_diff() {
+        let csv_day = make_csv_day("2月1日", "8:00", "17:00", "5:00", "5:00");
+        let mut sys_day = csv_day.clone();
+        sys_day.drive = "6:00".into();
+        let diffs = detect_diffs_csv(&[csv_day], &[sys_day]);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].field, "運転");
+    }
+
+    // ---- DayAgg default ----
+    #[test]
+    fn test_day_agg_default() {
+        let agg = DayAgg::default();
+        assert_eq!(agg.drive_minutes, 0);
+        assert_eq!(agg.total_work_minutes, 0);
+        assert!(agg.unko_nos.is_empty());
+        assert!(!agg.from_multi_op);
+    }
+}

@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
-use daiun_salary::compare::{self, parse_restraint_csv, CsvDayRow, CsvDriverData, DiffItem};
+use daiun_salary::compare::{
+    self, annotate_known_bugs, parse_restraint_csv, CsvDayRow, CsvDriverData, DiffItem,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -23,6 +25,11 @@ pub struct RestraintReportFilter {
     pub driver_id: Uuid,
     pub year: i32,
     pub month: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompareQuery {
+    pub driver_cd: Option<String>,
 }
 
 // --- Response DTOs ---
@@ -594,6 +601,8 @@ pub struct CompareResult {
     pub csv: CsvDriverData,
     pub system: Option<SystemDriverData>,
     pub diffs: Vec<DiffItem>,
+    pub known_bug_diffs: usize,
+    pub unknown_diffs: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -679,9 +688,11 @@ fn parse_hhmm(s: &str) -> i32 {
 async fn compare_csv(
     State(state): State<AppState>,
     Extension(auth_user): Extension<AuthUser>,
+    Query(query): Query<CompareQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<Vec<CompareResult>>, (StatusCode, String)> {
     let tenant_id = auth_user.tenant_id;
+    let filter_driver_cd = query.driver_cd;
 
     // CSVファイルを受け取る
     let mut csv_bytes = Vec::new();
@@ -730,10 +741,16 @@ async fn compare_csv(
     let mut results = Vec::new();
 
     for csv_d in &csv_drivers {
+        // driver_cd フィルター
+        if let Some(ref filter_cd) = filter_driver_cd {
+            if csv_d.driver_cd != *filter_cd {
+                continue;
+            }
+        }
         // driver_cd でマッチ
         let db_match = db_drivers.iter().find(|(_, cd, _)| cd == &csv_d.driver_cd);
 
-        let (driver_id, system_data, diffs) = if let Some((did, _, dname)) = db_match {
+        let (driver_id, system_data, mut diffs) = if let Some((did, _, dname)) = db_match {
             // システムのレポートを取得
             match build_report_with_name(&state.pool, tenant_id, *did, dname, year, month).await {
                 Ok(report) => {
@@ -804,6 +821,7 @@ async fn compare_csv(
                                     field: field.to_string(),
                                     csv_val: cv.to_string(),
                                     sys_val: sv.to_string(),
+                                    known_bug: None,
                                 });
                             }
                         }
@@ -870,8 +888,18 @@ async fn compare_csv(
                 total_ot_late_night: csv_d.total_ot_late_night.clone(),
             },
             system: system_data,
-            diffs,
+            diffs: {
+                // 既知バグアノテーション適用
+                annotate_known_bugs(&csv_d.driver_cd, &mut diffs, &mut []);
+                diffs
+            },
+            known_bug_diffs: 0, // 下で再計算
+            unknown_diffs: 0,
         });
+        // known_bug_diffs / unknown_diffs を再計算
+        let last = results.last_mut().unwrap();
+        last.known_bug_diffs = last.diffs.iter().filter(|d| d.known_bug.is_some()).count();
+        last.unknown_diffs = last.diffs.len() - last.known_bug_diffs;
     }
 
     Ok(Json(results))
@@ -927,6 +955,7 @@ fn detect_diffs(csv_days: &[CsvDayRow], sys_days: &[SystemDayRow]) -> Vec<DiffIt
                     field: field.to_string(),
                     csv_val: cv.to_string(),
                     sys_val: sv.to_string(),
+                    known_bug: None,
                 });
             }
         }

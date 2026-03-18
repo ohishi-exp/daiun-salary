@@ -525,6 +525,7 @@ async fn calculate_daily_hours(
     daiun_salary::compare::post_process_day_map(
         &mut compare_day_map,
         &mut workday_boundaries,
+        &build_result.multi_wd_boundaries,
         &mut day_work_events,
         &kudgivt_by_unko,
         &classifications,

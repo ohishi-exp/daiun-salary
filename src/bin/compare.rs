@@ -145,7 +145,7 @@ fn main() {
 fn output_report(report: &CompareReport, json_output: bool) {
     if json_output {
         println!("{}", serde_json::to_string_pretty(report).unwrap());
-        process::exit(if report.total_diffs > 0 { 1 } else { 0 });
+        process::exit(if report.unknown_diffs > 0 { 1 } else { 0 });
     }
 
     // カラー出力
@@ -155,24 +155,48 @@ fn output_report(report: &CompareReport, json_output: bool) {
             println!("  \x1b[32m差分なし\x1b[0m");
         } else {
             for d in &dr.diffs {
-                println!(
-                    "  \x1b[31m{} {}: csv1={} csv2={}\x1b[0m",
-                    d.date, d.field, d.csv_val, d.sys_val
-                );
-            }
-            if !dr.diffs.is_empty() {
-                println!("  差分: {}件", dr.diffs.len());
+                if let Some(ref bug) = d.known_bug {
+                    println!(
+                        "  \x1b[33m{} {}: csv={} sys={} [{}]\x1b[0m",
+                        d.date, d.field, d.csv_val, d.sys_val, bug
+                    );
+                } else {
+                    println!(
+                        "  \x1b[31m{} {}: csv={} sys={}\x1b[0m",
+                        d.date, d.field, d.csv_val, d.sys_val
+                    );
+                }
             }
             for t in &dr.total_diffs {
-                println!(
-                    "  \x1b[31m{}: csv1={} csv2={}\x1b[0m",
-                    t.label, t.csv_val, t.sys_val
-                );
+                if let Some(ref bug) = t.known_bug {
+                    println!(
+                        "  \x1b[33m{}: csv={} sys={} [{}]\x1b[0m",
+                        t.label, t.csv_val, t.sys_val, bug
+                    );
+                } else {
+                    println!(
+                        "  \x1b[31m{}: csv={} sys={}\x1b[0m",
+                        t.label, t.csv_val, t.sys_val
+                    );
+                }
+            }
+            if dr.unknown_diffs > 0 {
+                println!("  未知差分: {}件", dr.unknown_diffs);
+            }
+            if dr.known_bug_diffs > 0 {
+                println!("  既知バグ: {}件", dr.known_bug_diffs);
             }
         }
         println!();
     }
 
-    println!("合計差分: {}件", report.total_diffs);
-    process::exit(if report.total_diffs > 0 { 1 } else { 0 });
+    if report.known_bug_diffs > 0 {
+        println!(
+            "合計差分: {}件 (既知バグ: {}件, 未知: {}件)",
+            report.total_diffs, report.known_bug_diffs, report.unknown_diffs
+        );
+    } else {
+        println!("合計差分: {}件", report.total_diffs);
+    }
+    process::exit(if report.unknown_diffs > 0 { 1 } else { 0 });
 }

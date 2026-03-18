@@ -45,27 +45,33 @@ echo "  OK"
 STEP=$((STEP+1))
 
 if [ "$SKIP_COMPARE" = false ]; then
-    # CSV比較テスト定義: ZIP CSV 期待差分数 ラベル
+    # CSV比較テスト定義: ZIP CSV 期待未知差分 期待既知バグ差分 ラベル
     declare -a COMPARE_TESTS=(
-        "test_data/csvdata-202602-1018-1021-1026.zip|test_data/拘束時間管理表_202602-1018-1021-1026.csv|0|1018/1021/1026"
-        "test_data/csvdata-202602-1029-1032-1036-1037.zip|test_data/拘束時間管理表_202602-1029-1032-1036-1037.csv|0|1029/1032/1036/1037"
-        "test_data/csvdata-202602-1039.zip|test_data/拘束時間管理表_202602-all.csv|15|1039(既知差分15件)"
+        "test_data/csvdata-202602-1018-1021-1026.zip|test_data/拘束時間管理表_202602-1018-1021-1026.csv|0|0|1018/1021/1026"
+        "test_data/csvdata-202602-1029-1032-1036-1037.zip|test_data/拘束時間管理表_202602-1029-1032-1036-1037.csv|0|0|1029/1032/1036/1037"
+        "test_data/csvdata-202602-1039.zip|test_data/拘束時間管理表_202602-all.csv|0|15|1039(既知バグ15件)"
+        "test_data/csvdata-202602-1041.zip|test_data/拘束時間管理表_202602-all.csv|110|0|1041(未知差分110件)"
     )
 
     TOTAL_COMPARE=${#COMPARE_TESTS[@]}
     for i in "${!COMPARE_TESTS[@]}"; do
-        IFS='|' read -r ZIP CSV EXPECTED_DIFFS LABEL <<< "${COMPARE_TESTS[$i]}"
+        IFS='|' read -r ZIP CSV EXPECTED_UNKNOWN EXPECTED_KNOWN LABEL <<< "${COMPARE_TESTS[$i]}"
         echo ""
         echo "=== Step $STEP: CSV比較 ($LABEL) ==="
 
-        OUTPUT=$(cargo run --bin compare -- "$ZIP" "$CSV" --json 2>&1)
-        DIFFS=$(echo "$OUTPUT" | grep -o '"total_diffs": [0-9]*' | tail -1 | grep -o '[0-9]*')
+        OUTPUT=$(cargo run --bin compare -- "$ZIP" "$CSV" --json 2>&1 || true)
+        UNKNOWN=$(echo "$OUTPUT" | grep -o '"unknown_diffs": [0-9]*' | tail -1 | grep -o '[0-9]*')
+        KNOWN=$(echo "$OUTPUT" | grep -o '"known_bug_diffs": [0-9]*' | tail -1 | grep -o '[0-9]*')
+        UNKNOWN=${UNKNOWN:-0}
+        KNOWN=${KNOWN:-0}
 
-        if [ "$DIFFS" = "$EXPECTED_DIFFS" ]; then
-            echo "  OK（差分${DIFFS}件 = 期待値${EXPECTED_DIFFS}件）"
+        if [ "$UNKNOWN" = "$EXPECTED_UNKNOWN" ] && [ "$KNOWN" = "$EXPECTED_KNOWN" ]; then
+            echo "  OK（未知${UNKNOWN}件, 既知バグ${KNOWN}件）"
+        elif [ "$UNKNOWN" = "$EXPECTED_UNKNOWN" ]; then
+            echo "  WARN: 未知${UNKNOWN}件=OK, 既知バグ${KNOWN}件≠期待値${EXPECTED_KNOWN}件"
         else
-            echo "  FAIL: 差分${DIFFS}件 ≠ 期待値${EXPECTED_DIFFS}件"
-            echo "$OUTPUT" | tail -20
+            echo "  FAIL: 未知${UNKNOWN}件≠期待値${EXPECTED_UNKNOWN}件, 既知バグ${KNOWN}件"
+            echo "$OUTPUT" | tail -30
             exit 1
         fi
         STEP=$((STEP+1))

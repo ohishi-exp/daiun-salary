@@ -29,10 +29,12 @@ pub struct Workday {
 /// - `rest_events`: 302イベント（時系列ソート済み）
 /// - `first_start`: 最初の拘束開始（出社日時等）
 /// - `last_end`: 最後の拘束終了
+/// - `is_long_distance`: 宿泊を伴う長距離貨物運送（例外基準: 480分）
 pub fn determine_workdays(
     rest_events: &[(NaiveDateTime, i32)], // (start_at, duration_minutes)
     first_start: NaiveDateTime,
     last_end: NaiveDateTime,
+    is_long_distance: bool,
 ) -> Vec<Workday> {
     let mut workdays = Vec::new();
     let mut current_start = first_start;
@@ -48,9 +50,11 @@ pub fn determine_workdays(
         let rest_end = rest_start + chrono::Duration::minutes(rest_duration as i64);
 
         // 24時間ルール: 始業から24h経過していたら強制日締め（複数回分割の可能性）
+        let mut handled_by_24h = false;
         loop {
             let max_end = current_start + chrono::Duration::minutes(MAX_WORK_HOURS);
             if rest_start >= max_end {
+                // 休息開始が24h後より後 → 24h境界で強制分割
                 workdays.push(Workday {
                     start: current_start,
                     end: max_end,
@@ -58,13 +62,34 @@ pub fn determine_workdays(
                 });
                 current_start = max_end;
                 split_rests.clear();
+            } else if rest_start < max_end && rest_end > max_end {
+                // 24hマークが休息の途中に落ちる場合:
+                // 「始業から24時間後が休息中なら休息の開始が終業になる」
+                // 休息終了が新しい始業
+                workdays.push(Workday {
+                    start: current_start,
+                    end: rest_start,
+                    date: current_start.date(),
+                });
+                current_start = rest_end;
+                split_rests.clear();
+                handled_by_24h = true;
+                break;
             } else {
                 break;
             }
         }
+        if handled_by_24h {
+            continue;
+        }
 
-        // 原則: 連続540分以上
-        if rest_duration >= REST_THRESHOLD_PRINCIPAL {
+        // 原則: 連続540分以上 / 長距離例外: 480分以上
+        let threshold = if is_long_distance {
+            480
+        } else {
+            REST_THRESHOLD_PRINCIPAL
+        };
+        if rest_duration >= threshold {
             workdays.push(Workday {
                 start: current_start,
                 end: rest_start,
@@ -345,7 +370,7 @@ pub fn split_segments_at_24h(segments: Vec<WorkSegment>) -> Vec<WorkSegment> {
 }
 
 /// 指定範囲内のイベントを運転/荷役に分けて duration_minutes を合計
-fn sum_events_in_range(
+pub fn sum_events_in_range(
     events: &[&&KudgivtRow],
     classifications: &HashMap<String, EventClass>,
     range_start: NaiveDateTime,
@@ -600,5 +625,54 @@ mod tests {
             calc_late_night_mins(dt(2026, 1, 1, 8, 0), dt(2026, 1, 1, 17, 0),),
             0
         );
+    }
+
+    #[test]
+    fn test_24h_mark_during_rest() {
+        // 始業: 2/21 08:30
+        // 休息: 2/22 06:00〜15:00 (540min)
+        // 24hマーク: 2/22 08:30 → 休息の途中
+        // 期待: workday1 ends at 06:00 (rest_start), workday2 starts at 15:00 (rest_end)
+        let rest_events = vec![(dt(2026, 2, 22, 6, 0), 540)];
+        let first_start = dt(2026, 2, 21, 8, 30);
+        let last_end = dt(2026, 2, 22, 20, 0);
+        let workdays = determine_workdays(&rest_events, first_start, last_end, false);
+        assert_eq!(workdays.len(), 2);
+        assert_eq!(workdays[0].start, dt(2026, 2, 21, 8, 30));
+        assert_eq!(workdays[0].end, dt(2026, 2, 22, 6, 0)); // 休息開始 = 終業
+        assert_eq!(workdays[1].start, dt(2026, 2, 22, 15, 0)); // 休息終了 = 始業
+        assert_eq!(workdays[1].end, dt(2026, 2, 22, 20, 0));
+    }
+
+    #[test]
+    fn test_24h_mark_during_short_rest() {
+        // 始業: 2/21 08:30
+        // 休息: 2/22 07:00〜11:00 (240min, < 540min)
+        // 24hマーク: 2/22 08:30 → 休息の途中
+        // 短い休息でも24hルールで日締めされる
+        let rest_events = vec![(dt(2026, 2, 22, 7, 0), 240)];
+        let first_start = dt(2026, 2, 21, 8, 30);
+        let last_end = dt(2026, 2, 22, 20, 0);
+        let workdays = determine_workdays(&rest_events, first_start, last_end, false);
+        assert_eq!(workdays.len(), 2);
+        assert_eq!(workdays[0].end, dt(2026, 2, 22, 7, 0)); // 休息開始 = 終業
+        assert_eq!(workdays[1].start, dt(2026, 2, 22, 11, 0)); // 休息終了 = 始業
+    }
+
+    #[test]
+    fn test_24h_mark_after_short_rest_no_split() {
+        // 1039ケース: 383min休息が24hマーク前に終了 → 新ルール不発動
+        // 始業: 2/21 08:30
+        // 休息: 2/21 23:17〜2/22 05:40 (383min)
+        // 24hマーク: 2/22 08:30 → 休息は05:40に終了済み
+        let rest_events = vec![(dt(2026, 2, 21, 23, 17), 383)];
+        let first_start = dt(2026, 2, 21, 8, 30);
+        let last_end = dt(2026, 2, 22, 20, 20);
+        let workdays = determine_workdays(&rest_events, first_start, last_end, false);
+        // 383min < 540min → 休息による分割なし
+        // 24hルールで08:30に強制分割
+        assert_eq!(workdays.len(), 2);
+        assert_eq!(workdays[0].end, dt(2026, 2, 22, 8, 30)); // 24h境界
+        assert_eq!(workdays[1].start, dt(2026, 2, 22, 8, 30)); // 24h境界から開始
     }
 }

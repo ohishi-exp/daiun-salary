@@ -59,12 +59,16 @@ pub struct DiffItem {
     pub field: String,
     pub csv_val: String,
     pub sys_val: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_bug: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CompareReport {
     pub drivers: Vec<DriverCompareResult>,
     pub total_diffs: usize,
+    pub known_bug_diffs: usize,
+    pub unknown_diffs: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,6 +77,8 @@ pub struct DriverCompareResult {
     pub driver_cd: String,
     pub diffs: Vec<DiffItem>,
     pub total_diffs: Vec<TotalDiffItem>,
+    pub known_bug_diffs: usize,
+    pub unknown_diffs: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +86,8 @@ pub struct TotalDiffItem {
     pub label: String,
     pub csv_val: String,
     pub sys_val: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_bug: Option<String>,
 }
 
 // ========== ユーティリティ ==========
@@ -277,6 +285,7 @@ pub fn detect_diffs_csv(csv_days: &[CsvDayRow], sys_days: &[CsvDayRow]) -> Vec<D
                     field: field.to_string(),
                     csv_val: cv.to_string(),
                     sys_val: sv.to_string(),
+                    known_bug: None,
                 });
             }
         }
@@ -302,6 +311,90 @@ pub fn detect_year_month(drivers: &[CsvDriverData]) -> (i32, u32) {
     (2026, 1)
 }
 
+// ========== 既知バグパターン ==========
+
+struct KnownBugPattern {
+    driver_cd: &'static str,
+    date_contains: &'static str,
+    fields: &'static [&'static str],
+    description: &'static str,
+    cascading: bool,
+}
+
+/// web地球号の既知バグパターン定義
+const KNOWN_BUGS: &[KnownBugPattern] = &[
+    // 1039: 2/22 休息終了が始業にならないバグ → 170分消失
+    KnownBugPattern {
+        driver_cd: "1039",
+        date_contains: "2月22",
+        fields: &["始業", "終業", "運転", "小計", "合計", "実働", "時間外"],
+        description: "web地球号バグ: 休息終了が始業にならない (#1)",
+        cascading: true,
+    },
+    // 1039: 2/21 休息基準未達なのに終業扱い
+    KnownBugPattern {
+        driver_cd: "1039",
+        date_contains: "2月21",
+        fields: &["終業", "運転", "小計", "合計", "実働", "時間外", "深夜"],
+        description: "web地球号バグ: 休息基準未達で終業扱い (#1)",
+        cascading: true,
+    },
+];
+
+/// 差分リストに既知バグアノテーションを付与（連鎖差分の自動計算含む）
+pub fn annotate_known_bugs(
+    driver_cd: &str,
+    diffs: &mut [DiffItem],
+    total_diffs: &mut [TotalDiffItem],
+) {
+    let mut has_cascading = false;
+
+    // Phase 1: 直接パターンマッチ
+    for diff in diffs.iter_mut() {
+        for pattern in KNOWN_BUGS {
+            if pattern.driver_cd == driver_cd
+                && diff.date.contains(pattern.date_contains)
+                && pattern.fields.contains(&diff.field.as_str())
+            {
+                diff.known_bug = Some(pattern.description.to_string());
+                if pattern.cascading {
+                    has_cascading = true;
+                }
+                break;
+            }
+        }
+    }
+
+    // Phase 2: 連鎖差分（cascading=trueのパターンがあれば、以降の累計差分もマーク）
+    if has_cascading {
+        // 直接マッチした最初の日付を取得
+        let first_bug_date = diffs
+            .iter()
+            .find(|d| d.known_bug.is_some())
+            .map(|d| d.date.clone());
+
+        if let Some(ref bug_date) = first_bug_date {
+            for diff in diffs.iter_mut() {
+                if diff.known_bug.is_some() {
+                    continue;
+                }
+                // 累計は始点以降の全日が影響を受ける
+                if diff.field == "累計" && diff.date >= *bug_date {
+                    diff.known_bug = Some("連鎖: 既知バグによる累計ずれ (#1)".to_string());
+                }
+            }
+        }
+    }
+
+    // Phase 3: 合計行 — 全day差分がknown_bugなら合計もknown_bug
+    let all_day_diffs_known = diffs.iter().all(|d| d.known_bug.is_some());
+    if all_day_diffs_known && !diffs.is_empty() {
+        for td in total_diffs.iter_mut() {
+            td.known_bug = Some("連鎖: 既知バグによる合計ずれ (#1)".to_string());
+        }
+    }
+}
+
 // ========== ドライバー比較 ==========
 
 pub fn compare_drivers(
@@ -312,6 +405,8 @@ pub fn compare_drivers(
     let mut report = CompareReport {
         drivers: Vec::new(),
         total_diffs: 0,
+        known_bug_diffs: 0,
+        unknown_diffs: 0,
     };
 
     for d1 in drivers1 {
@@ -330,14 +425,17 @@ pub fn compare_drivers(
                     label: "エラー".to_string(),
                     csv_val: "存在".to_string(),
                     sys_val: "該当なし".to_string(),
+                    known_bug: None,
                 }],
+                known_bug_diffs: 0,
+                unknown_diffs: 0,
             });
             continue;
         };
 
-        let diffs = detect_diffs_csv(&d1.days, &d2.days);
+        let mut diffs = detect_diffs_csv(&d1.days, &d2.days);
 
-        let mut total_diffs = Vec::new();
+        let mut total_diffs_vec = Vec::new();
         let total_checks = [
             ("運転合計", &d1.total_drive, &d2.total_drive),
             ("拘束合計", &d1.total_restraint, &d2.total_restraint),
@@ -349,22 +447,37 @@ pub fn compare_drivers(
             let a = v1.trim();
             let b = v2.trim();
             if a != b && !(a.is_empty() && b.is_empty()) {
-                total_diffs.push(TotalDiffItem {
+                total_diffs_vec.push(TotalDiffItem {
                     label: label.to_string(),
                     csv_val: a.to_string(),
                     sys_val: b.to_string(),
+                    known_bug: None,
                 });
             }
         }
 
-        let diff_count = diffs.len() + total_diffs.len();
+        // 既知バグアノテーション
+        annotate_known_bugs(&d1.driver_cd, &mut diffs, &mut total_diffs_vec);
+
+        let known = diffs.iter().filter(|d| d.known_bug.is_some()).count()
+            + total_diffs_vec
+                .iter()
+                .filter(|t| t.known_bug.is_some())
+                .count();
+        let diff_count = diffs.len() + total_diffs_vec.len();
+        let unknown = diff_count - known;
+
         report.total_diffs += diff_count;
+        report.known_bug_diffs += known;
+        report.unknown_diffs += unknown;
 
         report.drivers.push(DriverCompareResult {
             driver_name: d1.driver_name.clone(),
             driver_cd: d1.driver_cd.clone(),
             diffs,
-            total_diffs,
+            total_diffs: total_diffs_vec,
+            known_bug_diffs: known,
+            unknown_diffs: unknown,
         });
     }
 
@@ -653,6 +766,7 @@ pub fn post_process_day_map(
         (String, NaiveDate, NaiveTime),
         (NaiveDateTime, NaiveDateTime),
     >,
+    multi_wd_boundaries: &std::collections::HashSet<(String, NaiveDate, NaiveTime)>,
     day_work_events: &mut HashMap<
         (String, NaiveDate, NaiveTime),
         Vec<(NaiveDateTime, NaiveDateTime)>,
@@ -807,16 +921,17 @@ pub fn post_process_day_map(
                 };
                 if reset {
                     let key = (driver_cd.clone(), date, st);
-                    if let Some(&(wb_start, _)) = workday_boundaries.get(&key) {
+                    if let Some(&(wb_start, wb_end_orig)) = workday_boundaries.get(&key) {
                         // merge由来の24h境界がある → chain最終日
                         // effective_startは24h境界から（window計算に使用）
                         effective_start = Some(wb_start);
-                        // endは実際のsegment endに更新
+                        // endは実際のsegment endに更新（ただし24h境界を縮めない）
                         let seg_end = day_map
                             .get(&key)
                             .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
                             .unwrap_or(info.end);
-                        workday_boundaries.insert(key, (wb_start, seg_end));
+                        let end = wb_end_orig.max(seg_end);
+                        workday_boundaries.insert(key, (wb_start, end));
                     } else {
                         effective_start = Some(info.start);
                     }
@@ -938,6 +1053,20 @@ pub fn post_process_day_map(
                         split_rests.clear();
                     }
 
+                    // determine_workdaysが複数workdayを生成し、
+                    // 24h境界より前に終業を設定している場合はchainしない
+                    if !next_resets {
+                        let key = (driver_cd.clone(), date, st);
+                        if multi_wd_boundaries.contains(&key) {
+                            if let Some(&(_, wb_end)) = workday_boundaries.get(&key) {
+                                if wb_end < window_end {
+                                    next_resets = true;
+                                    split_rests.clear();
+                                }
+                            }
+                        }
+                    }
+
                     // 同日かつ長めのgap(≥180分)は重複表示（24h境界の分割）
                     let same_date_long_gap = date == next_date && next_gap >= 180;
                     if !next_resets && ol_restraint > 0 && !same_date_long_gap {
@@ -969,14 +1098,17 @@ pub fn post_process_day_map(
                             .insert((driver_cd.clone(), date, st), (eff_start, window_end));
                         // 次エントリ: start=window_end(24h境界), end=実際のsegment終了
                         // (chain最終日はendが実際の時刻で表示される)
+                        let next_key = (driver_cd.clone(), next_date, next_st);
                         let next_seg_end = day_map
-                            .get(&(driver_cd.clone(), next_date, next_st))
+                            .get(&next_key)
                             .and_then(|a| a.segments.iter().map(|s| s.end_at).max())
                             .unwrap_or(window_end + chrono::Duration::hours(24));
-                        workday_boundaries.insert(
-                            (driver_cd.clone(), next_date, next_st),
-                            (window_end, next_seg_end),
-                        );
+                        // 既存のwb.endがnext_seg_endより後なら保持（24h境界を縮めない）
+                        let next_end = workday_boundaries
+                            .get(&next_key)
+                            .map(|&(_, orig_end)| orig_end.max(next_seg_end))
+                            .unwrap_or(next_seg_end);
+                        workday_boundaries.insert(next_key, (window_end, next_end));
                     } else if let Some(agg) = day_map.get_mut(&(driver_cd.clone(), date, st)) {
                         agg.overlap_drive_minutes = ol_drive;
                         agg.overlap_cargo_minutes = ol_cargo;
@@ -1043,6 +1175,7 @@ pub fn post_process_day_map(
 pub struct BuildDayMapResult {
     pub day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg>,
     pub workday_boundaries: HashMap<(String, NaiveDate, NaiveTime), (NaiveDateTime, NaiveDateTime)>,
+    pub multi_wd_boundaries: std::collections::HashSet<(String, NaiveDate, NaiveTime)>,
     pub day_work_events:
         HashMap<(String, NaiveDate, NaiveTime), Vec<(NaiveDateTime, NaiveDateTime)>>,
 }
@@ -1058,6 +1191,10 @@ pub fn build_day_map(
         (String, NaiveDate, NaiveTime),
         (NaiveDateTime, NaiveDateTime),
     > = HashMap::new();
+    // determine_workdaysが複数workdayを生成した境界（分割休息/24h境界等）
+    // overlap計算でのchain上書きを防止するために使用
+    let mut multi_wd_boundaries: std::collections::HashSet<(String, NaiveDate, NaiveTime)> =
+        std::collections::HashSet::new();
     let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
     let mut unko_segments: HashMap<
         String,
@@ -1155,7 +1292,12 @@ pub fn build_day_map(
                             .map(|d| (e.start_at, d))
                     })
                     .collect();
-                let workdays = work_segments::determine_workdays(&rest_events_for_unko, dep, ret);
+                let workdays = work_segments::determine_workdays(
+                    &rest_events_for_unko,
+                    dep,
+                    ret,
+                    false, // 長距離480例外はoverlap計算側で処理
+                );
 
                 let segments =
                     work_segments::split_by_rest(dep, ret, &event_slice, &classifications);
@@ -1186,10 +1328,12 @@ pub fn build_day_map(
                 let daily_segments = work_segments::split_segments_by_day(&segments);
 
                 for wd in &workdays {
-                    workday_boundaries.insert(
-                        (row.driver_cd.clone(), wd.date, wd.start.time()),
-                        (wd.start, wd.end),
-                    );
+                    let key = (row.driver_cd.clone(), wd.date, wd.start.time());
+                    workday_boundaries.insert(key.clone(), (wd.start, wd.end));
+                    // 複数workdayの場合、各境界をauthoritativeとして登録
+                    if workdays.len() >= 2 {
+                        multi_wd_boundaries.insert(key);
+                    }
                 }
 
                 let find_start_time = |ts: NaiveDateTime| -> NaiveTime {
@@ -1441,24 +1585,32 @@ pub fn build_day_map(
                         }
 
                         for (part_start, part_end, part_secs) in &parts {
-                            let (event_date, event_start_time) = unko_segments
-                                .get(unko_no)
-                                .and_then(|segs| {
-                                    segs.iter()
-                                        .find(|(start, end, _, _)| {
-                                            *part_start >= *start && *part_start < *end
-                                        })
-                                        .or_else(|| {
-                                            segs.iter()
-                                                .find(|(start, _, _, _)| *part_start < *start)
-                                        })
-                                        .or_else(|| segs.last())
-                                        .map(|(_, _, wd, st)| (*wd, *st))
-                                })
-                                .unwrap_or((
-                                    part_start.date(),
-                                    NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-                                ));
+                            // unko_segmentsの[start, end)に含まれるpartのみ帰属
+                            // clipped_startでworkday始業前の時間が除外される
+                            let segs = unko_segments.get(unko_no);
+                            let direct_match = segs.and_then(|segs| {
+                                segs.iter()
+                                    .find(|(start, end, _, _)| {
+                                        *part_start >= *start && *part_start < *end
+                                    })
+                                    .map(|(_, _, wd, st)| (*wd, *st))
+                            });
+                            let (event_date, event_start_time) = match direct_match {
+                                Some(v) => v,
+                                None => {
+                                    // 通常のfallback（従来の挙動を維持）
+                                    segs.and_then(|segs| {
+                                        segs.iter()
+                                            .find(|(start, _, _, _)| *part_start < *start)
+                                            .or_else(|| segs.last())
+                                            .map(|(_, _, wd, st)| (*wd, *st))
+                                    })
+                                    .unwrap_or((
+                                        part_start.date(),
+                                        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                                    ))
+                                }
+                            };
 
                             let cls = classifications.get(&evt.event_cd);
                             match cls {
@@ -1552,6 +1704,7 @@ pub fn build_day_map(
     BuildDayMapResult {
         day_map,
         workday_boundaries,
+        multi_wd_boundaries,
         day_work_events,
     }
 }
@@ -1594,12 +1747,14 @@ pub fn process_zip(
     let result = build_day_map(&kudguri_rows, &kudgivt_by_unko, &classifications);
     let mut day_map = result.day_map;
     let mut workday_boundaries = result.workday_boundaries;
+    let multi_wd_boundaries = result.multi_wd_boundaries;
     let mut day_work_events = result.day_work_events;
 
     let ferry_info = FerryInfo::from_zip_files(&zip_files, &kudgivt_by_unko);
     post_process_day_map(
         &mut day_map,
         &mut workday_boundaries,
+        &multi_wd_boundaries,
         &mut day_work_events,
         &kudgivt_by_unko,
         &classifications,
@@ -1697,9 +1852,11 @@ pub fn process_zip(
                         .unwrap_or_default();
                     let seg_max_end = agg.segments.iter().map(|s| s.end_at).max();
                     let end_time = match (wb, seg_max_end) {
+                        // 日跨ぎworkday: seg_endがwd_endより60分以上前
+                        // → 24h境界等の強制日締めでwd_endが正しい終業
                         (Some((wd_start, wd_end)), Some(seg_end))
                             if wd_start.date() != wd_end.date()
-                                && seg_end.date() == wd_start.date() =>
+                                && (*wd_end - seg_end).num_minutes() > 60 =>
                         {
                             fmt_trunc_time(*wd_end)
                         }

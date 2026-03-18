@@ -903,11 +903,6 @@ pub fn post_process_day_map(
             for (idx, &(date, st)) in dates.iter().enumerate() {
                 let info = &dates_map[&(date, st)];
 
-                // determine_workdays由来のwb_endを保存（line932で上書きされる前）
-                let orig_wb_end = workday_boundaries
-                    .get(&(driver_cd.clone(), date, st))
-                    .map(|&(_, end)| end);
-
                 // deductionは先に適用（resetで消される前に）
                 if let Some((ded_drive, ded_cargo, ded_restraint, ded_night)) =
                     next_day_deduction.take()

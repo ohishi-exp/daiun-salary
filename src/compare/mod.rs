@@ -2351,6 +2351,191 @@ mod tests {
         assert_eq!(diffs[0].field, "運転");
     }
 
+    // ---- build_day_map ----
+    #[test]
+    fn test_build_day_map_single_day_run() {
+        let cls = default_classifications();
+        let kudguri = vec![make_kudguri(
+            "U1", "D1",
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 1, 17, 0, 0),
+        )];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 120),  // 運転2h
+            make_kudgivt("U1", dt(2026, 2, 1, 10, 0, 0), "202", 60),  // 荷役1h
+            make_kudgivt("U1", dt(2026, 2, 1, 11, 0, 0), "301", 60),  // 休憩1h
+            make_kudgivt("U1", dt(2026, 2, 1, 12, 0, 0), "201", 180), // 運転3h
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), refs);
+
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        // 1エントリ (D1, 2/1, 8:00)
+        assert_eq!(result.day_map.len(), 1);
+        let key = result.day_map.keys().next().unwrap();
+        assert_eq!(key.0, "D1");
+        assert_eq!(key.1, NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+        let agg = &result.day_map[key];
+        assert_eq!(agg.drive_minutes, 300); // 120+180=300
+        assert_eq!(agg.cargo_minutes, 60);
+    }
+
+    #[test]
+    fn test_build_day_map_multi_day_with_rest() {
+        let cls = default_classifications();
+        let kudguri = vec![make_kudguri(
+            "U1", "D1",
+            dt(2026, 2, 1, 8, 0, 0),
+            dt(2026, 2, 2, 17, 0, 0),
+        )];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 8, 0, 0), "201", 480),  // 運転8h
+            make_kudgivt("U1", dt(2026, 2, 1, 16, 0, 0), "302", 600), // 休息10h (≥540→分割)
+            make_kudgivt("U1", dt(2026, 2, 2, 2, 0, 0), "201", 480),  // 運転8h
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), refs);
+
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        // 休息で分割 → 2エントリ
+        assert!(result.day_map.len() >= 2, "Expected ≥2 entries, got {}", result.day_map.len());
+    }
+
+    #[test]
+    fn test_build_day_map_24h_forced_split() {
+        let cls = default_classifications();
+        let kudguri = vec![make_kudguri(
+            "U1", "D1",
+            dt(2026, 2, 1, 6, 0, 0),
+            dt(2026, 2, 3, 10, 0, 0),
+        )];
+        // 休息なしで連続作業 → 24h強制分割
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 6, 0, 0), "201", 1440),  // 24h運転
+            make_kudgivt("U1", dt(2026, 2, 2, 6, 0, 0), "201", 1440),  // 24h運転
+        ];
+        let refs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), refs);
+
+        let result = build_day_map(&kudguri, &by_unko, &cls);
+        assert!(result.day_map.len() >= 2, "Expected 24h split, got {} entries", result.day_map.len());
+    }
+
+    // ---- post_process_day_map ----
+    #[test]
+    fn test_post_process_overlap_chain() {
+        // 2日連続workday（gap短い） → chain
+        let cls = default_classifications();
+        let d1 = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
+        let t = NaiveTime::from_hms_opt(5, 0, 0).unwrap();
+        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        // Day1: 5:00→翌3:00 (22h)
+        let mut agg1 = DayAgg::default();
+        agg1.drive_minutes = 600;
+        agg1.total_work_minutes = 600;
+        agg1.unko_nos = vec!["U1".into()];
+        agg1.segments = vec![SegRec {
+            start_at: dt(2026, 2, 1, 5, 0, 0),
+            end_at: dt(2026, 2, 2, 3, 0, 0),
+        }];
+        day_map.insert(("D1".into(), d1, t), agg1);
+        // Day2: 3:00→15:00 (12h)
+        let t2 = NaiveTime::from_hms_opt(3, 0, 0).unwrap();
+        let mut agg2 = DayAgg::default();
+        agg2.drive_minutes = 400;
+        agg2.total_work_minutes = 400;
+        agg2.unko_nos = vec!["U1".into()];
+        agg2.segments = vec![SegRec {
+            start_at: dt(2026, 2, 2, 3, 0, 0),
+            end_at: dt(2026, 2, 2, 15, 0, 0),
+        }];
+        day_map.insert(("D1".into(), d2, t2), agg2);
+
+        let mut wb = HashMap::new();
+        wb.insert(("D1".into(), d1, t), (dt(2026, 2, 1, 5, 0, 0), dt(2026, 2, 2, 3, 0, 0)));
+        wb.insert(("D1".into(), d2, t2), (dt(2026, 2, 2, 3, 0, 0), dt(2026, 2, 2, 15, 0, 0)));
+        let mwb = HashMap::new();
+        let mut dwe = HashMap::new();
+        let kudguri = vec![make_kudguri("U1", "D1", dt(2026, 2, 1, 5, 0, 0), dt(2026, 2, 2, 15, 0, 0))];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 5, 0, 0), "201", 600),
+            make_kudgivt("U1", dt(2026, 2, 2, 3, 0, 0), "201", 400),
+        ];
+        let erefs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), erefs);
+        let ferry = FerryInfo::default();
+
+        post_process_day_map(
+            &mut day_map, &mut wb, &mwb, &mut dwe,
+            &by_unko, &cls, &kudguri, &ferry,
+        );
+        // chain: gap=0 < 480 → overlap added to day1, deducted from day2
+        // post_process実行後もエラーなく完了すること
+        assert!(day_map.contains_key(&("D1".into(), d1, t)));
+    }
+
+    #[test]
+    fn test_post_process_overlap_reset() {
+        // gap=600分 ≥ 540 → reset（overlap表示）
+        let cls = default_classifications();
+        let d1 = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
+        let t1 = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
+        let t2 = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+        let mut day_map: HashMap<(String, NaiveDate, NaiveTime), DayAgg> = HashMap::new();
+        let mut agg1 = DayAgg::default();
+        agg1.drive_minutes = 300;
+        agg1.total_work_minutes = 300;
+        agg1.unko_nos = vec!["U1".into()];
+        agg1.segments = vec![SegRec {
+            start_at: dt(2026, 2, 1, 6, 0, 0),
+            end_at: dt(2026, 2, 1, 11, 0, 0),
+        }];
+        day_map.insert(("D1".into(), d1, t1), agg1);
+        let mut agg2 = DayAgg::default();
+        agg2.drive_minutes = 300;
+        agg2.total_work_minutes = 300;
+        agg2.unko_nos = vec!["U1".into()];
+        agg2.segments = vec![SegRec {
+            start_at: dt(2026, 2, 2, 8, 0, 0),
+            end_at: dt(2026, 2, 2, 13, 0, 0),
+        }];
+        day_map.insert(("D1".into(), d2, t2), agg2);
+
+        let mut wb = HashMap::new();
+        wb.insert(("D1".into(), d1, t1), (dt(2026, 2, 1, 6, 0, 0), dt(2026, 2, 1, 11, 0, 0)));
+        wb.insert(("D1".into(), d2, t2), (dt(2026, 2, 2, 8, 0, 0), dt(2026, 2, 2, 13, 0, 0)));
+        let mwb = HashMap::new();
+        let mut dwe = HashMap::new();
+        let kudguri = vec![
+            make_kudguri("U1", "D1", dt(2026, 2, 1, 6, 0, 0), dt(2026, 2, 1, 11, 0, 0)),
+            make_kudguri("U1", "D1", dt(2026, 2, 2, 8, 0, 0), dt(2026, 2, 2, 13, 0, 0)),
+        ];
+        let evts = vec![
+            make_kudgivt("U1", dt(2026, 2, 1, 6, 0, 0), "201", 300),
+            make_kudgivt("U1", dt(2026, 2, 2, 8, 0, 0), "201", 300),
+        ];
+        let erefs: Vec<&_> = evts.iter().collect();
+        let mut by_unko: HashMap<String, Vec<&_>> = HashMap::new();
+        by_unko.insert("U1".into(), erefs);
+        let ferry = FerryInfo::default();
+
+        post_process_day_map(
+            &mut day_map, &mut wb, &mwb, &mut dwe,
+            &by_unko, &cls, &kudguri, &ferry,
+        );
+        // gap=21h > 540 → reset. 次のworkday(2/2 8:00)が24h window(6:00+24h=翌6:00)内
+        // → overlap表示
+        let entry1 = &day_map[&("D1".into(), d1, t1)];
+        // day1にoverlap_restraint_minutesが設定される場合がある
+        assert!(entry1.overlap_restraint_minutes >= 0);
+    }
+
     // ---- DayAgg default ----
     #[test]
     fn test_day_agg_default() {

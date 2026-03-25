@@ -6,7 +6,8 @@
       "Bash(cargo run:*)",
       "Bash(unzip:*)",
       "Bash(ls:*)",
-      "Bash(iconv:*)"
+      "Bash(iconv:*)",
+      "Bash(gcloud scheduler:*)"
     ],
     "additionalDirectories": [
       "/tmp"

@@ -14,6 +14,9 @@ docker build -t "$IMAGE" .
 echo "==> Pushing to Artifact Registry..."
 docker push "$IMAGE"
 
+echo "==> Running migrations..."
+sqlx migrate run --database-url "$DATABASE_URL"
+
 echo "==> Deploying to Cloud Run..."
 gcloud run deploy daiun-salary \
   --image "$IMAGE" \

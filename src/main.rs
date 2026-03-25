@@ -68,8 +68,6 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await?;
 
-    sqlx::migrate!("./migrations").run(&pool).await?;
-
     // R2 storage
     let bucket = std::env::var("R2_BUCKET").expect("R2_BUCKET must be set");
     let account_id = std::env::var("R2_ACCOUNT_ID").expect("R2_ACCOUNT_ID must be set");

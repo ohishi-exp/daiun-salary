@@ -1,18 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# .env 読み込み (GHCR_USER, GHCR_TOKEN, DATABASE_URL 等)
+# .env 読み込み
 set -a
 source .env
 set +a
 
 # GHCR に push、Cloud Run は AR remote-repo (asia-northeast1/daiun-salary) 経由で pull
 # AR daiun-salary は REMOTE_REPOSITORY (upstream: https://ghcr.io)
+# GHCR 認証は ~/.docker/config.json (事前に `docker login ghcr.io` 済みであること)
 IMAGE_PUSH="ghcr.io/ohishi-exp/daiun-salary:latest"
 IMAGE_CLOUDRUN="asia-northeast1-docker.pkg.dev/cloudsql-sv/daiun-salary/ohishi-exp/daiun-salary:latest"
-
-echo "==> Logging in to GHCR..."
-echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
 echo "==> Building Docker image..."
 docker build -t "$IMAGE_PUSH" .

@@ -1,25 +1,31 @@
 #!/bin/bash
 set -euo pipefail
 
-# .env 読み込み
+# .env 読み込み (GHCR_USER, GHCR_TOKEN, DATABASE_URL 等)
 set -a
 source .env
 set +a
 
-IMAGE=asia-northeast1-docker.pkg.dev/cloudsql-sv/daiun-salary/daiun-salary:latest
+# GHCR に push、Cloud Run は AR remote-repo (asia-northeast1/daiun-salary) 経由で pull
+# AR daiun-salary は REMOTE_REPOSITORY (upstream: https://ghcr.io)
+IMAGE_PUSH="ghcr.io/ohishi-exp/daiun-salary:latest"
+IMAGE_CLOUDRUN="asia-northeast1-docker.pkg.dev/cloudsql-sv/daiun-salary/ohishi-exp/daiun-salary:latest"
+
+echo "==> Logging in to GHCR..."
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
 echo "==> Building Docker image..."
-docker build -t "$IMAGE" .
+docker build -t "$IMAGE_PUSH" .
 
-echo "==> Pushing to Artifact Registry..."
-docker push "$IMAGE"
+echo "==> Pushing to GHCR..."
+docker push "$IMAGE_PUSH"
 
 echo "==> Running migrations..."
 sqlx migrate run --database-url "$DATABASE_URL"
 
 echo "==> Deploying to Cloud Run..."
 gcloud run deploy daiun-salary \
-  --image "$IMAGE" \
+  --image "$IMAGE_CLOUDRUN" \
   --region asia-northeast1 \
   --platform managed \
   --allow-unauthenticated \

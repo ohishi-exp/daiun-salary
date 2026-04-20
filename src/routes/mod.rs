@@ -5,6 +5,7 @@ pub mod daily_hours;
 pub mod drivers;
 pub mod event_classifications;
 pub mod gateway;
+pub mod health;
 pub mod members;
 pub mod operations;
 pub mod restraint_report;
@@ -46,6 +47,7 @@ pub fn router() -> Router<AppState> {
 
     // Public routes (no auth)
     let public_routes = Router::new()
+        .merge(health::router())
         .merge(auth::public_router())
         .merge(gateway::router());
 

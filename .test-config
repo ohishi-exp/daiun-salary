@@ -1,0 +1,6 @@
+# daiun-salary テスト設定
+TEST_DB_PORT=54323
+UNIT_TEST_FILTER="restraint_report"
+EXTRA_TEST_CMD="bash scripts/csv_compare_test.sh"
+CLOUD_RUN_SERVICE="daiun-salary"
+CLOUD_RUN_REGION="asia-northeast1"

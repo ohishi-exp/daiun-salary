@@ -1,0 +1,11 @@
+services:
+  test-db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: test
+    ports:
+      - "54323:5432"
+    volumes:
+      - ./scripts/init_local_db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    tmpfs:
+      - /var/lib/postgresql/data

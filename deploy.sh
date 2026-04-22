@@ -30,7 +30,7 @@ gcloud run deploy daiun-salary \
   --port 8080 \
   --memory 1Gi \
   --set-env-vars "DATABASE_URL=${DATABASE_URL}" \
-  --set-env-vars "JWT_SECRET=${JWT_SECRET}" \
+  --set-secrets "JWT_SECRET=JWT_SECRET:latest" \
   --set-env-vars "GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}" \
   --set-env-vars "GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}" \
   --set-env-vars "R2_BUCKET=${R2_BUCKET}" \

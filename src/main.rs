@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         .allow_headers(Any);
 
     let app = Router::new()
-        .nest("/api", routes::router())
+        .nest("/api", routes::router().merge(routes::upload::internal_router()))
         .merge(routes::upload::internal_router())
         .layer(Extension(google_verifier))
         .layer(Extension(jwt_secret))

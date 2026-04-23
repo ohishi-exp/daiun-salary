@@ -79,4 +79,4 @@ jobs:
       image_tag: ${{ needs.build.outputs.tag }}
       ar_repo: asia-northeast1-docker.pkg.dev/cloudsql-sv/daiun-salary/ohishi-exp/daiun-salary
     secrets:
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      GCP_SA_KEY: ${{ secrets.DAIUN_SALARY_GCP_SA_KEY }}

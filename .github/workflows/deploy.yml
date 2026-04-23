@@ -1,0 +1,82 @@
+name: Deploy
+
+# GHCR へ image を build + push し、ippoan/ci-workflows の
+# cloud-run-deploy reusable で Cloud Run にデプロイする。
+#
+# トリガー:
+#   - push tag v*   → そのタグの image をビルド + デプロイ
+#   - workflow_dispatch → 手動 (tag を入力)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to build + deploy (e.g. v0.1.2)'
+        required: true
+        type: string
+
+env:
+  GHCR_IMAGE: ghcr.io/ohishi-exp/daiun-salary
+  AR_REPO: asia-northeast1-docker.pkg.dev/cloudsql-sv/daiun-salary/ohishi-exp/daiun-salary
+  SERVICE: daiun-salary
+  REGION: asia-northeast1
+  PROJECT: cloudsql-sv
+
+jobs:
+  build:
+    name: Build + push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "### Build tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.GHCR_IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.GHCR_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Cloud Run
+    needs: build
+    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
+    with:
+      service: daiun-salary
+      region: asia-northeast1
+      project: cloudsql-sv
+      ghcr_image: ghcr.io/ohishi-exp/daiun-salary
+      image_tag: ${{ needs.build.outputs.tag }}
+      ar_repo: asia-northeast1-docker.pkg.dev/cloudsql-sv/daiun-salary/ohishi-exp/daiun-salary
+    secrets:
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}

@@ -20,6 +20,8 @@ tower = "0.5"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 jsonwebtoken = "9"
 sha2 = "0.10"
+# JWT claims / 検証の SoT (ippoan/rust-alc-api#410 の手動コピー集約)
+alc-auth-jwt = { git = "https://github.com/ippoan/rust-alc-api", branch = "main" }
 thiserror = "2"
 async-trait = "0.1"
 rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }

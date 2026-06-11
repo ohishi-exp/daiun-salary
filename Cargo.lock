@@ -29,6 +29,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "alc-auth-jwt"
+version = "0.1.0"
+source = "git+https://github.com/ippoan/rust-alc-api?branch=main#ad0da855766db20c3e769cade391827c6ff23bcd"
+dependencies = [
+ "chrono",
+ "jsonwebtoken",
+ "serde",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "aliasable"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -726,6 +738,7 @@ dependencies = [
 name = "daiun-salary"
 version = "0.1.0"
 dependencies = [
+ "alc-auth-jwt",
  "anyhow",
  "async-trait",
  "axum",

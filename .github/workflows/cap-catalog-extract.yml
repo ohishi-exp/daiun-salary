@@ -4,9 +4,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+
+# Per-job permission パターン (Refs ippoan/cap-catalog#29 retroactive 改善):
+# top-level は read のみ。auto-merge job 側で write を明示 elevate する。
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+
 jobs:
   extract:
     uses: ippoan/ci-workflows/.github/workflows/catalog-extract.yml@main
@@ -15,6 +18,9 @@ jobs:
   auto-merge:
     needs: [extract]
     if: github.event_name == 'pull_request'
+    permissions:
+      contents: write
+      pull-requests: write
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     secrets:
       CI_APP_ID: ${{ secrets.CI_APP_ID }}
